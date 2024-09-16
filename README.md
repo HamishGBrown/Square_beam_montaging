@@ -1,5 +1,7 @@
 Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with square and rectangular beams.
 
+# Setting up the coordinates for a montage
+
 ```
 $ python Generate_Image_shifts_for_Montage.py -h
 
@@ -47,11 +49,17 @@ Which (optionally) generates the following plot
 
 ![image](https://github.com/user-attachments/assets/b4e5e8cc-04e5-46b0-974e-74dc991f787d)
 
-And a text file ```Imageshifts.txt``` which Serial-EM will read.
+And a text file ```Imageshifts.txt``` which Serial-EM will read, transfer this to the Serial-EM computer
 
+# Running Serial-EM
 
+In low-dose mode create some nav points maps using the view preset and run the ```acquire_montage.txt``` script at these points using the "Acquire at items" feature of Serial-EM, the output for a single tilt will look like this:
 
 ![image](https://github.com/HamishGBrown/Square_beam_montaging/blob/main/SingleMontage.gif)
+
+# Stitching montages
+
+Use the python script ```stitch.py``` to stitch images in montage:
 
 ```
 $ python stitch.py -h
@@ -86,6 +94,8 @@ optional arguments:
                         Rotation of tilt axis relative to image, if not provided will
                         take from .mdoc file.
 ```
+
+For example:
 
 ```
 $ python stitch.py -i  "/home/hbrown/Mount/KriosFalcon4/Brown/20240826_montaging/Montagingtest1_*.mrc" -b 4 -I Krios_imageshifts.txt  -t -3
