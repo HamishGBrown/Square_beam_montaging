@@ -13,7 +13,10 @@ ReportNavItem
 ## Get data directory, image prefix, tile coordinate file, number of tilts in series 
 ## and montage tiles per tilt from commandline
 SetDirectory X:/DoseFractions/Brown/20240826_montaging
-OFPrefix = Montagingtest_$navLabel 
+OFPrefix = Montagingtest_$navLabel
+
+# TODO store an imageshifts file for each nav item, these will be set up
+# by another serial-EM script
 ParFilename = X:/DoseFractions/Brown/Krios_imageshifts.txt
 TSNumber = 33
 
@@ -49,28 +52,6 @@ Loop $TSNumber
       ResetImageShift 
       RealignToNavItem  1 1 $LmtISShift $LmtRATimes  3
 
-      ## Attempt to align to image in buffer A $LmtRATimes (3 by default)
-#      Loop $LmtRATimes
-         ## Aqcuire image with view parameters, will be in buffer A
-  #       View
-
-         ## Align (view image in buffer A) to image in buffer T
-         ##TODO change this to RealigntoNavItem for batch tomography
-         ##AlignTo T
-         
-#         ReportSpecimenShift 
-
-         ## Magnitude of specimen shift 
-#         IS = $reportedValue1 * $reportedValue1 + $reportedValue2 * $reportedValue2
-
-         ## Reset image shift and move stage to compensate if above threshhold
-#         If  $IS > $LmtISShift
-  #          ResetImageShift
-    #     Else
-            ## If not above threshhold break loop
-        #    Break 
-      #   Endif 
-     # EndLoop
       View
       ## Copy View image to buffers R and S, R will be overwritten at each
       ## positive tilt and S will be overwritten at each negative tilt
