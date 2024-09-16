@@ -64,13 +64,13 @@ def parse_commandline():
     parser.add_argument(
         "-s",
         "--skipcrosscorrelation",
-        help="Size of Fresnel fringes at edge of beam, this will be removed from the gain reference (default 20).",
+        help="Skip cross-correlation alignment of montage tiles and default to using imageshifts to stitch montage.",
         action="store_true",
     )
     parser.add_argument(
         "-t",
         "--tiltaxisrotation",
-        help="Rotation of tilt axis relative to image, if not provided will take from .mdoc frile.",
+        help="Rotation of tilt axis relative to image, if not provided will take from .mdoc file.",
         type=float,
         required=False,
     )
