@@ -15,7 +15,7 @@ def parse_commandline():
     Parse commandline input.
     """
     parser = argparse.ArgumentParser(
-        description="Stitch square beam montage tomography data."
+        description="Join Montage tiff files into single mrc for IMOD, filling blank areas in montage."
     )
     parser.add_argument(
         "-i", "--input", help="Directory containing stitched montage tilt series tiff files", required=True, type=str
