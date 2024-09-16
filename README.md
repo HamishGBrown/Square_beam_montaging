@@ -1,5 +1,56 @@
 Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with square and rectangular beams.
 
+```
+$ python Generate_Image_shifts_for_Montage.py -h
+
+usage: Generate_Image_shifts_for_Montage.py [-h] -tr TILTAXISROTATION [-ts TILTSTEP] -tm
+                                            MAXTILT [-tg DOSESYMMETRICTILTGROUP] -p
+                                            PIXELSIZE -n CAMERAPIXELS CAMERAPIXELS -M
+                                            MONTAGETILES MONTAGETILES
+                                            [-ov MONTAGEOVERLAP MONTAGEOVERLAP]
+                                            [-o OUTPUT] [-plt]
+
+Stitch square beam montage tomography data.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -tr TILTAXISROTATION, --tiltaxisrotation TILTAXISROTATION
+                        Rotation between tilt axis and camera axes (required)
+  -ts TILTSTEP, --tiltstep TILTSTEP
+                        Step of tomography tilt series in degrees (3 by default)
+  -tm MAXTILT, --maxtilt MAXTILT
+                        Maximum tilt in tilt series (required)
+  -tg DOSESYMMETRICTILTGROUP, --dosesymmetrictiltgroup DOSESYMMETRICTILTGROUP
+                        Number of tilts in dose-symmetric tilt group (3 by default)
+  -p PIXELSIZE, --pixelsize PIXELSIZE
+                        Pixel size of camera in Angstrom (required)
+  -n CAMERAPIXELS CAMERAPIXELS, --camerapixels CAMERAPIXELS CAMERAPIXELS
+                        Detector size in pixels (required)
+  -M MONTAGETILES MONTAGETILES, --montagetiles MONTAGETILES MONTAGETILES
+                        Number of tiles in montage (required)
+  -ov MONTAGEOVERLAP MONTAGEOVERLAP, --montageoverlap MONTAGEOVERLAP MONTAGEOVERLAP
+                        Montage overlap factor (1/overlap fraction), default 10
+  -o OUTPUT, --output OUTPUT
+                        Output basename (default Imageshifts)
+  -plt, --plot          Plot imageshifts (default True)
+
+```
+
+eg. to create a 4 x 3 montage with a K3 (4092 x 5760 pixels) at 50 kx magnfication (1.56 Å pixel size on our instrument) and a dose-symmetric tilt series between -60 and 60 with a step size of 3° and alternatig betwen positive and negative tilts every 3 tilt series. Use the following command:
+
+```
+$ python Generate_Image_shifts_for_Montage.py  -tr -96.7 -ts 3.0 -tm 60 -tg 3 -p 1.56 -n 4092 5760 -M 4 3 -o Imageshifts --plot
+41 tilts between -60.0 and 60.0 in steps of 3.0
+```
+
+Which (optionally) generates the following plot
+
+![image](https://github.com/user-attachments/assets/b4e5e8cc-04e5-46b0-974e-74dc991f787d)
+
+And a text file ```Imageshifts.txt``` which Serial-EM will read.
+
+
+
 ![image](https://github.com/HamishGBrown/Square_beam_montaging/blob/main/SingleMontage.gif)
 
 ```
