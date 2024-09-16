@@ -1,5 +1,18 @@
 Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with square and rectangular beams.
 
+# Install
+
+Download Github repo
+
+```git clone https://github.com/HamishGBrown/Square_beam_montaging.git```
+
+Install 
+
+```
+cd Square_beam_montaging
+pip install -e .
+```
+
 # Setting up the coordinates for a montage
 
 ```
