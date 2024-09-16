@@ -1,4 +1,4 @@
-Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with square and rectangular beams.
+Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with square and rectangular beams. Draws substantial inspiration from https://github.com/apeck12/montage
 
 # Install
 
