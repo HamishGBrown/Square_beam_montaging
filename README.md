@@ -1,5 +1,18 @@
 Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with square and rectangular beams.
 
+# Install
+
+Download Github repo
+
+```git clone https://github.com/HamishGBrown/Square_beam_montaging.git```
+
+Install 
+
+```
+cd Square_beam_montaging
+pip install -e .
+```
+
 # Setting up the coordinates for a montage
 
 ```
@@ -101,6 +114,24 @@ For example:
 $ python stitch.py -i  "/home/hbrown/Mount/KriosFalcon4/Brown/20240826_montaging/Montagingtest1_*.mrc" -b 4 -I Krios_imageshifts.txt  -t -3
 ```
 
-Produces the following output:
+After this you will need to the ```Crop_to_smallest_common_size.py``` script to join all the montages into a single mrc for IMOD
 
-![image](https://github.com/HamishGBrown/Square_beam_montaging/blob/main/tilt_series_preali-1.gif)
+```
+$ python Crop_to_smallest_common_size.py -h
+usage: Crop_to_smallest_common_size.py [-h] -i INPUT [-o OUTPUT]
+
+Join Montage tiff files into single mrc for IMOD, filling blank areas in montage.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -i INPUT, --input INPUT
+                        Directory containing stitched montage tilt series tiff files
+  -o OUTPUT, --output OUTPUT
+                        Output directory, if not supplied, output will be placed in same
+                        directory as input
+
+```
+
+Produces the following output (after rough alignment in IMOD):
+
+![image](https://github.com/HamishGBrown/Square_beam_montaging/blob/main/tilt_series_preali.gif)
