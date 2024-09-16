@@ -1,0 +1,395 @@
+MacroName MontageTiltSerieswithBeamCentering
+
+##Realign to center image up to 3 times when the shift is more than 1um, end with nonzero image shift
+##Center reference image taken at view mode and saved in buffer T
+LmtRATimes = 3
+LmtISShift = 1
+ISDelay = 0.5
+Beamcentering = 0
+
+Require arrays
+ReportNavItem
+
+## Get data directory, image prefix, tile coordinate file, number of tilts in series 
+## and montage tiles per tilt from commandline
+SetDirectory X:/DoseFractions/Brown/20240826_montaging
+OFPrefix = Montagingtest_$navLabel 
+ParFilename = X:/DoseFractions/Brown/Krios_imageshifts.txt
+TSNumber = 33
+
+## Initialize arrays for storing stage positions
+NewArray PlusStagePos -1 2
+NewArray MinusStagePos -1 2
+
+## Opens text file $ParFilename as read-only (r) and with ID MTSPar
+OpenTextFile MTSPar r 0 $ParFilename
+
+## Initialize Angle, Montage image shift (MontIS_D) and last Montage Image shifts (LastMontIS_D)
+## arrays
+NewArray Angle -1 1
+NewArray MontIS_D -1 3
+NewArray LastMontIS_D -1 3 
+echo $TSNumber
+## Loop over tilts
+Loop $TSNumber
+
+   ## Reset counter for montage tiles and image shift
+   Count = 0
+   SetImageShift 0 0
+
+   ## Read line from image shift text file (id MTSPar) to array Angle
+   ReadLineToArray MTSPar Angle
+
+   ## Write tilt angle to log window
+   Echo Tilt to $Angle
+   
+   ## 0 degree image
+   If $Angle == 0
+      TiltTo $Angle
+      ResetImageShift 
+      RealignToNavItem  1 1 $LmtISShift $LmtRATimes  3
+
+      ## Attempt to align to image in buffer A $LmtRATimes (3 by default)
+#      Loop $LmtRATimes
+         ## Aqcuire image with view parameters, will be in buffer A
+  #       View
+
+         ## Align (view image in buffer A) to image in buffer T
+         ##TODO change this to RealigntoNavItem for batch tomography
+         ##AlignTo T
+         
+#         ReportSpecimenShift 
+
+         ## Magnitude of specimen shift 
+#         IS = $reportedValue1 * $reportedValue1 + $reportedValue2 * $reportedValue2
+
+         ## Reset image shift and move stage to compensate if above threshhold
+#         If  $IS > $LmtISShift
+  #          ResetImageShift
+    #     Else
+            ## If not above threshhold break loop
+        #    Break 
+      #   Endif 
+     # EndLoop
+      View
+      ## Copy View image to buffers R and S, R will be overwritten at each
+      ## positive tilt and S will be overwritten at each negative tilt
+      Copy A R
+      Copy A S
+
+      ## Get and store stage positions, positive and negative (tilt) stage
+      ## positions will be stored seperately
+      ReportStageXYZ
+      PlusStagePos[1] = $ReportedValue1
+      PlusStagePos[2] = $ReportedValue2
+      MinusStagePos = $PlusStagePos
+
+      
+      ## 1 means beam centering using centroid - beam should be fully in image
+         Trial 
+         CenterBeamFromImage
+
+      ## Autofocus, take Trial image and center beam if necessary
+      AutoFocus 
+
+      #Read number of tiles to variable TileNumber
+      ReadLineToArray MTSPar TileNumber
+     
+
+      ## Get image shift from file and store in array
+      ReadLineToArray MTSPar LastMontIS_D
+      echo  $Count  $LastMontIS_D
+
+      ## Apply image shift from file
+      ImageShiftByMicrons $LastMontIS_D[1] $LastMontIS_D[2]
+
+      ## Open output file
+      output_file = $OFPrefix_$Angle_$Count.mrc
+      OpenNewFile $output_file 
+
+      ## Delay after image shift and then record image save, and
+      ## close file
+      Delay $ISDelay
+      Record
+      Save
+      CloseFile 
+      Echo $output_file saved
+
+      # beam centering using centroid 1 means beam should be fully in image
+      If $Beamcentering == 1
+         CenterBeamFromImage 1
+      Endif
+
+      # Loop over times
+      Echo $TileNumber tiles for this tilt
+      Loop $TileNumber - 1 indx 
+         ## Update count (for saving image shift tiles)
+         Count = $Count + 1
+
+         ## Read image shift from file
+         ReadLineToArray MTSPar MontIS_D
+         echo  $indx $Count  $MontIS_D
+
+         ## Difference in image shift from last image shift vector
+         IS_X = $MontIS_D[1] - $LastMontIS_D[1]
+         IS_Y = $MontIS_D[2] - $LastMontIS_D[2]
+         ImageShiftByMicrons $IS_X $IS_Y
+         ReportSpecimenShift
+
+         # Open output file
+         output_file = $OFPrefix_$Angle_$Count.mrc
+         OpenNewFile $output_file
+
+         ## Delay after image shift and then record image, save image, and
+         ## close file
+         Delay $ISDelay
+         Record
+         Save
+         CloseFile 
+         Echo $output_file saved
+
+         # Center beam
+         If $Beamcentering == 1
+            CenterBeamFromImage 1
+         Endif
+
+         # Store current image shift as last image shift for next loop
+         # iteration
+         LastMontIS_D = $MontIS_D
+      EndLoop
+   
+   # Positive tilts
+   ElseIf $Angle > 0
+      TiltTo $Angle
+
+      # Move stage to previously aligned x,y position
+      MoveStageTo $PlusStagePos[1] $PlusStagePos[2]
+
+      ## Loop alignment procedure at view preset up to
+      ## $LmtRATimes (3 by default)
+      Loop $LmtRATimes
+         ## Take view image
+         View
+
+         ## Align to image stored in buffer R (view image taken at previous tilt)
+         AlignTo R
+         ReportSpecimenShift 
+         
+         ## Magnitude of shift by Pythagoras theorem
+         IS = $reportedValue1 * $reportedValue1 + $reportedValue2 * $reportedValue2
+
+         ## If measured shift greater than threshhold reset image shift and stage shift
+         ## to position, then align again. Otherwise break loop
+         If $IS > $LmtISShift
+            ResetImageShift
+         Else
+            Break 
+         Endif 
+      EndLoop
+      ## Save aligned view image in buffer R
+      View
+      Copy A R
+      ReportStageXYZ
+      PlusStagePos[1] = $ReportedValue1
+      PlusStagePos[2] = $ReportedValue2
+      
+      ## Autofocus and center beam
+
+         Trial 
+         CenterBeamFromImage
+      AutoFocus
+      
+
+
+      # Read number of tiles from file
+      ReadLineToArray MTSPar TileNumber
+      Echo $TileNumber tiles for this tilt
+
+      ## Get image shift from file for first tile and apply it
+      ReadLineToArray MTSPar LastMontIS_D
+      ImageShiftByMicrons $LastMontIS_D[1] $LastMontIS_D[2]
+
+      ## Change focus if required
+      if $LastMontIS_D[3] != 0
+         ChangeFocus $LastMontIS_D[3]
+         echo chang focus by $LastMontIS_D[3]
+      endif
+
+      ## Make output file
+      output_file = $OFPrefix_$Angle_$Count.mrc
+      OpenNewFile $output_file 
+
+      ## Delay after image shift and then record image, save image, and
+      ## close file
+      Delay $ISDelay
+      Record
+      Save
+      CloseFile 
+      Echo $output_file saved
+
+      ## Center beam from record image (using centroid - beam should be fully in image)
+      If $Beamcentering == 1
+         CenterBeamFromImage 1
+      Endif
+
+
+      ## Loop over montage tiles
+      Loop $TileNumber - 1 
+         ## update counter for montage tiles
+         Count = $Count + 1
+
+         ## Read image shift from file
+         ReadLineToArray MTSPar MontIS_D
+
+         ## Vector difference between this image shift and the last
+         IS_X = $MontIS_D[1] - $LastMontIS_D[1]
+         IS_Y = $MontIS_D[2] - $LastMontIS_D[2]
+
+         ## Defocus change
+         DelDef = $MontIS_D[3] - $LastMontIS_D[3]
+
+         ## Apply image shift
+         ImageShiftByMicrons $IS_X $IS_Y
+
+         ## Apply defocus offset if necessary
+         if $DelDef != 0
+            ChangeFocus $DelDef
+            echo change focus by $DelDef
+         Endif
+
+         ## Get current image shift (necessary?)
+         ReportSpecimenShift
+
+         ## Open outputfile for this tile
+         output_file = $OFPrefix_$Angle_$Count.mrc
+         OpenNewFile $output_file 
+
+         ## Delay after image shift and then record image, save image, and
+         ## close file
+         Delay $ISDelay
+         Record
+         Save
+         CloseFile 
+         Echo $output_file saved
+         If $Beamcentering == 1
+            CenterBeamFromImage 1
+         Endif
+
+         ## Store current image shift for next montage tile
+         LastMontIS_D = $MontIS_D
+      EndLoop
+   
+   ## Negative tilts
+   Else
+
+      ## Tilt to angle (first go -1 below target)
+      TiltTo ($Angle - 1)
+      TiltTo $Angle
+
+      ## Move stage to last aligned x and y 
+      MoveStageTo $MinusStagePos[1] $MinusStagePos[2]
+
+      ## Apply aligned to last saved (negative tilt) view image
+      Loop $LmtRATimes
+         View
+         AlignTo S
+         ReportSpecimenShift 
+         IS = $reportedValue1 * $reportedValue1 + $reportedValue2 * $reportedValue2
+         If $IS > $LmtISShift
+            ResetImageShift
+         Else
+            Break 
+         Endif 
+      EndLoop
+
+      ## Update view image for negative tilts and save stage position
+      View
+      Copy A S
+      ReportStageXYZ
+      MinusStagePos[1] = $ReportedValue1
+      MinusStagePos[2] = $ReportedValue2
+      
+      ## Autofocus and center beam
+         Trial 
+         CenterBeamFromImage
+
+      AutoFocus
+
+      # Read number of tiles from file
+      ReadLineToArray MTSPar TileNumber
+      Echo $TileNumber tiles for this tilt      
+
+      ## Get image shift from file for first tile and apply it
+      ReadLineToArray MTSPar LastMontIS_D
+      ImageShiftByMicrons $LastMontIS_D[1] $LastMontIS_D[2]
+
+      ## Change focus if required
+      if $LastMontIS_D[3] != 0
+         ChangeFocus $LastMontIS_D[3]
+         echo change focus by $LastMontIS_D[3]
+      Endif
+
+      ## Make output file
+      output_file = $OFPrefix_$Angle_$Count.mrc
+      OpenNewFile $output_file 
+
+      ## Delay after image shift and then record image, save image, and
+      ## close file
+      Delay $ISDelay
+      Record
+      Save
+      CloseFile 
+      Echo $output_file saved
+
+      ## Center beam from record image (using centroid - beam should be fully in image)
+      If $Beamcentering == 1
+         CenterBeamFromImage 1
+      Endif
+
+      ## Loop over montage tiles
+      Loop $TileNumber - 1
+         ## update counter for montage tiles
+         Count = $Count + 1
+
+         ## Read image shift from file
+         ReadLineToArray MTSPar MontIS_D
+
+         ## Vector difference between this image shift and the last
+         IS_X = $MontIS_D[1] - $LastMontIS_D[1]
+         IS_Y = $MontIS_D[2] - $LastMontIS_D[2]
+
+         ## Defocus change
+         DelDef = $MontIS_D[3] - $LastMontIS_D[3]
+         if $DelDef != 0
+            echo change focus by $DelDef
+            ChangeFocus $DelDef
+         Endif  
+
+         ## Apply image shift
+         ImageShiftByMicrons $IS_X $IS_Y
+
+         ## Get current image shift (necessary?)
+         ReportSpecimenShift
+         output_file = $OFPrefix_$Angle_$Count.mrc
+         OpenNewFile $output_file 
+
+         ## Delay after image shift and then record image, save image, and
+         ## close file
+         Delay $ISDelay
+         Record
+         Save
+         CloseFile 
+         Echo $output_file saved
+         If $Beamcentering == 1
+            CenterBeamFromImage 1
+         Endif
+
+         ## Store current image shift for next montage tiles
+         LastMontIS_D = $MontIS_D
+      EndLoop
+
+   Endif 
+EndLoop 
+
+TiltTo 0
+SetImageShift 0 0
