@@ -222,15 +222,16 @@ def write_tilts_and_image_shifts_to_file(filename,tilts,imageshifts,zs):
 
     f.close()
     
-def calculate_defocii(imageshifts,angles):
+def calculate_defocii(imageshifts,angles,tiltaxisrotation=0):
 
     # Generate tilt axis vector
     zs = []
+    R = rotation_matrix(tiltaxisrotation)
     for alpha,imshift in zip(angles,imageshifts):
         # calculate cross product (component of image shift away from tilt axis)
         # times tangent of alpha
 
-        zs.append(np.tan(np.deg2rad(alpha))*imshift[:,1])
+        zs.append(np.tan(np.deg2rad(alpha))*( R @ imshift.T).T[:,1])
     return zs
 
 
@@ -266,7 +267,7 @@ if __name__=='__main__':
 
         # Generate montage shifts for this tilt, shift by overlap
         # output is in pixels
-        imagexy = generate_montage_shifts(o,[m,n],[nx,ny],shift=[(itilts/o[0])%1.0,(itilts/o[1])%1.0])*p
+        imagexy = generate_montage_shifts(o,[m,n],[nx,ny],shift=[(itilts/o[0])%1.0,(itilts/o[1])%1.0])
 
         if generate_plot:
             
@@ -277,11 +278,11 @@ if __name__=='__main__':
             a = ax[i,j]
 
             # Plot image-shift points
-            a.plot(imagexy[:,0],imagexy[:,1],'k--',linewidth=0.25)
+            a.plot(imagexy[:,0]*p,imagexy[:,1]*p,'k--',linewidth=0.25)
 
             # Add rectangles for camera field of view
             for i,xy in enumerate(imagexy):
-                x,y = xy
+                x,y = [x*p for x in xy]
                 a.add_artist(Rectangle([x-nx/2*p,y-ny/2*p],nx*p,ny*p,ec='none',fc='b',alpha=1/5))
                 ax[-1,-1].add_artist(Rectangle([x-nx/2*p,y-ny/2*p],nx*p,ny*p,ec='none',fc='b',alpha=1/ntilts/2))
                 # Annotate first plot
@@ -290,8 +291,8 @@ if __name__=='__main__':
             a.set_aspect('equal')
             
             if itilts ==0:
-                minx,maxx = [np.amin(imagexy[:,0])-nx*p,np.amax(imagexy[:,0])+nx*p*1.5]
-                miny,maxy = [np.amin(imagexy[:,1])-ny*p,np.amax(imagexy[:,1])+ny*p*1.5]
+                minx,maxx = [np.amin(imagexy[:,0])*p-nx*p,np.amax(imagexy[:,0])*p+nx*p*1.5]
+                miny,maxy = [np.amin(imagexy[:,1])*p-ny*p,np.amax(imagexy[:,1])*p+ny*p*1.5]
             # Plot tilt-axis
             a.plot([minx,maxx], [minx*np.tan(np.deg2rad(tiltaxisrotation)),maxx*np.tan(np.deg2rad(tiltaxisrotation))],'k--')
             # a.text((maxx-minx)/6*5+minx,(minx+(maxx-minx)/6*5),'Tilt axis',ha='left',va='center')
@@ -300,7 +301,8 @@ if __name__=='__main__':
 
         # Apply tilt axis rotation since Serial-EM accepts shifts in basis
         # along and perpendicular to tilt axis.
-        imagexy = (rotation_matrix(tiltaxisrotation) @ imagexy.T).T
+        # Dep
+        # imagexy = (rotation_matrix(tiltaxisrotation) @ imagexy.T).T
         imageshifts.append(imagexy)
 
     if generate_plot:
@@ -316,5 +318,7 @@ if __name__=='__main__':
     # Calculate defocii to compensate for distance from tilt axis
     zs = calculate_defocii(imageshifts,tilts)
 
-    # Save image shifts for Serial-EM    
-    write_tilts_and_image_shifts_to_file(output + '.txt',tilts,[i/1e4 for i in imageshifts],[z/1e4 for z in zs])
+    # Save image shifts for Serial-EM in units of pixels in the camera
+    # basis (x and y aligned with camera axes). Imageshifts will be 
+    # converted to basis aligned with tilt axis inside SerialEM
+    write_tilts_and_image_shifts_to_file(output + '.txt',tilts,imageshifts,[z/1e4 for z in zs])

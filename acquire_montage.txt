@@ -33,6 +33,16 @@ NewArray Angle -1 1
 NewArray MontIS_D -1 3
 NewArray LastMontIS_D -1 3 
 echo $TSNumber
+
+# Get matrix to convert from camera values for image shift (which is what is inputted)
+# to
+GoToLowDoseArea R
+CameraToSpecimenMatrix 0
+XperX = $ReportedValue1
+XperY = $ReportedValue2
+YperX = $ReportedValue3
+YperY = $ReportedValue4
+
 ## Loop over tilts
 Loop $TSNumber
 
@@ -81,11 +91,18 @@ Loop $TSNumber
       ReadLineToArray MTSPar LastMontIS_D
       echo  $Count  $LastMontIS_D
 
+      ## Convert image shift from camera pixel units to specimen units
+      ## by multiplying by appropriate matrix
+      Xout = $LastMontIS_D[1] * XperX + $LastMontIS_D[2] * XperY
+      Yout = $LastMontIS_D[1] * YperX + $LastMontIS_D[2] * YperY 
+      LastMontIS_D[1] = $Xout
+      LastMontIS_D[2] = $Yout
+
       ## Apply image shift from file
-      ImageShiftByMicrons $LastMontIS_D[1] $LastMontIS_D[2]
+      ImageShiftByMicrons $Xout $Yout
 
       ## Open output file
-      output_file = $OFPrefix_$Angle_$Count.mrc
+      output_file = $OFPrefix_$Angle.mrc
       OpenNewFile $output_file 
 
       ## Delay after image shift and then record image save, and
@@ -93,9 +110,7 @@ Loop $TSNumber
       Delay $ISDelay
       Record
       Save
-      CloseFile 
-      Echo $output_file saved
-
+      
       # beam centering using centroid 1 means beam should be fully in image
       If $Beamcentering == 1
          CenterBeamFromImage 1
@@ -111,23 +126,26 @@ Loop $TSNumber
          ReadLineToArray MTSPar MontIS_D
          echo  $indx $Count  $MontIS_D
 
+         ## Convert image shift from camera pixel units to specimen units
+         ## by multiplying by appropriate matrix
+         Xout = $MontIS_D[1] * XperX + $MontIS_D[2] * XperY
+         Yout = $MontIS_D[1] * YperX + $MontIS_D[2] * YperY 
+
          ## Difference in image shift from last image shift vector
-         IS_X = $MontIS_D[1] - $LastMontIS_D[1]
-         IS_Y = $MontIS_D[2] - $LastMontIS_D[2]
+         IS_X = $Xout - $LastMontIS_D[1]
+         IS_Y = $Yout - $LastMontIS_D[2]
          ImageShiftByMicrons $IS_X $IS_Y
          ReportSpecimenShift
 
          # Open output file
-         output_file = $OFPrefix_$Angle_$Count.mrc
-         OpenNewFile $output_file
+         # output_file = $OFPrefix_$Angle_$Count.mrc
+         # OpenNewFile $output_file
 
          ## Delay after image shift and then record image, save image, and
          ## close file
          Delay $ISDelay
          Record
-         Save
-         CloseFile 
-         Echo $output_file saved
+         Save 
 
          # Center beam
          If $Beamcentering == 1
@@ -136,9 +154,14 @@ Loop $TSNumber
 
          # Store current image shift as last image shift for next loop
          # iteration
-         LastMontIS_D = $MontIS_D
+         $LastMontIS_D[1] = $Xout
+         $LastMontIS_D[2] = $Yout
+
       EndLoop
-   
+
+      # Close file
+      CloseFile
+
    # Positive tilts
    ElseIf $Angle > 0
       TiltTo $Angle
@@ -188,7 +211,16 @@ Loop $TSNumber
 
       ## Get image shift from file for first tile and apply it
       ReadLineToArray MTSPar LastMontIS_D
-      ImageShiftByMicrons $LastMontIS_D[1] $LastMontIS_D[2]
+
+      ## Convert image shift from camera pixel units to specimen units
+      ## by multiplying by appropriate matrix
+      Xout = $LastMontIS_D[1] * XperX + $LastMontIS_D[2] * XperY
+      Yout = $LastMontIS_D[1] * YperX + $LastMontIS_D[2] * YperY 
+      LastMontIS_D[1] = $Xout
+      LastMontIS_D[2] = $Yout
+
+      ## Apply image shift from file
+      ImageShiftByMicrons $Xout $Yout
 
       ## Change focus if required
       if $LastMontIS_D[3] != 0
@@ -197,7 +229,7 @@ Loop $TSNumber
       endif
 
       ## Make output file
-      output_file = $OFPrefix_$Angle_$Count.mrc
+      output_file = $OFPrefix_$Angle.mrc
       OpenNewFile $output_file 
 
       ## Delay after image shift and then record image, save image, and
@@ -205,7 +237,6 @@ Loop $TSNumber
       Delay $ISDelay
       Record
       Save
-      CloseFile 
       Echo $output_file saved
 
       ## Center beam from record image (using centroid - beam should be fully in image)
@@ -222,9 +253,14 @@ Loop $TSNumber
          ## Read image shift from file
          ReadLineToArray MTSPar MontIS_D
 
-         ## Vector difference between this image shift and the last
-         IS_X = $MontIS_D[1] - $LastMontIS_D[1]
-         IS_Y = $MontIS_D[2] - $LastMontIS_D[2]
+         ## Convert image shift from camear pixel units to specimen units
+         ## by multiplying by appropriate matrix
+         Xout = $MontIS_D[1] * XperX + $MontIS_D[2] * XperY
+         Yout = $MontIS_D[1] * YperX + $MontIS_D[2] * YperY 
+
+         ## Difference in image shift from last image shift vector
+         IS_X = $Xout - $LastMontIS_D[1]
+         IS_Y = $Yout - $LastMontIS_D[2]
 
          ## Defocus change
          DelDef = $MontIS_D[3] - $LastMontIS_D[3]
@@ -242,24 +278,26 @@ Loop $TSNumber
          ReportSpecimenShift
 
          ## Open outputfile for this tile
-         output_file = $OFPrefix_$Angle_$Count.mrc
-         OpenNewFile $output_file 
+         # output_file = $OFPrefix_$Angle_$Count.mrc
+         # OpenNewFile $output_file 
 
          ## Delay after image shift and then record image, save image, and
          ## close file
          Delay $ISDelay
          Record
          Save
-         CloseFile 
+          
          Echo $output_file saved
          If $Beamcentering == 1
             CenterBeamFromImage 1
          Endif
 
-         ## Store current image shift for next montage tile
-         LastMontIS_D = $MontIS_D
+         # Store current image shift as last image shift for next loop
+         # iteration
+         $LastMontIS_D[1] = $Xout
+         $LastMontIS_D[2] = $Yout
       EndLoop
-   
+      CloseFile
    ## Negative tilts
    Else
 
@@ -291,8 +329,11 @@ Loop $TSNumber
       MinusStagePos[2] = $ReportedValue2
       
       ## Autofocus and center beam
+      # Center beam
+      If $Beamcentering == 1
          Trial 
          CenterBeamFromImage
+      Endif
 
       AutoFocus
 
@@ -302,7 +343,16 @@ Loop $TSNumber
 
       ## Get image shift from file for first tile and apply it
       ReadLineToArray MTSPar LastMontIS_D
-      ImageShiftByMicrons $LastMontIS_D[1] $LastMontIS_D[2]
+      
+      ## Convert image shift from camera pixel units to specimen units
+      ## by multiplying by appropriate matrix
+      Xout = $LastMontIS_D[1] * XperX + $LastMontIS_D[2] * XperY
+      Yout = $LastMontIS_D[1] * YperX + $LastMontIS_D[2] * YperY 
+      LastMontIS_D[1] = $Xout
+      LastMontIS_D[2] = $Yout
+
+      ## Apply image shift from file
+      ImageShiftByMicrons $Xout $Yout
 
       ## Change focus if required
       if $LastMontIS_D[3] != 0
@@ -311,7 +361,7 @@ Loop $TSNumber
       Endif
 
       ## Make output file
-      output_file = $OFPrefix_$Angle_$Count.mrc
+      output_file = $OFPrefix_$Angle.mrc
       OpenNewFile $output_file 
 
       ## Delay after image shift and then record image, save image, and
@@ -319,7 +369,6 @@ Loop $TSNumber
       Delay $ISDelay
       Record
       Save
-      CloseFile 
       Echo $output_file saved
 
       ## Center beam from record image (using centroid - beam should be fully in image)
@@ -334,6 +383,13 @@ Loop $TSNumber
 
          ## Read image shift from file
          ReadLineToArray MTSPar MontIS_D
+
+         ## Convert image shift from camera pixel units to specimen units
+         ## by multiplying by appropriate matrix
+         Xout = $MontIS_D[1] * XperX + $MontIS_D[2] * XperY
+         Yout = $MontIS_D[1] * YperX + $MontIS_D[2] * YperY 
+         MontIS_D[1] = $Xout
+         MontIS_D[2] = $Yout
 
          ## Vector difference between this image shift and the last
          IS_X = $MontIS_D[1] - $LastMontIS_D[1]
@@ -351,15 +407,15 @@ Loop $TSNumber
 
          ## Get current image shift (necessary?)
          ReportSpecimenShift
-         output_file = $OFPrefix_$Angle_$Count.mrc
-         OpenNewFile $output_file 
+         # output_file = $OFPrefix_$Angle_$Count.mrc
+         # OpenNewFile $output_file 
 
          ## Delay after image shift and then record image, save image, and
          ## close file
          Delay $ISDelay
          Record
          Save
-         CloseFile 
+         
          Echo $output_file saved
          If $Beamcentering == 1
             CenterBeamFromImage 1
@@ -368,7 +424,7 @@ Loop $TSNumber
          ## Store current image shift for next montage tiles
          LastMontIS_D = $MontIS_D
       EndLoop
-
+      CloseFile 
    Endif 
 EndLoop 
 
