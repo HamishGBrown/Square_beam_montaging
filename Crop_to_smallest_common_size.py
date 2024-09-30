@@ -5,6 +5,7 @@ import numpy as np
 import re
 import os
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 import argparse
 
 fnams = ['Montage_{0:.1f}.tiff'.format(x) for x in np.arange(-48,49,3)]
@@ -41,7 +42,7 @@ if __name__=='__main__':
     else:
         outputdir = args['output']
 
-    fnams = glob.glob(os.path.join(inputdir,'*.tiff'))
+    fnams = glob.glob(os.path.join(inputdir,'*.tiff')) +glob.glob(os.path.join(inputdir,'*.tif'))
 
     # Sort filenames in order of increasing tilt
     fnams = sorted(fnams,key=extract_number)
@@ -52,31 +53,36 @@ if __name__=='__main__':
     for fnam in fnams[1:]:
         maxsize= [max(x,xx) for x,xx in zip(Image.open(fnam).size,maxsize)]
 
-    cropped_names = [fnam.replace('.tiff','_cropped.mrc') for fnam in fnams]
+    cropped_names = [os.path.splitext(fnam)[0]+'cropped.mrc' for fnam in fnams]
 
     # for fnam in fnams:
-    for i,fnam in enumerate(fnams):
-        mrcname = fnam.replace('.tiff','.mrc')
-        command = 'tif2mrc {0} {1}'.format(fnam,mrcname)
-        print(command)
-        os.system(command)
-        command = 'clip resize -ox {0} -oy {1} -p 0 {2} {3}'.format(*maxsize,mrcname,cropped_names[i])
-        print(command)
-        os.system(command)
-        print('Removing {0}'.format(mrcname))
-        os.system('rm {0}'.format(mrcname))
+    # for i,fnam in enumerate(fnams):
+    #     # Run tif to mrc
+    #     mrcname = os.path.splitext(fnam)[0]+'.mrc'
+    #     command = 'tif2mrc {0} {1}'.format(fnam,mrcname)
+    #     print(command)
+    #     os.system(command)
+
+    #     # Run the clip utility to crop/pad images to common size
+    #     command = 'clip resize -ox {0} -oy {1} -p 0 {2} {3}'.format(*maxsize,mrcname,cropped_names[i])
+    #     print(command)
+    #     os.system(command)
+
+    #     # Remove temporary mrc file
+    #     print('Removing {0}'.format(mrcname))
+    #     os.system('rm {0}'.format(mrcname))
     
     # Join all in stack
     command = 'newstack {0} {1}'.format(' '.join(cropped_names),'Montage_stack.mrc')
     # sys.exit()
 
-    for i,fnam in enumerate(tqdm(cropped_names,desc='filling black areas')):
-        with mrcfile.open(fnam,'r+') as m:
-            data = np.asarray(m.data)
-            fill = np.median(data[data>2])
-            data[data<2] = fill
-            m.data[:] = data[:]
-        m.close()
+    # for i,fnam in enumerate(tqdm(cropped_names,desc='filling black areas')):
+    #     with mrcfile.open(fnam,'r+') as m:
+    #         data = np.asarray(m.data)
+    #         fill = np.median(data[data>2])
+    #         data[data<2] = fill
+    #         m.data[:] = data[:]
+    #     m.close()
 
     
 

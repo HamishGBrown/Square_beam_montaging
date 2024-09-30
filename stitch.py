@@ -585,28 +585,30 @@ def make_gain_ref(images, binning=8):
     # Loop through each image file
     for i, image in enumerate(tqdm(images, desc="Averaging images to gain ref")):
         # Open the MRC file and read the image data
-        with mrcfile.open(image) as mrc:
-            im = np.asarray(mrc.data)
+        memmap = mrcfile.mrcmemmap.MrcMemmap(image)
 
-        # Perform Fourier interpolation on the image to bin it
-        im = fourier_interpolate(im, [x // binning for x in im.shape])
+        for j,img in enumerate(memmap.data):
+            im = np.asarray(img)
 
-        # Create a mask for the image
-        msk = make_mask(im)
+            # Perform Fourier interpolation on the image to bin it
+            im = fourier_interpolate(im, [x // binning for x in im.shape])
 
-        # For the first image, initialize the template and gain reference
-        if i == 0:
-            template = np.where(msk, 1, 0)  # Create the binary template mask
-            gainref = copy.deepcopy(
-                im
-            )  # Initialize the gain reference with the first image
-        else:
-            # For subsequent images, align them to the template
-            y, x = cross_correlate_alignment(
-                np.where(msk, 1, 0), template, returncoords=True
-            )
-            # Add the aligned image to the gain reference
-            gainref += np.roll(im, (y, x), axis=(-2, -1))
+            # Create a mask for the image
+            msk = make_mask(im,shrinkn=20//binning)
+
+            # For the first image, initialize the template and gain reference
+            if i == 0 and j == 0 :
+                template = np.where(msk, 1, 0)  # Create the binary template mask
+                gainref = copy.deepcopy(
+                    im
+                )  # Initialize the gain reference with the first image
+            else:
+                # For subsequent images, align them to the template
+                y, x = cross_correlate_alignment(
+                    np.where(msk, 1, 0), template, returncoords=True
+                )
+                # Add the aligned image to the gain reference
+                gainref += np.roll(im, (y, x), axis=(-2, -1))
 
     # Normalize the gain reference by the median value of the template region
     median = np.median(gainref[template == 1])
@@ -616,15 +618,16 @@ def make_gain_ref(images, binning=8):
 
 
 def montage(
-    images,
+    image,
+    outdir,
     positions,
     pixel_size,
-    masks=None,
     binning=8,
     tiltaxisrotation=0,
     gainref=None,
     gainrefmask=None,
     skipcrosscorrelation=False,
+    tiles = None,
 ):
     """
     Creates a montage image from a series of input images by aligning and stitching them together.
@@ -635,20 +638,23 @@ def montage(
 
     Parameters:
     -----------
-    images : list of str
-        List of file paths to the input images (in MRC format) to be included in the montage.
+    image : str
+        mrc file containing montage tiles
+    outdir : str
+        directory for output
     positions : numpy.ndarray
-        Array of shape (N, 2) containing the (x, y) coordinates for positioning each image.
+        Array of shape (N, 2) containing the (x, y) coordinates for positioning each image in units of pixels.
+        Note that the x,y have opposite convention to standard y,x Python convention
     pixel_size : float
         The pixel size in Angstroms.
-    masks : list of str, optional
-        List of file paths to mask images (in MRC format). If None, masks will be generated automatically.
     binning : int, optional
         Binning factor to reduce the image size. Default is 8.
     tiltaxisrotation : float, optional
         Rotation angle of the tilt axis, used to correct the positions. Default is 0.
     gainref : numpy.ndarray, optional
         Gain reference image used to normalize the input images. Default is None.
+    tiles : None or sliceobject, optional
+        Slice object indicating tiles that will be stitched (mainly for testing purposes)
 
     Returns:
     --------
@@ -656,40 +662,40 @@ def montage(
         The resulting stitched montage image.
     """
 
-    # Get the shape and data type of the montage tiles from the first image
-    with mrcfile.mrcmemmap.MrcMemmap(images[0]) as mrc:
-        dtype = mrc.data.dtype
-        pixels = np.asarray([x // binning for x in mrc.data.shape[-2:]], dtype=int)
+    # Load images as mrc memory map
+    mrcmemmap = mrcfile.mrcmemmap.MrcMemmap(image)
+
+    # Get the shape and data type of the montage tiles
+    dtype = mrcmemmap.data.dtype
+    pixels = np.asarray([x // binning for x in mrcmemmap.data.shape[-2:]], dtype=int)
+
+    if tiles is None:
+        M = slice(0,len(mrcmemmap.data))
+    else:
+        M = tiles
 
     # Rotate the position coordinates back to camera coordinates based on tilt axis rotation
     positions = (rotation_matrix(-tiltaxisrotation) @ positions[:, :2].T).T
     # positions = -positions[:,::-1]
-    positions[:, 0] *= -1  # Invert the x-axis for correct alignment
-    # fig, ax = plt.subplots()
-    # ax.plot(*positions.T, "ko")
-    # plt.show(block=True)
+    # flip y axis and multiply by pixel size in microns (hence 1e-4)
+    # positions[:, 0] *= -1  # Invert the x-axis for correct alignment
+    positions *= pixel_size*1e-4
+    #fig, ax = plt.subplots()
+    #ax.plot(*positions.T, "ko")
+    #plt.show(block=True)
     # positions = positions[:,::-1]
 
-    # If masks are provided, process them; otherwise, initialize an empty mask list
-    if masks is not None:
-        msks = np.zeros((len(masks), *pixels), dtype=bool)
-        for i in range(len(masks)):
-            with mrcfile.open(masks[i]) as mrc:
-                msk = np.asarray(mrc.data)
-            msks[i] = fourier_interpolate(np.where(msk, 1, 0), pixels) > 0.9
-    else:
-        msks = []
+    # Initialize an empty mask list
+    msks = []
 
     ims = []  # List to store the processed images
-    for i, (image, position) in enumerate(zip(images, positions)):
-        with mrcfile.open(image) as mrc:
-            im = np.asarray(mrc.data)
+    for position,img in tqdm(zip(positions[M],mrcmemmap.data[M]),total=len(positions[M]),desc='Applying gain reference'):
+        im = np.asarray(img)
         im = fourier_interpolate(im, [x // binning for x in im.shape])
 
         # Generate a mask if none is provided
-        if masks is None:
-            msk = make_mask(im)
-            msks.append(msk)
+        msk = make_mask(im,shrinkn=20//binning)
+        msks.append(msk)
 
         # Apply gain reference correction if provided
         if gainref is not None:
@@ -698,32 +704,26 @@ def montage(
             im[msk] /= np.roll(gainref, (-y, -x), axis=(-2, -1))[msk]
             im = np.where(msk, im, 0)
 
-        # Normalize the image by replacing non-masked areas with random noise
-        # std = np.std(im[msk])
-        # mean = np.mean(im[msk])
-        # im = np.where(msk, im, np.random.random_sample(size=im.shape) * std + mean)
         ims.append(im)
 
-    # Calculate the overlaps between adjacent tiles
-    overlaps = find_overlaps(positions, pixels, pixel_size * binning, msks, ims)
-
-    # Refine the tile positions using cross-correlation between overlapping
-    # tiles
-
     if not skipcrosscorrelation:
-        positions = cross_correlate_tiles(
-            positions, ims, msks, overlaps, pixel_size * binning, generate_plot=False
+        # Calculate the overlaps between adjacent tiles
+        overlaps = find_overlaps(positions[M], pixels, pixel_size * binning, msks,plot=False)
+
+        # Refine the tile positions using cross-correlation between overlapping
+        # tiles
+        plotfile = os.path.join(outdir, os.path.split(file)[1].replace('.mrc','_Plot.pdf'))
+        positions[M] = cross_correlate_tiles(
+            positions[M], ims, msks, overlaps, pixel_size * binning, generate_plot=plotfile
         )
-    # ax.plot(*positions.T, "bo")
-    # plt.show(block=True)
 
     # Determine the global range of tiles in Angstroms
-    width = np.ptp(positions, axis=0) * 1e4
-    origin = np.amin(positions, axis=0) * 1e4
+    width = np.ptp(positions[M], axis=0) * 1e4
+    origin = np.amin(positions[M], axis=0) * 1e4
 
     # Calculate the size of the global montage canvas in pixels
     size = (
-        np.asarray(width / pixel_size / binning, dtype=int)
+        np.asarray(width / pixel_size / binning, dtype=int)[::-1]
         + pixels
         + np.asarray([1, 1])
     )
@@ -733,19 +733,23 @@ def montage(
     overlap = np.zeros(size, dtype=np.uint8)
 
     # Place each image onto the canvas, applying the masks
-    for i, (im, position, msk) in enumerate(zip(ims, positions, msks)):
+    for i, (im, position, msk) in enumerate(tqdm(zip(ims, positions[M], msks),desc='Stitching')):
         s = im.shape
-        x0, y0 = [int(x) for x in (position * 1e4 - origin) / pixel_size / binning]
+        y0, x0 = [int(x) for x in (position * 1e4 - origin) / pixel_size / binning]
         canvas[x0 : x0 + s[0], y0 : y0 + s[1]] += np.where(msk, im, 0)
         overlap[x0 : x0 + s[0], y0 : y0 + s[1]] += np.where(
             msk, np.uint8(1), np.uint8(0)
         )
 
     # Normalize the canvas by the overlap map to account for overlapping regions
+    median = np.median(canvas[overlap == 1])
+    canvas[overlap<1] = median
     overlap = np.where(overlap > 1, overlap, 1)
     canvas /= overlap
 
-    return canvas
+    fileout = os.path.join(outdir, os.path.split(file)[1].replace('.mrc','.tif'))
+    Image.fromarray(canvas.astype(np.int16)).save(fileout)
+    # return canvas
 
 
 def plot_overlaps(positions, overlaps, show=True):
@@ -771,36 +775,81 @@ def array_overlap(dx, n):
 
 
 def find_overlaps(
-    positions, pixels, pixel_size, masks=None, images=None, minoverlapfrac=0.03
+    positions, pixels, pixel_size, masks, minoverlapfrac=0.01,plot=True
 ):
-    def check_mask_overlaps(positions, masks, i, j):
-        dx = positions[i] - positions[j]
+    """
+    Identify pairs of images that overlap in a 2D montage, based on their positions
+    and field of view, and further refine the overlap based on binary masks.
 
-    m = len(positions)
+    Parameters:
+    ----------
+    positions : ndarray of shape (m, 2)
+        The (x, y) coordinates of `m` images in a 2D montage. Note that
+        the positions array is ordered (x,y) opposite to python standard (y,x)
+    pixels : tuple or list of length 2
+        Dimensions of each image in pixels, as (height, width).
+    pixel_size : float
+        The size of each pixel in microns.
+    masks : list of ndarrays
+        Binary masks for each image (same shape as image), used to check if
+        a specific region of the images overlaps. If None, the function only
+        considers the geometric overlap.
+    minoverlapfrac : float, optional
+        Minimum fraction of overlap (based on pixel area) required for two images
+        to be considered overlapping. Default is 0.03 (i.e., 3%).
+    plot : float, optional
+    Returns:
+    -------
+    overlapping_inds : list of lists
+        List of pairs of indices representing images that overlap.
+        Each element is a list of two indices `[i, j]`, where the i-th and j-th
+        images overlap.
+    """
+    m = len(positions) # Number of images
 
     from scipy.spatial.distance import pdist
+
+    # Calculate the size of each field of view in microns (height, width)
+    # Order of pixels array has to be reversed from python standard to match
+    # positions array
+    criterion = pixel_size * np.asarray(pixels)[::-1] * 1e-4
 
     # Calculate (unique) distances between montage pieces
     # with scipy's pdist (pair-wise distance) function and
     # calculate which are within a "field of view" of each other
     # result is stored in a condensed distance matrix
-    criterion = pixel_size * np.asarray(pixels) * 1e-4
+
     overlaps = np.logical_and(
         *[pdist(positions[..., i : i + 1]) / criterion[i] < 1.0 for i in range(2)]
     )
-    # plot_overlaps(positions,overlaps)
 
+    # Visualize the positions and overlap status
+    if plot:
+        overlapfig = plot_overlaps(positions,overlaps,show=False)
+        overlapax = overlapfig.get_axes()[0]
+
+    # List to store the indices of overlapping image pairs
     overlapping_inds = []
+
+    # Update criterion to be the minimum required overlap area in pixels
     criterion = minoverlapfrac * np.product(pixels)
+
+    # Iterate over the condensed distance matrix
     for n, val in enumerate(overlaps):
-        if val:
+        if val:  # If overlap is detected
+            # Convert the index in the condensed matrix back to the square form
             i, j = condensed_to_square(n, m)
             x1 = positions[i]
             x2 = positions[j]
-            # Relative shift in pixels
+
+            # Calculate the relative shift in position between the two images, in pixels
             dx = [int(x) for x in (x2 - x1) / pixel_size * 1e4]
-            i1, i2 = array_overlap(dx[0], pixels[0])
-            j1, j2 = array_overlap(dx[1], pixels[1])
+
+             # Determine the overlapping pixel regions in both images
+            i1, i2 = array_overlap(dx[1], pixels[0])
+            j1, j2 = array_overlap(dx[0], pixels[1])
+
+            # Check if the overlap area in the masks exceeds the minimum criterion
             overlap = (
                 np.sum(
                     np.logical_and(
@@ -810,8 +859,18 @@ def find_overlaps(
                 )
                 >= criterion
             )
+            # fig,ax = plt.subplots(ncols=2)
+            # ax[0].imshow(np.where(masks[i],1,0))
+            # ax[1].imshow(np.where(masks[j],1,0))
+            # plt.show(block=True)
             if overlap:
                 overlapping_inds.append([i, j])
+                if plot:
+                    x1 = positions[i]
+                    x2 = positions[j]
+                    overlapax.plot([x1[0], x2[0]], [x1[1], x2[1]], "b--")
+    if plot:
+        plt.show(block=True)
     return overlapping_inds
 
 
@@ -850,6 +909,37 @@ def cross_correlate_tiles(
     max_shift=50,
     generate_plot=False,
 ):
+    """
+    Perform cross-correlation-based alignment of image tiles and adjust their positions.
+
+    This function aligns overlapping image tiles by calculating the relative shifts between them
+    using masked phase cross-correlation. The shifts are then used to adjust the global positions
+    of the tiles through least squares minimization. The function supports visualizing the tile
+    positions and shift vectors if desired.
+
+    Args:
+        positions (ndarray): Nx2 array of the initial x, y coordinates of the tiles in micrometers.
+        tiles (list of ndarrays): List of 2D arrays representing the image tiles.
+        masks (list of ndarrays): List of binary masks representing the valid regions of the tiles.
+        overlaps (list of tuples): Pairs of indices representing which tiles overlap and should be aligned.
+        pixel_size (float): The pixel size in microns.
+        max_correction (float, optional): Maximum allowed correction (in microns) for shifts between tiles. Defaults to 0.1.
+        max_shift (float, optional): Maximum allowed shift (in pixels) between overlapping tiles. Defaults to 50.
+        generate_plot (bool or string, optional): Whether to generate a plot visualizing the tile positions and shift vectors. Defaults to False.
+                                                  If a string this will be the filename that the plot will be saved as.
+
+    Returns:
+        ndarray: Updated Nx2 array of the adjusted x, y coordinates of the tiles.
+
+    Notes:
+        - The alignment is solved as a least squares problem (Ax = b) to minimize the relative shifts between overlapping tiles.
+        - If some tiles are not connected to others through reliable shift determinations, their positions are adjusted
+        using the initial relative positions inferred from the microscope.
+
+    References:
+        - Masked phase cross-correlation: https://scikit-image.org/docs/stable/auto_examples/registration/plot_masked_register_translation.html
+        - Dirk Padfield, "Masked object registration in the Fourier domain", IEEE Transactions on Image Processing, 2011.
+    """
     pixels = tiles[0].shape
 
     # We will solve global alignment of tiles by least squares Ax = b
@@ -860,9 +950,19 @@ def cross_correlate_tiles(
     A = []
     b = []
 
-    if generate_plot:
-        fig, ax = plt.subplots(ncols=2, nrows=2, figsize=(8, 8))
-        ax = ax.ravel()
+    genplot = False
+    if type(generate_plot) is bool:
+        genplot = generate_plot
+        show = True
+        savefig = False
+    elif type(generate_plot) is str:
+        genplot = True
+        show = False
+        savefig = True
+
+    if genplot:
+        xcorfig, xcorax = plt.subplots(ncols=2, nrows=2, figsize=(8, 8))
+        ax = xcorax.ravel()
         ax[0].plot(*positions.T, "ko", label="Initial tile positions")
         for i, pos in enumerate(positions):
             ax[0].annotate(str(i), pos)
@@ -870,7 +970,8 @@ def cross_correlate_tiles(
     G = nx.Graph()
     # Add nodes to graph
     G.add_nodes_from(list(range(len(positions))))
-    for ind, (i, j) in enumerate(overlaps):
+    #TODO make this threaded
+    for ind, (i, j) in enumerate(tqdm(overlaps,desc='Cross-correlation alignment')):
         # Align tiles by masked phase cross correlation, see:
         # https://scikit-image.org/docs/stable/auto_examples/registration/plot_masked_register_translation.html
         # and Padfield, Dirk. "Masked object registration in the Fourier domain." IEEE Transactions on image processing 21.5 (2011): 2706-2718.
@@ -880,7 +981,7 @@ def cross_correlate_tiles(
         x2 = positions[j]
 
         # Calculate relative shift in pixels
-        dx = [int(x) for x in (x2 - x1) / pixel_size * 1e4]
+        dx = [int(x) for x in (x2 - x1) / pixel_size * 1e4][::-1]
 
         # Get the indices for array overlap
         i1, i2 = array_overlap(dx[0], pixels[0])
@@ -896,13 +997,20 @@ def cross_correlate_tiles(
             i2[0] : i2[1], j2[0] : j2[1]
         ]
 
-        # Calculate shift by masked cross correlation
+        # Calculate shift by masked cross correlation with ordering (Y,X)
         detected_shift = phase_cross_correlation(
             tiles[i], tiles[j], reference_mask=reference_mask, moving_mask=moving_mask
         )
+        # fig,axes = plt.subplots(nrows = 2,ncols=2)
+        # ax = axes.ravel()
+        # ax[0].imshow(tiles[i])
+        # ax[2].imshow(tiles[j])
+        # ax[1].imshow(np.where(reference_mask,1,0))
+        # ax[3].imshow(np.where(moving_mask,1,0))
+        # plt.show(block=True)
 
         shifttoolarge = np.linalg.norm(np.asarray(dx) - detected_shift) > max_shift
-
+        # shifttoolarge=True
         if generate_plot:
             delta = np.asarray(detected_shift) * pixel_size * 1e-4
             if ind == 0:
@@ -910,17 +1018,17 @@ def cross_correlate_tiles(
             else:
                 label = None
 
-            if shifttoolarge and generate_plot:
+            if shifttoolarge and genplot:
                 ax[0].plot(
-                    [x1[0], x1[0] + delta[0]],
-                    [x1[1], x1[1] + delta[1]],
+                    [x1[0], x1[0] + delta[1]],
+                    [x1[1], x1[1] + delta[0]],
                     "r-",
                     label=label,
                 )
-            elif generate_plot:
+            elif genplot:
                 ax[0].plot(
-                    [x1[0], x1[0] + delta[0]],
-                    [x1[1], x1[1] + delta[1]],
+                    [x1[0], x1[0] + delta[1]],
+                    [x1[1], x1[1] + delta[0]],
                     "b-",
                     label=label,
                 )
@@ -941,22 +1049,29 @@ def cross_correlate_tiles(
             # Add valid connection to graph
             G.add_edge(i, j)
 
-    A = np.concatenate(A, axis=0)
+    # Join rows of A into numpy matrix
+    if len(A)>0:
+        A = np.concatenate(A, axis=0)
+    else:
+        A = np.asarray(A)
 
     # For some tiles there will be no reliable shift determinations
     # from cross-correlation linking them to the other tiles,
     # in this case default to using the original
     # shifts implied by the microscope image shifts if groups of tiles
-    #
+
     if not nx.is_connected(G):
+    # if False:
         extraA = []
-        islands = sorted(nx.connected_components(G), key=len, reverse=True)
+        islands = sorted(nx.connected_components(G), key=len)
         largest_island = islands.pop()
         anchor = largest_island.pop()
         # for i in np.where(np.all(A == 0, axis=0))[0]:
         for x in islands:
             i = x.pop()
-
+            x1 = positions[anchor]
+            x2 = positions[i]
+            delta = x1-x2
             # Loop over x and y components
             for j in range(2):
                 # Make new row to add to A matrix
@@ -964,22 +1079,22 @@ def cross_correlate_tiles(
                 Arow[2 * anchor + j] = 1
                 Arow[2 * i + j] = -1
                 extraA.append(Arow)
-                b.append((positions[anchor][j] - positions[i // 2][j]))
 
-            if generate_plot:
-                x1 = positions[anchor]
-                x2 = positions[i]
-                ax[0].plot([x1[0], x2[0]], [x1[1], x2[1]], "k--")
+                # (j+1)%2 swaps the order of x and y
+            b[len(b):] = delta[::-1].tolist()
+            if genplot:
+                ax[0].plot([x1[0], x1[0]-delta[0]], [x1[1], x1[1]-delta[1]], "k--")
 
         A = np.stack(A.tolist() + extraA, axis=0)
-    # U,S,Vh = np.linalg.svd(A)
-    # ax[1].imshow(U,cmap='bwr')
-    # # ax[1].set_title('Difference matrix')
-    # ax[2].imshow(Vh)
-    # ax[3].plot(S)
-    x, residuals, rank, s = np.linalg.lstsq(A, np.asarray(b), rcond=1e-1)
-    newx = x[::2]
-    newy = x[1::2]
+    # matfig,matax = plt.subplots(ncols=2)
+    # matax[0].imshow(A,vmin=-1,vmax=1,cmap='bwr')
+
+
+    # print(A,b)
+    x, residuals, rank, s = np.linalg.lstsq(A, np.asarray(b), rcond=1e-2)
+    # matax[1].plot(s)
+    newy = x[::2]
+    newx = x[1::2]
 
     # The absolute position is unconstrained in least squares minimization
     # Pin the position closest to the origin to its original absolute position
@@ -990,11 +1105,13 @@ def cross_correlate_tiles(
     positions[:, 0] = newx
     positions[:, 1] = newy
 
-    if generate_plot:
-        ax[0].plot(*positions.T, "bo", label="Initial tile positions")
+    if genplot:
+        ax[0].plot(*positions.T, "bo", label="Refined tile positions")
         ax[0].legend()
-        plt.show(block=True)
-
+        if show:
+            plt.show(block=True)
+        if savefig:
+            xcorfig.savefig(generate_plot)
     return positions
 
 
@@ -1121,6 +1238,27 @@ def setup_gainreference(gainreffile, filenames, outputdir):
 
     return gainref, gainrefmask
 
+def find_closest_index(arr, target):
+    """
+    Finds the index of the closest value in the array to the target value.
+    
+    Parameters:
+    arr (list or np.array): A list or numpy array of numbers
+    target (float or int): The target value to find the closest match for
+    
+    Returns:
+    int: The index of the closest value in the array
+    """
+    # Convert the input array to a numpy array if it's not already
+    arr = np.array(arr)
+    
+    # Compute the absolute difference between each element and the target
+    diff = np.abs(arr - target)
+    
+    # Find the index of the minimum difference
+    closest_index = np.argmin(diff)
+    
+    return closest_index
 
 if __name__ == "__main__":
     args = parse_commandline()
@@ -1136,11 +1274,11 @@ if __name__ == "__main__":
     mdoc = parse_mdoc(mdoc_files[0])
     pixelsize = float(mdoc["PixelSpacing"])
     if args["tiltaxisrotation"] is None:
-        tiltaxisrotation = extract_tilt_axis_angle(mdoc_files[0])
+        tiltaxisrotation =0
+        # tiltaxisrotation = extract_tilt_axis_angle(mdoc_files[0])
     else:
         tiltaxisrotation = float(args["tiltaxisrotation"])
 
-    # tiltaxisrotation = float(parse_mdoc(mdoc_files[0])["ZValue = 0"]["RotationAngle"])
 
     # get tilts and image shifts from all mdoc files
     tilts, imageshifts = [[], []]
@@ -1158,13 +1296,12 @@ if __name__ == "__main__":
 
     imageshifts = np.asarray(imageshifts)
 
-    # Get unique tilts and map of which images correspond to which tilts
-    uniquetilts, ntilts = np.unique(tilts, return_counts=True)
-
     # Get image shifts from file
     # TODO make SerialEM put this in the mdoc file in microns (not
     # weird TFS units) to obviate this step
     imageshifts = parse_image_shifts(args["image_shifts"])
+    tiltsfromfile = [imageshifts[x][0] for x in range(len(imageshifts))]
+    imageshifts = [imageshifts[x][1] for x in range(len(imageshifts))]
 
     # Load gain ref if available make a new one if not
     if args["gainref"] is not None:
@@ -1185,19 +1322,17 @@ if __name__ == "__main__":
     # Remove Fresnel fringes from gain reference mask
     gainrefmask = binary_erosion(
         gainrefmask,
-        structure=circular_mask([fringe_size * 2] * 2, radius=fringe_size / 2),
+        structure=circular_mask([fringe_size//binning * 2] * 2, radius=fringe_size//binning / 2),
     )
-    for i, tilt in enumerate(tqdm(uniquetilts, desc="Stitching montages")):
-        # For a given tilt get the images and image shifts for that tilt
-        mask = np.isclose(tilts, tilt)
-        # Sort image files by integer just before .mrc
-        imagefiles = sorted(
-            np.asarray(files)[mask],
-            key=lambda x: int(re.search(r"([-\d]+)\.mrc", x).group(1)),
-        )
-        positions = imageshifts[i][1]
+    for i,(file,tilt)  in enumerate(tqdm(zip(files,tilts), total = len(files),desc="Stitching montages")):
+        
+        # positions = imageshifts[i][1]
+        indx = find_closest_index(tiltsfromfile,tilt)
+        positions = imageshifts[indx]
+
         mont = montage(
-            imagefiles,
+            file,
+            outdir,
             positions,
             pixelsize,
             tiltaxisrotation=tiltaxisrotation,
@@ -1205,69 +1340,6 @@ if __name__ == "__main__":
             gainref=np.where(gainrefmask, gainref, 1),
             gainrefmask=gainrefmask,
             skipcrosscorrelation=args["skipcrosscorrelation"],
+            # tiles = slice(5),
         )
-        fileout = os.path.join(outdir, "Montage_{0}.tiff".format(int(tilt)))
-        Image.fromarray(mont.astype(np.int16)).save(fileout)
-
-    import sys
-
-    sys.exit()
-
-    tilt = 0.0
-    # Imageshifts=
-    tiltsandimageshifts = parse_image_shifts("Krios_imageshifts.txt")
-    tilts = [x[0] for x in tiltsandimageshifts]
-    # print(tilts)
-    # import sys;sys.exit()
-    imageshifts = [x[1] for x in tiltsandimageshifts]
-    pixelsize = 1.664 * 2
-    tiltaxisrotation = -3
-    outdir = "/home/hbrown/Projects/Research_projects/20240715_square_beam_tomography/20240808_Montage_stiching/20240826_Kriosmontages/rough_montages"
-    name = "Montagingtest1"
-    datadir = "/home/hbrown/Mount/KriosFalcon4/Brown/20240826_montaging"
-
-    allnames = sum(
-        [
-            generate_image_file_names_from_template(name, datadir, tilt, positions)
-            for tilt, positions in zip(tilts, imageshifts)
-        ],
-        [],
-    )
-
-    gainreffile = os.path.join(outdir, "gain.mrc")
-    if os.path.exists(gainreffile):
-        with mrcfile.open(gainreffile, "r+") as m:
-            gainref = np.asarray(m.data)
-    else:
-        gainref = make_gain_ref(allnames, binning=4)
-        savetomrc(gainref.astype(np.float32), gainreffile)
-    # fig,ax = plt.subplots(ncols=2)
-
-    gainref = np.where(gainrefmask, gainref, np.min(gainref[gainrefmask]))
-
-    # plt.show(block=True)
-    # for i,tilt in enumerate(tilts):
-    #     print(i,tilt)
-
-    # import sys;sys.exit()
-    # masks = ['/home/hbrown/Projects/Research_projects/20240715_square_beam_tomography/20240808_Montage_stiching/Montagetest6/gain_cor/Montagingtest6_0_{0}.mrc'.format(x) for x in range(14)]
-    # imagefiles = sorted(list(glob.glob(args['image_paths'])))
-    # positions = get_imageshifts_for_tilt_angle(Imageshifts,tilt)
-    from tqdm.contrib import tzip
-
-    n = 9
-    print(tilts[n])
-    for tilt, positions in tzip(tilts[:], imageshifts[:], desc="Stitching montages"):
-        imagefiles = generate_image_file_names_from_template(
-            name, datadir, tilt, positions
-        )
-        mont = montage(
-            imagefiles,
-            positions,
-            float(pixelsize),
-            tiltaxisrotation=tiltaxisrotation,
-            binning=4,
-            gainref=gainref,
-        )
-        fileout = os.path.join(outdir, "Montage_{0}.tiff".format(tilt))
-        Image.fromarray(mont.astype(np.int16)).save(fileout)
+        

@@ -12,13 +12,13 @@ ReportNavItem
 
 ## Get data directory, image prefix, tile coordinate file, number of tilts in series 
 ## and montage tiles per tilt from commandline
-SetDirectory X:/DoseFractions/Brown/20240826_montaging
-OFPrefix = Montagingtest_$navLabel
+SetDirectory X:\DoseFractions\Brown\20240930_Setupscripttests
+OFPrefix = MontageNeurons2_$navLabel
 
 # TODO store an imageshifts file for each nav item, these will be set up
 # by another serial-EM script
-ParFilename = X:/DoseFractions/Brown/Krios_imageshifts.txt
-TSNumber = 33
+ParFilename = Montage_imageshifts_$navLabel.txt
+
 
 ## Initialize arrays for storing stage positions
 NewArray PlusStagePos -1 2
@@ -26,6 +26,10 @@ NewArray MinusStagePos -1 2
 
 ## Opens text file $ParFilename as read-only (r) and with ID MTSPar
 OpenTextFile MTSPar r 0 $ParFilename
+## Read line from image shift text file (id MTSPar) to array TSNumber (number of tilt series)
+NewArray TSNumber -1 1
+ReadLineToArray MTSPar TSNumber 
+echo $TSNumber
 
 ## Initialize Angle, Montage image shift (MontIS_D) and last Montage Image shifts (LastMontIS_D)
 ## arrays
@@ -38,10 +42,12 @@ echo $TSNumber
 # to
 GoToLowDoseArea R
 CameraToSpecimenMatrix 0
-XperX = $ReportedValue1
-XperY = $ReportedValue2
-YperX = $ReportedValue3
-YperY = $ReportedValue4
+
+# 2 * is to account for the fact that serial-EM takes the "un-binned" pixel size of the K3 to be in super-res mode
+XperX = 2 * $ReportedValue1
+XperY = 2 * $ReportedValue2
+YperX = 2 * $ReportedValue3
+YperY = 2 * $ReportedValue4
 
 ## Loop over tilts
 Loop $TSNumber
@@ -77,8 +83,10 @@ Loop $TSNumber
 
       
       ## 1 means beam centering using centroid - beam should be fully in image
+      If $Beamcentering == 1
          Trial 
          CenterBeamFromImage
+       Endif
 
       ## Autofocus, take Trial image and center beam if necessary
       AutoFocus 
@@ -93,8 +101,8 @@ Loop $TSNumber
 
       ## Convert image shift from camera pixel units to specimen units
       ## by multiplying by appropriate matrix
-      Xout = $LastMontIS_D[1] * XperX + $LastMontIS_D[2] * XperY
-      Yout = $LastMontIS_D[1] * YperX + $LastMontIS_D[2] * YperY 
+      Xout = $LastMontIS_D[1] * $XperX + $LastMontIS_D[2] * $XperY
+      Yout = $LastMontIS_D[1] * $YperX + $LastMontIS_D[2] * $YperY 
       LastMontIS_D[1] = $Xout
       LastMontIS_D[2] = $Yout
 
@@ -128,8 +136,8 @@ Loop $TSNumber
 
          ## Convert image shift from camera pixel units to specimen units
          ## by multiplying by appropriate matrix
-         Xout = $MontIS_D[1] * XperX + $MontIS_D[2] * XperY
-         Yout = $MontIS_D[1] * YperX + $MontIS_D[2] * YperY 
+         Xout = $MontIS_D[1] * $XperX + $MontIS_D[2] * $XperY
+         Yout = $MontIS_D[1] * $YperX + $MontIS_D[2] * $YperY 
 
          ## Difference in image shift from last image shift vector
          IS_X = $Xout - $LastMontIS_D[1]
@@ -154,8 +162,8 @@ Loop $TSNumber
 
          # Store current image shift as last image shift for next loop
          # iteration
-         $LastMontIS_D[1] = $Xout
-         $LastMontIS_D[2] = $Yout
+         LastMontIS_D[1] = $Xout
+         LastMontIS_D[2] = $Yout
 
       EndLoop
 
@@ -214,8 +222,8 @@ Loop $TSNumber
 
       ## Convert image shift from camera pixel units to specimen units
       ## by multiplying by appropriate matrix
-      Xout = $LastMontIS_D[1] * XperX + $LastMontIS_D[2] * XperY
-      Yout = $LastMontIS_D[1] * YperX + $LastMontIS_D[2] * YperY 
+      Xout = $LastMontIS_D[1] * $XperX + $LastMontIS_D[2] * $XperY
+      Yout = $LastMontIS_D[1] * $YperX + $LastMontIS_D[2] * $YperY 
       LastMontIS_D[1] = $Xout
       LastMontIS_D[2] = $Yout
 
@@ -255,8 +263,8 @@ Loop $TSNumber
 
          ## Convert image shift from camear pixel units to specimen units
          ## by multiplying by appropriate matrix
-         Xout = $MontIS_D[1] * XperX + $MontIS_D[2] * XperY
-         Yout = $MontIS_D[1] * YperX + $MontIS_D[2] * YperY 
+         Xout = $MontIS_D[1] * $XperX + $MontIS_D[2] * $XperY
+         Yout = $MontIS_D[1] * $YperX + $MontIS_D[2] * $YperY 
 
          ## Difference in image shift from last image shift vector
          IS_X = $Xout - $LastMontIS_D[1]
@@ -294,8 +302,9 @@ Loop $TSNumber
 
          # Store current image shift as last image shift for next loop
          # iteration
-         $LastMontIS_D[1] = $Xout
-         $LastMontIS_D[2] = $Yout
+         LastMontIS_D[1] = $Xout
+         LastMontIS_D[2] = $Yout
+         LastMontIS_D[3] = $MontIS_D[3]
       EndLoop
       CloseFile
    ## Negative tilts
@@ -346,8 +355,8 @@ Loop $TSNumber
       
       ## Convert image shift from camera pixel units to specimen units
       ## by multiplying by appropriate matrix
-      Xout = $LastMontIS_D[1] * XperX + $LastMontIS_D[2] * XperY
-      Yout = $LastMontIS_D[1] * YperX + $LastMontIS_D[2] * YperY 
+      Xout = $LastMontIS_D[1] * $XperX + $LastMontIS_D[2] * $XperY
+      Yout = $LastMontIS_D[1] * $YperX + $LastMontIS_D[2] * $YperY 
       LastMontIS_D[1] = $Xout
       LastMontIS_D[2] = $Yout
 
@@ -386,8 +395,8 @@ Loop $TSNumber
 
          ## Convert image shift from camera pixel units to specimen units
          ## by multiplying by appropriate matrix
-         Xout = $MontIS_D[1] * XperX + $MontIS_D[2] * XperY
-         Yout = $MontIS_D[1] * YperX + $MontIS_D[2] * YperY 
+         Xout = $MontIS_D[1] * $XperX + $MontIS_D[2] * $XperY
+         Yout = $MontIS_D[1] * $YperX + $MontIS_D[2] * $YperY 
          MontIS_D[1] = $Xout
          MontIS_D[2] = $Yout
 
