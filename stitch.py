@@ -1260,7 +1260,7 @@ def find_closest_index(arr, target):
     
     return closest_index
 
-if __name__ == "__main__":
+def main():
     args = parse_commandline()
     outdir = setup_outputdir(args["output"])
 
@@ -1343,3 +1343,7 @@ if __name__ == "__main__":
             # tiles = slice(5),
         )
         
+
+
+if __name__ == "__main__":
+    main()    
