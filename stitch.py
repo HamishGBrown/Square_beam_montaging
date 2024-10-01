@@ -1208,8 +1208,8 @@ def extract_tilt_axis_angle(file_path):
     return tilt_axis_angle
 
 
-def setup_outputdir(output):
-    if output is None:
+def setup_outputdir(args):
+    if args['output'] is None:
         outputdir = os.path.split(args["input"])[1].replace("*.mrc", "_output")
     else:
         outputdir = args["output"]
@@ -1262,7 +1262,7 @@ def find_closest_index(arr, target):
 
 def main():
     args = parse_commandline()
-    outdir = setup_outputdir(args["output"])
+    outdir = setup_outputdir(args)
 
     # Binning constant
     binning = int(args["binning"])
