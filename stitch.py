@@ -12,6 +12,7 @@ import glob
 import mrcfile
 import argparse
 import numpy as np
+from skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
 
 
 def parse_commandline():
@@ -552,6 +553,8 @@ def cross_correlate_alignment(im, template, returncoords=True):
     # Step 2: Find the coordinates (y, x) of the maximum value in the correlation matrix
     y, x = np.unravel_index(np.argmax(corr), im.shape)
 
+    y, x = [(i + N // 2) % N - N // 2 for i,N in zip((y,x),im.shape)]
+
     # Step 3: Depending on the value of returncoords, return the coordinates or the aligned image
     if returncoords:
         return y, x  # Return the coordinates of the maximum correlation
@@ -559,8 +562,53 @@ def cross_correlate_alignment(im, template, returncoords=True):
         # Align the image by rolling it to place the max correlation point at the origin
         return np.roll(im, (-y, -x), axis=(-2, -1))
 
+def roll_no_periodic(arr, shift, fill_value=0, axis=None):
+    """
+    Rolls an array along the given axis or axes but without periodic boundary conditions.
+    Vacated positions will be filled with fill_value.
 
-def make_gain_ref(images, binning=8):
+    Parameters:
+    - arr: numpy array to be shifted.
+    - shift: int or tuple of ints, amount to shift. Positive values shift right/down, negative values shift left/up.
+    - fill_value: value to place in the vacated positions.
+    - axis: int or tuple of ints, the axis or axes to roll along. If None, roll along all axes.
+
+    Returns:
+    - A new numpy array with the same shape as arr, but shifted.
+    """
+    # If axis is None, shift across all axes
+    if axis is None:
+        axis = tuple(range(arr.ndim))
+        shift = (shift,) * arr.ndim
+    elif isinstance(axis, int):
+        axis = (axis,)
+        shift = (shift,) if isinstance(shift, int) else shift
+    
+    result = np.full_like(arr, fill_value)  # Create an array filled with the fill_value
+    
+    if len(axis) != len(shift):
+        raise ValueError("The number of shifts must match the number of axes.")
+    src_slice = [slice(None)] * arr.ndim
+    dst_slice = [slice(None)] * arr.ndim
+
+    for ax, s in zip(axis, shift):
+        if s == 0:
+            continue  # No shift for this axis
+
+        # Determine the slices that will remain after the shift
+        if s > 0:
+            src_slice[ax] = slice(0, -s)
+            dst_slice[ax] = slice(s, None)
+        elif s < 0:
+            src_slice[ax] = slice(-s, None)
+            dst_slice[ax] = slice(0, s)
+            
+    result[tuple(dst_slice)] = arr[tuple(src_slice)]
+
+    return result
+
+
+def make_gain_ref(images, binning=8,templateindex= 0,maxnumber=None):
     """
     Generate a gain reference image by averaging a series of input images.
 
@@ -575,41 +623,62 @@ def make_gain_ref(images, binning=8):
         A list of file paths to the input images (in MRC format) that will be used to create the gain reference.
     binning : int, optional
         The factor by which the images are binned to reduce their size. Default is 8.
-
+    templateindex: int,optional
+        Which image to align all other images too.
+    maxnumber: int or None
+        Maximum number of frames that will be averaged to produce the gain reference.
+        If None, all available frames will be used.
     Returns:
     --------
     numpy.ndarray
         The resulting gain reference image, normalized by the median value of the template region.
     """
 
+    def get_image_and_mask(img):
+        # Perform Fourier interpolation on the image to bin it
+        im = np.asarray(img)
+        im = fourier_interpolate(im, [x // binning for x in img.shape])
+
+        # Create a mask for the image
+        msk = make_mask(im,shrinkn=20//binning)
+        return im,msk
+    
+    # Get target image
+    memmap = mrcfile.mrcmemmap.MrcMemmap(images[0])
+    img = memmap.data[templateindex]
+    im,msk = get_image_and_mask(img)
+    template = np.where(msk, 1, 0)  # Create the binary template mask
+    # Initialize the gain reference with the first image
+    gainref = copy.deepcopy(im)
+
+    # Weight will track the denominator for the averaging step later on
+    weight = np.ones_like(gainref) 
+
+    count = 0
+
     # Loop through each image file
     for i, image in enumerate(tqdm(images, desc="Averaging images to gain ref")):
         # Open the MRC file and read the image data
         memmap = mrcfile.mrcmemmap.MrcMemmap(image)
 
-        for j,img in enumerate(memmap.data):
-            im = np.asarray(img)
+        for j,img in enumerate(tqdm(memmap.data,leave=False,desc='Frames in mrc')):
+            im,msk = get_image_and_mask(img)
 
-            # Perform Fourier interpolation on the image to bin it
-            im = fourier_interpolate(im, [x // binning for x in im.shape])
-
-            # Create a mask for the image
-            msk = make_mask(im,shrinkn=20//binning)
-
-            # For the first image, initialize the template and gain reference
-            if i == 0 and j == 0 :
-                template = np.where(msk, 1, 0)  # Create the binary template mask
-                gainref = copy.deepcopy(
-                    im
-                )  # Initialize the gain reference with the first image
+            # skip template image
+            if i == 0 and j==templateindex:
+                continue
             else:
-                # For subsequent images, align them to the template
+                # Align images to the template
                 y, x = cross_correlate_alignment(
-                    np.where(msk, 1, 0), template, returncoords=True
+                    template,np.where(msk, 1, 0),  returncoords=True
                 )
-                # Add the aligned image to the gain reference
-                gainref += np.roll(im, (y, x), axis=(-2, -1))
-
+                gainref += roll_no_periodic(im, (-y, -x), axis=(-2, -1))
+                weight += roll_no_periodic(np.ones_like(im),(-y,-x),axis=(-2,-1))
+                count += 1
+            if maxnumber is not None:
+                if count >= maxnumber :
+                    break
+    gainref /= weight
     # Normalize the gain reference by the median value of the template region
     median = np.median(gainref[template == 1])
     gainref /= median
@@ -627,6 +696,8 @@ def montage(
     gainref=None,
     gainrefmask=None,
     skipcrosscorrelation=False,
+    montagewidth=None,
+    montageorigin=None,
     tiles = None,
 ):
     """
@@ -653,6 +724,13 @@ def montage(
         Rotation angle of the tilt axis, used to correct the positions. Default is 0.
     gainref : numpy.ndarray, optional
         Gain reference image used to normalize the input images. Default is None.
+    montagewidth : None or (2,) array_like
+        size in Angstrom of the full montage in both dimensions, useful for consistency
+        with other tilts in the tilt series
+    montageorigin : None or (2,) array_like
+        Origin point (most negative image shift) in Angstrom of the full montage 
+        in both dimensions, useful for consistency with other tilts in the tilt 
+        series
     tiles : None or sliceobject, optional
         Slice object indicating tiles that will be stitched (mainly for testing purposes)
 
@@ -712,14 +790,20 @@ def montage(
 
         # Refine the tile positions using cross-correlation between overlapping
         # tiles
-        plotfile = os.path.join(outdir, os.path.split(file)[1].replace('.mrc','_Plot.pdf'))
+        plotfile = os.path.join(outdir, os.path.split(image)[1].replace('.mrc','_Plot.pdf'))
         positions[M] = cross_correlate_tiles(
             positions[M], ims, msks, overlaps, pixel_size * binning, generate_plot=plotfile
         )
 
     # Determine the global range of tiles in Angstroms
-    width = np.ptp(positions[M], axis=0) * 1e4
-    origin = np.amin(positions[M], axis=0) * 1e4
+    if montagewidth is None:
+        width = np.ptp(positions[M], axis=0) * 1e4
+    else:
+        width=montagewidth
+    if montageorigin is None:
+        origin = np.amin(positions[M], axis=0) * 1e4
+    else:
+        origin = montageorigin
 
     # Calculate the size of the global montage canvas in pixels
     size = (
@@ -736,10 +820,26 @@ def montage(
     for i, (im, position, msk) in enumerate(tqdm(zip(ims, positions[M], msks),desc='Stitching')):
         s = im.shape
         y0, x0 = [int(x) for x in (position * 1e4 - origin) / pixel_size / binning]
-        canvas[x0 : x0 + s[0], y0 : y0 + s[1]] += np.where(msk, im, 0)
-        overlap[x0 : x0 + s[0], y0 : y0 + s[1]] += np.where(
+        
+        # Catch tiles that have fallen off canvas
+        if y0>size[1] or x0>size[0]:
+            continue
+
+        # Truncate coordinates that will extend beyond the range of the montage canvas
+        # Truncate beginning to be >= 0
+        cy0,cx0 = [max(coord,0) for coord in [y0,x0]]
+        # Truncate  maximum to be <= canvas array limits
+        y1,x1 = [min(coord,limit) for coord,limit in zip([cy0+s[1],cx0+s[0]],size)]
+
+        # Size of tile that will make it onto the montage canvase
+        X = x1-max(x0,0)
+        Y = y1-max(y0,0)
+
+        print(x0,y0,x1,y1,X,Y,-min(x0,0),-min(y0,0))
+        canvas[cx0 : x1, cy0 : y1] += np.where(msk, im, 0)[-min(x0,0):X,-min(y0,0):Y]
+        overlap[cx0 : x1, cy0 : y1] += np.where(
             msk, np.uint8(1), np.uint8(0)
-        )
+        )[-min(x0,0):X,-min(y0,0):Y]
 
     # Normalize the canvas by the overlap map to account for overlapping regions
     median = np.median(canvas[overlap == 1])
@@ -747,7 +847,7 @@ def montage(
     overlap = np.where(overlap > 1, overlap, 1)
     canvas /= overlap
 
-    fileout = os.path.join(outdir, os.path.split(file)[1].replace('.mrc','.tif'))
+    fileout = os.path.join(outdir, os.path.splitext(os.path.split(image)[1])[0]+'.tif')
     Image.fromarray(canvas.astype(np.int16)).save(fileout)
     # return canvas
 
@@ -832,7 +932,7 @@ def find_overlaps(
     overlapping_inds = []
 
     # Update criterion to be the minimum required overlap area in pixels
-    criterion = minoverlapfrac * np.product(pixels)
+    criterion = minoverlapfrac * np.prod(pixels)
 
     # Iterate over the condensed distance matrix
     for n, val in enumerate(overlaps):
@@ -898,6 +998,84 @@ def correlate(array1, array2, axes=None):
             np.fft.rfftn(array1, s, a) * np.conj(np.fft.rfftn(a2, s, a)), s, a
         )
 
+def _masked_phase_cross_correlation(reference_image, moving_image,
+                                    reference_mask, moving_mask=None,
+                                    overlap_ratio=0.3):
+    """Masked image translation registration by masked normalized
+    cross-correlation.
+
+    Parameters
+    ----------
+    reference_image : ndarray
+        Reference image.
+    moving_image : ndarray
+        Image to register. Must be same dimensionality as ``reference_image``,
+        but not necessarily the same size.
+    reference_mask : ndarray
+        Boolean mask for ``reference_image``. The mask should evaluate
+        to ``True`` (or 1) on valid pixels. ``reference_mask`` should
+        have the same shape as ``reference_image``.
+    moving_mask : ndarray or None, optional
+        Boolean mask for ``moving_image``. The mask should evaluate to ``True``
+        (or 1) on valid pixels. ``moving_mask`` should have the same shape
+        as ``moving_image``. If ``None``, ``reference_mask`` will be used.
+    overlap_ratio : float, optional
+        Minimum allowed overlap ratio between images. The correlation for
+        translations corresponding with an overlap ratio lower than this
+        threshold will be ignored. A lower `overlap_ratio` leads to smaller
+        maximum translation, while a higher `overlap_ratio` leads to greater
+        robustness against spurious matches due to small overlap between
+        masked images.
+
+    Returns
+    -------
+    shifts : ndarray
+        Shift vector (in pixels) required to register ``moving_image``
+        with ``reference_image``. Axis ordering is consistent with
+        numpy (e.g. Z, Y, X)
+
+    References
+    ----------
+    .. [1] Dirk Padfield. Masked Object Registration in the Fourier Domain.
+           IEEE Transactions on Image Processing, vol. 21(5),
+           pp. 2706-2718 (2012). :DOI:`10.1109/TIP.2011.2181402`
+    .. [2] D. Padfield. "Masked FFT registration". In Proc. Computer Vision and
+           Pattern Recognition, pp. 2918-2925 (2010).
+           :DOI:`10.1109/CVPR.2010.5540032`
+
+    """
+    if moving_mask is None:
+        if reference_image.shape != moving_image.shape:
+            raise ValueError(
+                "Input images have different shapes, moving_mask must "
+                "be explicitely set.")
+        moving_mask = reference_mask.astype(bool)
+
+    # We need masks to be of the same size as their respective images
+    for (im, mask) in [(reference_image, reference_mask),
+                       (moving_image, moving_mask)]:
+        if im.shape != mask.shape:
+            raise ValueError(
+                "Image sizes must match their respective mask sizes.")
+
+    xcorr = cross_correlate_masked(moving_image, reference_image,
+                                   moving_mask, reference_mask,
+                                   axes=tuple(range(moving_image.ndim)),
+                                   mode='full',
+                                   overlap_ratio=overlap_ratio)
+
+    # Generalize to the average of multiple equal maxima
+    maxima = np.stack(np.nonzero(xcorr == xcorr.max()), axis=1)
+    center = np.mean(maxima, axis=0)
+    shifts = center - np.array(reference_image.shape) + 1
+
+    # The mismatch in size will impact the center location of the
+    # cross-correlation
+    size_mismatch = (np.array(moving_image.shape)
+                     - np.array(reference_image.shape))
+
+    return -shifts + (size_mismatch / 2),xcorr.max()
+
 
 def cross_correlate_tiles(
     positions,
@@ -906,7 +1084,6 @@ def cross_correlate_tiles(
     overlaps,
     pixel_size,
     max_correction=0.1,
-    max_shift=50,
     generate_plot=False,
 ):
     """
@@ -924,7 +1101,6 @@ def cross_correlate_tiles(
         overlaps (list of tuples): Pairs of indices representing which tiles overlap and should be aligned.
         pixel_size (float): The pixel size in microns.
         max_correction (float, optional): Maximum allowed correction (in microns) for shifts between tiles. Defaults to 0.1.
-        max_shift (float, optional): Maximum allowed shift (in pixels) between overlapping tiles. Defaults to 50.
         generate_plot (bool or string, optional): Whether to generate a plot visualizing the tile positions and shift vectors. Defaults to False.
                                                   If a string this will be the filename that the plot will be saved as.
 
@@ -941,6 +1117,9 @@ def cross_correlate_tiles(
         - Dirk Padfield, "Masked object registration in the Fourier domain", IEEE Transactions on Image Processing, 2011.
     """
     pixels = tiles[0].shape
+
+    #Convert maximum allowed shift in microns (max_correction) to pixels (max_shift)
+    max_shift = max_correction/pixel_size*1e4
 
     # We will solve global alignment of tiles by least squares Ax = b
     # matrix problem (https://en.wikipedia.org/wiki/Linear_least_squares).
@@ -961,11 +1140,10 @@ def cross_correlate_tiles(
         savefig = True
 
     if genplot:
-        xcorfig, xcorax = plt.subplots(ncols=2, nrows=2, figsize=(8, 8))
-        ax = xcorax.ravel()
-        ax[0].plot(*positions.T, "ko", label="Initial tile positions")
+        xcorfig, xcorax = plt.subplots(figsize=(8, 8))
+        xcorax.plot(*positions.T, "ko", label="Initial tile positions")
         for i, pos in enumerate(positions):
-            ax[0].annotate(str(i), pos)
+            xcorax.annotate(str(i), pos)
 
     G = nx.Graph()
     # Add nodes to graph
@@ -998,16 +1176,7 @@ def cross_correlate_tiles(
         ]
 
         # Calculate shift by masked cross correlation with ordering (Y,X)
-        detected_shift = phase_cross_correlation(
-            tiles[i], tiles[j], reference_mask=reference_mask, moving_mask=moving_mask
-        )
-        # fig,axes = plt.subplots(nrows = 2,ncols=2)
-        # ax = axes.ravel()
-        # ax[0].imshow(tiles[i])
-        # ax[2].imshow(tiles[j])
-        # ax[1].imshow(np.where(reference_mask,1,0))
-        # ax[3].imshow(np.where(moving_mask,1,0))
-        # plt.show(block=True)
+        detected_shift,xcorrmax = _masked_phase_cross_correlation(tiles[i], tiles[j], reference_mask=reference_mask, moving_mask=moving_mask)
 
         shifttoolarge = np.linalg.norm(np.asarray(dx) - detected_shift) > max_shift
         # shifttoolarge=True
@@ -1019,14 +1188,14 @@ def cross_correlate_tiles(
                 label = None
 
             if shifttoolarge and genplot:
-                ax[0].plot(
+                xcorax.plot(
                     [x1[0], x1[0] + delta[1]],
                     [x1[1], x1[1] + delta[0]],
                     "r-",
                     label=label,
                 )
             elif genplot:
-                ax[0].plot(
+                xcorax.plot(
                     [x1[0], x1[0] + delta[1]],
                     [x1[1], x1[1] + delta[0]],
                     "b-",
@@ -1043,8 +1212,9 @@ def cross_correlate_tiles(
             Arow[0, 2 * i] = -1
             Arow[1, 2 * j + 1] = 1
             Arow[1, 2 * i + 1] = -1
-            A.append(Arow)
-            b[len(b) :] = detected_shift.tolist()
+            # Weight by the maximum value of cross-correlation
+            A.append(xcorrmax*Arow)
+            b[len(b) :] = (xcorrmax*detected_shift).tolist()
 
             # Add valid connection to graph
             G.add_edge(i, j)
@@ -1083,15 +1253,12 @@ def cross_correlate_tiles(
                 # (j+1)%2 swaps the order of x and y
             b[len(b):] = delta[::-1].tolist()
             if genplot:
-                ax[0].plot([x1[0], x1[0]-delta[0]], [x1[1], x1[1]-delta[1]], "k--")
+                xcorax.plot([x1[0], x1[0]-delta[0]], [x1[1], x1[1]-delta[1]], "k--")
 
         A = np.stack(A.tolist() + extraA, axis=0)
-    # matfig,matax = plt.subplots(ncols=2)
-    # matax[0].imshow(A,vmin=-1,vmax=1,cmap='bwr')
 
 
-    # print(A,b)
-    x, residuals, rank, s = np.linalg.lstsq(A, np.asarray(b), rcond=1e-2)
+    x, residuals, rank, s = np.linalg.lstsq(A, np.asarray(b),rcond=-1)
     # matax[1].plot(s)
     newy = x[::2]
     newx = x[1::2]
@@ -1106,8 +1273,8 @@ def cross_correlate_tiles(
     positions[:, 1] = newy
 
     if genplot:
-        ax[0].plot(*positions.T, "bo", label="Refined tile positions")
-        ax[0].legend()
+        xcorax.plot(*positions.T, "bo", label="Refined tile positions")
+        xcorax.legend()
         if show:
             plt.show(block=True)
         if savefig:
@@ -1268,6 +1435,8 @@ def main():
     binning = int(args["binning"])
 
     files = glob.glob(args["input"])
+    if len(files)<1:
+        raise FileNotFoundError('No files matching {0}'.format(args["input"]))
     mdoc_files = [x.replace(".mrc", ".mrc.mdoc") for x in files]
 
     # Get pixel size, tilt axis rotation from first mdoc file
@@ -1302,6 +1471,11 @@ def main():
     imageshifts = parse_image_shifts(args["image_shifts"])
     tiltsfromfile = [imageshifts[x][0] for x in range(len(imageshifts))]
     imageshifts = [imageshifts[x][1] for x in range(len(imageshifts))]
+
+    # Global range of tiles in Angstroms
+    globalwidth = np.ptp(np.concatenate(imageshifts)[:,:2],axis=0)*pixelsize
+    globalorigin = np.amin(np.concatenate(imageshifts)[:,:2],axis=0)*pixelsize
+    print(globalwidth.shape,globalorigin.shape)
 
     # Load gain ref if available make a new one if not
     if args["gainref"] is not None:
@@ -1340,6 +1514,8 @@ def main():
             gainref=np.where(gainrefmask, gainref, 1),
             gainrefmask=gainrefmask,
             skipcrosscorrelation=args["skipcrosscorrelation"],
+            montagewidth=globalwidth,
+            montageorigin=globalorigin,
             # tiles = slice(5),
         )
         

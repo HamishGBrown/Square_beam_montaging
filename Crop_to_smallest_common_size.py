@@ -26,11 +26,13 @@ def parse_commandline():
         "-o", "--output", help="Output directory, if not supplied, output will be placed in same directory as input", required=False, type=str
     )
 
+    parser.add_argument("-S","--skipcropping", help="Skip cropping of files to common size",action="store_true")
+
     return vars(parser.parse_args())
 
 
 def extract_number(filename):
-    match = re.search(r'(-?\d+)\.tif', filename)
+    match = re.search(r'([-]?\d+\.?\d*)\.tif', filename)
     return float(match.group(1)) if match else 0
 
 if __name__=='__main__':
@@ -47,30 +49,36 @@ if __name__=='__main__':
     # Sort filenames in order of increasing tilt
     fnams = sorted(fnams,key=extract_number)
     print(fnams)
+    mrcnames = []
 
-    maxsize = Image.open(fnams[0]).size
+    skip_cropping = args["skipcropping"]
+    for i,fnam in enumerate(fnams):
+        # Run tif to mrc
+        mrcname = os.path.splitext(fnam)[0]+'.mrc'
+        command = 'tif2mrc {0} {1}'.format(fnam,mrcname)
+        print(command)
+        os.system(command)
+        mrcnames.append(mrcname)
+    
+    if not skip_cropping:
+        maxsize = Image.open(fnams[0]).size
 
-    for fnam in fnams[1:]:
-        maxsize= [max(x,xx) for x,xx in zip(Image.open(fnam).size,maxsize)]
+        for fnam in fnams[1:]:
+            maxsize= [max(x,xx) for x,xx in zip(Image.open(fnam).size,maxsize)]
 
-    cropped_names = [os.path.splitext(fnam)[0]+'cropped.mrc' for fnam in fnams]
+        cropped_names = [os.path.splitext(fnam)[0]+'cropped.mrc' for fnam in fnams]
 
-    # for fnam in fnams:
-    # for i,fnam in enumerate(fnams):
-    #     # Run tif to mrc
-    #     mrcname = os.path.splitext(fnam)[0]+'.mrc'
-    #     command = 'tif2mrc {0} {1}'.format(fnam,mrcname)
-    #     print(command)
-    #     os.system(command)
+        for i,mrcname in enumerate(mrcnames):
+            # Run the clip utility to crop/pad images to common size
+            command = 'clip resize -ox {0} -oy {1} {2} {3}'.format(*maxsize,mrcname,cropped_names[i])
+            print(command)
+            os.system(command)
 
-    #     # Run the clip utility to crop/pad images to common size
-    #     command = 'clip resize -ox {0} -oy {1} -p 0 {2} {3}'.format(*maxsize,mrcname,cropped_names[i])
-    #     print(command)
-    #     os.system(command)
-
-    #     # Remove temporary mrc file
-    #     print('Removing {0}'.format(mrcname))
-    #     os.system('rm {0}'.format(mrcname))
+            # Remove temporary mrc file
+            print('Removing {0}'.format(mrcname))
+            os.system('rm {0}'.format(mrcname))
+    else:
+        cropped_names = mrcnames
     
     # Join all in stack
     command = 'newstack {0} {1}'.format(' '.join(cropped_names),'Montage_stack.mrc')
