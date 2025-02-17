@@ -1,0 +1,8 @@
+README.md
+setup.py
+SquareBeamMontaging.egg-info/PKG-INFO
+SquareBeamMontaging.egg-info/SOURCES.txt
+SquareBeamMontaging.egg-info/dependency_links.txt
+SquareBeamMontaging.egg-info/entry_points.txt
+SquareBeamMontaging.egg-info/requires.txt
+SquareBeamMontaging.egg-info/top_level.txt

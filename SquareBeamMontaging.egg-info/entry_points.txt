@@ -1,0 +1,3 @@
+[console_scripts]
+stitch_square_beam = stitch:main
+
