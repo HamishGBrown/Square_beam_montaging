@@ -118,7 +118,6 @@ def fourier_interpolate(
     else:
         return aout
 
-
 def convolve(array1, array2, axes=None):
     """
     Fourier convolution of two arrays over specified axes.
@@ -138,7 +137,6 @@ def convolve(array1, array2, axes=None):
         return np.fft.ifftn(np.fft.fftn(array1, s, a) * np.fft.fftn(a2, s, a), s, a)
     else:
         return np.fft.irfftn(np.fft.rfftn(array1, s, a) * np.fft.rfftn(a2, s, a), s, a)
-
 
 def Gaussian(sigma, gridshape):
     r"""
@@ -187,7 +185,6 @@ def circular_mask(size, radius=None, center=None):
 
     return dist_from_center <= radius
 
-
 def make_mask(im, shrinkn=20, smoothing_kernel=3):
     """
     Generate a binary mask from an image by applying a Gaussian filter, filling holes,
@@ -224,7 +221,6 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3):
 
     return mask
 
-
 def parse_commandline():
     """
     Parse commandline input.
@@ -250,7 +246,7 @@ def main():
     args = parse_commandline()
 
     # Load the image
-    image_path = args["input"]
+    image_path = args['input']
     with mrcfile.mrcmemmap.MrcMemmap(args["input"]) as m:
         image = np.asarray(m.data[0])
     image = fourier_interpolate(image, [x // args["binning"] for x in image.shape])
@@ -263,28 +259,24 @@ def main():
     plt.subplots_adjust(bottom=0.25)
 
     # Display the original image
-    ax[0].imshow(image, vmin=vmin, vmax=vmax)
+    ax[0].imshow(image,vmin=vmin,vmax=vmax)
     ax[0].set_title("Original Image")
     ax[0].axis("off")
 
     # Placeholder for blurred image
-    mask = make_mask(image, 20 / args["binning"])  # Initial blur with small sigma
-    blurred_display = ax[1].imshow(np.where(mask, image, 0), vmin=vmin, vmax=vmax)
+    mask = make_mask(image, 20/ args["binning"])  # Initial blur with small sigma
+    blurred_display = ax[1].imshow(np.where(mask,image,0),vmin=vmin,vmax=vmax)
     ax[1].set_title("Image with fringes removed")
     ax[1].axis("off")
 
     # Create slider for adjusting the standard deviation
     ax_sigma = plt.axes([0.2, 0.1, 0.65, 0.03])
-    fringe_slider = Slider(
-        ax_sigma, "Fringe size (pixels)", 1, 200, valinit=20, valstep=1, valfmt="%0.0f"
-    )
+    fringe_slider = Slider(ax_sigma, "Fringe size (pixels)", 1, 200, valinit=20, valstep=1,valfmt='%0.0f')
 
     # Update function for slider
     def update(val):
         fringe_size = fringe_slider.val
-        defringed_image = np.where(
-            make_mask(image, fringe_size / args["binning"]), image, 0
-        )
+        defringed_image = np.where(make_mask(image, fringe_size / args['binning']),image,0)
         blurred_display.set_data(defringed_image)
         ax[1].set_title(f"Fringe size {fringe_size:.0f}")
         fig.canvas.draw_idle()
@@ -295,6 +287,5 @@ def main():
     # Show the interactive plot
     plt.show()
 
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()

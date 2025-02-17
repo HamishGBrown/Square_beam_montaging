@@ -188,20 +188,52 @@ def calculate_defocii(imageshifts, angles, M):
         zs.append(np.tan(np.deg2rad(alpha)) * (M @ imshift.T).T[:, 1])
     return zs
 
+def plot_points_in_serial_EM_navigator(imageshifts,M,nx,ny,x,y):
+    # Get a unique group number to add squares to
+    gid = int(sem.GetUniqueNavID())
+    print('gid',gid)
 
-if __name__ == "__main__":
+    # Plot zero-tilt image shifts on navigator
+    ids = []
+    for imshift in imageshifts:
+        xx = imshift[0]
+        yy = imshift[1]
+
+        # Generate corners in pixel coordinates
+        cornersx = [xx+nx/2*(1-2*((i%4)//2)) for i in range(5)]
+        cornersy = [yy+ny/2*(1-2*((i+1)%4//2)) for i in range(5)]
+        
+        # Use matrix to convert to specimen coordinates
+        cornersx,cornersy = M @ np.stack((cornersx,cornersy),axis=0)
+
+        # Add "origin" (nav point coordinates) to 
+        cornersx += x
+        cornersy += y
+
+        # Write arrays back to serial-EM land
+        sem.SetVariable('cornersx','\n'.join([str(a) for a in cornersx]))
+        sem.SetVariable('cornersy','\n'.join([str(a) for a in cornersy]))
+
+        # Add image shift acquisitions as polygons in display and group them
+        ids.append(int(sem.AddStagePointsAsPolygon('cornersx','cornersy',z)))
+    for id_ in ids:
+        sem.ChangeItemGroupID(id_,gid)
+    return ids,gid
+
+if __name__=='__main__':
+    
     # Parse commandline arguments
     step = 3
     maxtilt = 60
     ntiltgroup = 3
-    m, n = [5, 5]
-    overlap = [8, 8]
-    outdir = "X:\DoseFractions\Brown\20240930_Setupscripttests"
+    m,n = [5,5]
+    overlap = [8,8]
+    outdir = 'Z:\Hamish'
+
 
     # Get information about navigation item
-    indx, x, y, z, label = sem.ReportNavItem()
-    if isinstance(label, float):
-        label = int(label) + 1
+    indx, x, y, z, label = sem.ReportNextNavItem()
+    label = sem.GetVariable("navLabel").strip()
 
     # Generate output filename using navigation item albel
     fnamout = "Montage_imageshifts_{0}.txt".format(label)
@@ -252,37 +284,10 @@ if __name__ == "__main__":
 
             imageshifts.append(imagexy)
 
-        # Get a unique group number to add squares to
-        gid = int(sem.GetUniqueNavID())
-        print("gid", gid)
-
-        # Plot zero-tilt image shifts on navigator
-        ids = []
-        for imshift in imageshifts[0]:
-            xx = imshift[0]
-            yy = imshift[1]
-
-            # Generate corners in pixel coordinates
-            cornersx = [xx + nx / 2 * (1 - 2 * ((i % 4) // 2)) for i in range(5)]
-            cornersy = [yy + ny / 2 * (1 - 2 * ((i + 1) % 4 // 2)) for i in range(5)]
-
-            # Use matrix to convert to specimen coordinates
-            cornersx, cornersy = M @ np.stack((cornersx, cornersy), axis=0)
-
-            # Add "origin" (nav point coordinates) to
-            cornersx += x
-            cornersy += y
-
-            # Write arrays back to serial-EM land
-            sem.SetVariable("cornersx", "\n".join([str(a) for a in cornersx]))
-            sem.SetVariable("cornersy", "\n".join([str(a) for a in cornersy]))
-
-            # Add image shift acquisitions as polygons in display and group them
-            ids.append(int(sem.AddStagePointsAsPolygon("cornersx", "cornersy", z)))
-        for id_ in ids:
-            sem.ChangeItemGroupID(id_, gid)
-        satisfatory = sem.YesNoBox("Satisfactory?") == 1
-
+        ids,gid = plot_points_in_serial_EM_navigator(imageshifts[0],M,nx,ny,x,y) 
+        
+        satisfatory = sem.YesNoBox('Satisfactory?') ==1
+        
         if not satisfatory:
             for id_ in ids[::-1]:
                 sem.DeleteNavigatorItem(id_)

@@ -82,7 +82,7 @@ if __name__ == "__main__":
         for fnam in fnams[1:]:
             maxsize = [max(x, xx) for x, xx in zip(Image.open(fnam).size, maxsize)]
 
-        cropped_names = [os.path.splitext(fnam)[0] + "cropped.mrc" for fnam in fnams]
+        cropped_names = [os.path.splitext(fnam)[0] + "_cropped.mrc" for fnam in fnams]
 
         for i, mrcname in enumerate(mrcnames):
             # Run the clip utility to crop/pad images to common size
@@ -100,15 +100,6 @@ if __name__ == "__main__":
 
     # Join all in stack
     command = "newstack {0} {1}".format(" ".join(cropped_names), "Montage_stack.mrc")
-    # sys.exit()
-
-    # for i,fnam in enumerate(tqdm(cropped_names,desc='filling black areas')):
-    #     with mrcfile.open(fnam,'r+') as m:
-    #         data = np.asarray(m.data)
-    #         fill = np.median(data[data>2])
-    #         data[data<2] = fill
-    #         m.data[:] = data[:]
-    #     m.close()
 
     # Save tilts in rawtlt.tlt file for IMOD
     tilts = [extract_number(fnam) for fnam in fnams]
@@ -127,5 +118,5 @@ if __name__ == "__main__":
     # Delete intermediates
     for mrcname in cropped_names:
         print("Removing {0} and {0}~".format(mrcname))
-        # os.system("rm {0}".format(mrcname))
-        # os.system("rm {0}~".format(mrcname))
+        os.system("rm {0}".format(mrcname))
+        os.system("rm {0}~".format(mrcname))

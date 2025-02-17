@@ -1,10 +1,11 @@
+#!Python
 import copy
-import mrcfile
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.widgets import Slider
 import argparse
 from scipy.ndimage import binary_fill_holes, binary_erosion
+import serialem as sem
 
 
 def fourier_crop(ain, shapeout):
@@ -118,7 +119,6 @@ def fourier_interpolate(
     else:
         return aout
 
-
 def convolve(array1, array2, axes=None):
     """
     Fourier convolution of two arrays over specified axes.
@@ -138,7 +138,6 @@ def convolve(array1, array2, axes=None):
         return np.fft.ifftn(np.fft.fftn(array1, s, a) * np.fft.fftn(a2, s, a), s, a)
     else:
         return np.fft.irfftn(np.fft.rfftn(array1, s, a) * np.fft.rfftn(a2, s, a), s, a)
-
 
 def Gaussian(sigma, gridshape):
     r"""
@@ -187,7 +186,6 @@ def circular_mask(size, radius=None, center=None):
 
     return dist_from_center <= radius
 
-
 def make_mask(im, shrinkn=20, smoothing_kernel=3):
     """
     Generate a binary mask from an image by applying a Gaussian filter, filling holes,
@@ -224,7 +222,6 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3):
 
     return mask
 
-
 def parse_commandline():
     """
     Parse commandline input.
@@ -236,13 +233,7 @@ def parse_commandline():
         "-i", "--input", help="*.mrc file for raw data", required=True, type=str
     )
     parser.add_argument(
-        "-o",
-        "--overlapfactor",
-        help="Overlap factor in x and y",
-        required=True,
-        type=int,
-        nargs=2,
-        metavar=("oy", "ox"),
+        "-o", "--overlapfactor", help="Overlap factor in x and y", required=True, type=int, nargs=2,metavar=("oy","ox")
     )
     return vars(parser.parse_args())
 
@@ -294,48 +285,70 @@ def roll_no_periodic(arr, shift, fill_value=0, axis=None):
 
 
 def main():
-    args = parse_commandline()
+    # Take record image and read from serial EM buffer
+    a = sem.R()
+    image = np.asarray(sem.bufferImage('A'))
+    
+    sem.EnterString("inp","Enter tile overlap factor (x y)")
+    inp = sem.GetVariable("inp").strip()
+    oy,ox = [int(x) for x in inp.split(' ')]
 
-    # Load the image
-    image_path = args["input"]
-    with mrcfile.mrcmemmap.MrcMemmap(args["input"]) as m:
-        image = np.asarray(m.data[0])
-    # image = fourier_interpolate(image, [x // args["binning"] for x in image.shape])
-    oy, ox = args["overlapfactor"]
 
     vmin = np.percentile(image, 10)
     vmax = np.percentile(image, 90)
 
     # Plot the original image and create space for the eroded image
     fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+    plt.subplots_adjust(bottom=0.25)
+
+    ax_overlapy = plt.axes([0.33, 0.1, 0.25, 0.03])
+    ax_overlapx = plt.axes([0.66, 0.1, 0.25, 0.03])
+    oy,ox = [10,10]
+    overlapy_slider = Slider(ax_overlapy, "Y overlap", 2, 20, valinit=oy, valstep=1,valfmt='%0.0f')
+    overlapx_slider = Slider(ax_overlapx, "X overlap", 2, 20, valinit=ox, valstep=1,valfmt='%0.0f')
     # plt.subplots_adjust(bottom=0.25)
 
     # Display the original image
-    ax[0].imshow(image, vmin=vmin, vmax=vmax)
+    ax[0].imshow(image,vmin=vmin,vmax=vmax)
     ax[0].set_title("Original Image")
     ax[0].axis("off")
 
     # Placeholder for blurred image
-    mask = np.where(make_mask(image, 20, 3), 1, 0)  # Initial blur with small sigma
-    overlapmap = copy.deepcopy(mask)
-    s = mask.shape[0]
-    overlapmap[: s // oy] += mask[-s // oy :]
-    overlapmap[-s // oy :] += mask[: s // oy]
-
-    overlapyfraction = np.sum(overlapmap == 2) / np.prod(overlapmap.shape)
-    ax[1].imshow(overlapmap, vmin=0, vmax=2)
-    ax[1].set_title("Overlapy fraction: {0:.2f}".format(overlapyfraction))
-    overlapmap = copy.deepcopy(mask)
-    overlapmap[:, : s // ox] += mask[:, -s // ox :]
-    overlapmap[:, -s // ox :] += mask[:, : s // ox]
-    overlapxfraction = np.sum(overlapmap == 2) / np.prod(overlapmap.shape)
-    ax[2].imshow(overlapmap, vmin=0, vmax=2)
-    ax[2].set_title("Overlapx fraction: {0:.2f}".format(overlapxfraction))
+    mask = np.where(make_mask(image, 20,3),1,0)  # Initial blur with small sigma
     ax[2].axis("off")
+
+    def makeoverlapmaps(oy,ox,mask):
+        overlapmapy = copy.deepcopy(mask)
+        s = mask.shape[0]
+        overlapmapy[:s//oy] += mask[-s//oy:]
+        overlapmapy[-s//oy:] += mask[:s//oy]
+        overlapmapx = copy.deepcopy(mask)
+        overlapmapx[:,:s//ox] += mask[:,-s//ox:]
+        overlapmapx[:,-s//ox:] += mask[:,:s//ox]
+        return overlapmapy,overlapmapx
+
+    overlapmapy,overlapmapx = makeoverlapmaps(oy,ox,mask)
+    ax[1].imshow(overlapmapy,vmin=0,vmax=2)
+    ax[2].imshow(overlapmapx,vmin=0,vmax=2)
+
+    def update(val):
+        oy = overlapy_slider.val
+        ox = overlapx_slider.val
+        overlapmapy,overlapmapx = makeoverlapmaps(oy,ox,mask)
+        overlapyfraction = np.sum(overlapmapy == 2) / np.prod(overlapmapy.shape)
+        ax[1].set_data(overlapmapy)
+        ax[1].set_title('Overlapy fraction: {0:.2f}'.format(overlapyfraction))
+        
+        overlapxfraction = np.sum(overlapmapx == 2) / np.prod(overlapmapx.shape)
+        ax[2].set_data(overlapmapx)
+        ax[2].set_title('Overlapx fraction: {0:.2f}'.format(overlapxfraction))
+        fig.canvas.draw_idle()
+
+    overlapx_slider.on_changed(update)
+    overlapy_slider.on_changed(update)
 
     # Show the interactive plot
     plt.show()
 
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()

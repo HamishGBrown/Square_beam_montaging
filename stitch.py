@@ -196,6 +196,74 @@ def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None
 
     return gainref
 
+def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorigin=None):
+    # Determine the global range of tiles in Angstroms
+    if montagewidth is None:
+        width = np.ptp(positions, axis=0) * 1e4
+    else:
+        width = montagewidth
+    if montageorigin is None:
+        origin = np.amin(positions, axis=0) * 1e4
+    else:
+        origin = montageorigin
+
+    pixels = ims[0].shape
+
+    # Calculate the size of the global montage canvas in pixels
+    size = (
+        np.asarray(width / pixel_size / binning, dtype=int)[::-1]
+        + pixels
+        + np.asarray([1, 1])
+    )
+
+    # Initialize the montage canvas and overlap map
+    canvas = np.zeros(size)
+    overlap = np.zeros(size, dtype=np.uint8)
+
+    # Place each image onto the canvas, applying the masks
+    for i, (im, position, msk) in enumerate(
+        tqdm(zip(ims, positions, msks), desc="Stitching")
+    ): 
+        # s is shape of tile, size is shape of canvas
+        s = im.shape
+        # Desired coordinate of upper left of tile
+        y0, x0 = [int(x) for x in (position * 1e4 - origin) / pixel_size / binning]
+    
+
+        # Skip tiles that have fallen off canvas
+        if x0 > size[0] or y0 > size[1]:
+            continue
+        if x0 +s[0] <0 or y0 +s[1] <0:
+            continue
+
+        # Truncate canvas coordinate beginnings to be >= 0
+        cy0, cx0 = [max(coord, 0) for coord in [y0, x0]]
+        # Truncate canvas coordinate maximum to be <= canvas array limits
+        cx1, cy1 = [
+            min(coord, limit) for coord, limit in zip([x0 + s[0], y0 + s[1]], size)
+        ]
+
+        # Size of tile that will make it onto the montage canvas
+        X = cx1 - cx0
+        Y = cy1 - cy0
+
+        # Coordinates of tile, if x0 (or y0) < 0 this implies some of the tile
+        # falls off the left (or upper) edge of canvas so is not included
+        tx0 = -min(x0,0)
+        tx1 = tx0 + X
+        ty0 = -min(y0,0)
+        ty1 = ty0 + Y
+
+        canvas[cx0:cx1, cy0:cy1] += np.where(msk, im, 0)[tx0:tx1,ty0:ty1]
+        overlap[cx0:cx1, cy0:cy1] += np.where(msk, np.uint8(1), np.uint8(0))[tx0:tx1,ty0:ty1]
+
+    # Normalize the canvas by the overlap map to account for overlapping regions
+    median = np.median(canvas[overlap == 1])
+    canvas[overlap < 1] = median
+    overlap = np.where(overlap > 1, overlap, 1)
+    canvas /= overlap
+    return canvas
+
 
 def stitch(
     ims, positions, msks, pixel_size, binning=1, montagewidth=None, montageorigin=None
@@ -825,7 +893,6 @@ def cross_correlate_tiles(
         min_distance_index = distances.argmin()
         closest_point_list1 = list1[min_distance_index]
         closest_point_list2 = list2[indices[min_distance_index]]
-
         return min_distance_index, indices[min_distance_index]
 
     # For some tiles there will be no reliable shift determinations
@@ -862,6 +929,10 @@ def cross_correlate_tiles(
 
             b[len(b) :] = delta[::-1].tolist()
         A = np.stack(A.tolist() + extraA, axis=0)
+    def objective_function(x,A,b,positions,lam):
+        obj = np.linalg.norm(A @ x - b)
+        obj += lam*np.linalg.norm(positions - x)
+        return obj
 
     def objective_function(x, A, b, positions, lam):
         obj = np.linalg.norm(A @ x - b)
@@ -1160,6 +1231,44 @@ def plot_positions(coordinates, fnam=None, fig=None, color="blue"):
         fig.savefig(fnam)
 
 
+def plot_positions(coordinates,fnam=None,fig = None,color='blue'):
+
+
+    # Extract X and Y coordinates
+    x_coords = [coord[0] for coord in coordinates]
+    y_coords = [coord[1] for coord in coordinates]
+
+    # Create a scatter plot
+    if fig is None:
+        fig,ax = plt.subplots(figsize=(10, 8))
+    else:
+        ax = fig.get_axes()[0]
+        ax.title('Coordinate Points with Index Annotations')
+        ax.xlabel('X Coordinates')
+        ax.ylabel('Y Coordinates')
+        ax.axhline(0, color='black',linewidth=0.5)
+        ax.axvline(0, color='black',linewidth=0.5)
+        ax.grid(color = 'gray', linestyle = '--', linewidth = 0.5)
+    ax.scatter(x_coords, y_coords, color=color, label='Coordinates')
+
+    # Annotate each point with its index
+    for idx, (x, y) in enumerate(coordinates):
+        ax.annotate(str(idx), (x, y), textcoords="offset points", xytext=(5, 5), ha='center', fontsize=8)
+
+    # Set plot title and labels
+
+    
+    ax.legend()
+
+    # Save the plot to a PDF file
+    fig.tight_layout()
+    if fnam is None:
+        plt.show()
+    else:
+        fig.savefig(fnam)
+
+
+
 def main():
     args = parse_commandline()
     outdir = setup_outputdir(args)
@@ -1276,6 +1385,13 @@ def main():
         # positions = imageshifts[i][1]
         indx = find_closest_index(tiltsfromfile, tilt)
         positions = imageshifts[indx]
+        
+        # plot_positions(positions[:,:2])
+        if args['maximageshift'] is not None:
+            tiles = np.where(np.logical_and(*(np.abs(positions) < maxim).T))[0]
+        else:
+            tiles = None
+        # plot_positions(positions[tiles][:,:2],color='k')
 
         # plot_positions(positions[:,:2])
         if args["maximageshift"] is not None:
