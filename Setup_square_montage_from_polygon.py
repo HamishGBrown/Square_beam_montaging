@@ -1,5 +1,5 @@
 #!Python
-import serialem as sem
+
 import numpy as np
 import os
 import shapely
@@ -131,6 +131,7 @@ def extract_points(file_path, item_index):
 
 
 def plot_points_in_serial_EM_navigator(imageshifts, M, nx, ny, x, y):
+    import serialem as sem
     # Get a unique group number to add squares to
     gid = int(sem.GetUniqueNavID())
 
@@ -349,17 +350,36 @@ def calculate_defocii(imageshifts, angles, M):
         zs.append(np.tan(np.deg2rad(alpha)) * (M @ imshift.T).T[:, 1])
     return zs
 
-
-if __name__ == "__main__":
-
-    # Parse commandline arguments
-    step = 3
-    maxtilt = 60
-    ntiltgroup = 3
-    overlapy,overlapx = [5,7]
-    outdir = "X:\DoseFractions\Brown\20250103_Montagingscripttests"
-    polyoverlapfrac = 0.2
+def plot_tilts_and_image_shifts(polygonpoints,tilts,imageshifts,M,ny,nx,zs):
+    fig = plt.figure()  
+    camerapoints = np.asarray([[0,0],[nx,0],[nx,ny],[0,ny],[0,0]]) @ M.T
+    ax = fig.add_subplot(projection='3d')
     
+    threedpolypoints = np.concatenate((polygonpoints,polygonpoints[0:1,:]),axis=0)
+    Z = np.zeros(threedpolypoints.shape[0])
+    threedpolypoints = np.concatenate((threedpolypoints,Z.reshape((Z.shape[0],1))),axis=1)
+    ax.plot3D(*(threedpolypoints.T), c='b',alpha=0.5)
+    for i, (tilt, imagexy) in enumerate(zip(tilts, imageshifts)):
+        if tilt<0:
+            continue
+        points = imagexy @ M.T
+        print((points.reshape((points.shape[0], 1,points.shape[1])) + camerapoints).shape)
+
+        for shift in points.reshape((points.shape[0], 1,points.shape[1])) + camerapoints:
+            Z = shift[...,1]*np.tan(np.deg2rad(tilt))
+            ax.plot3D(*(np.concatenate([shift,Z.reshape((Z.shape[0],1))],axis=1)).T, 'r-')
+        # plt.show()
+        # ax.plot(imshift[:, 0], imshift[:, 1], "o", label=f"Tilt: {tilt}")
+        # for j, (x, y) in enumerate(imshift):
+        #     ax.text(x, y, f"{j}", fontsize=8)
+        # for j, (x, y) in enumerate(imshift):    
+    plt.show()
+
+def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac):
+    import serialem as sem
+
+    overlapy,overlapx = [int(x) for x in overlap]
+
     # Get coordinates from polygon and label from last acquired item
     # this script is intended by run after acquisition using "Acquire at items"
     # in serial-EM so the nav item will be the polygon
@@ -374,8 +394,9 @@ if __name__ == "__main__":
     polygonpoints = extract_points(tempnavfile, label)
     os.remove(tempnavfile)
 
-    # Get the label from the last acquired image which should be the view map.
-    _________, _, _ , _, label = sem.ReportOtherItem(-1)
+    # Get the stage position and label from the last acquired image which should be the view map.
+    _________, vx, vy , vz,  label = sem.ReportOtherItem(-1)
+
     # Generate output filename using navigation item albel
     fnamout = "Montage_imageshifts_{0}.txt".format(label)
     fnamout = os.path.join(outdir, fnamout)
@@ -440,6 +461,11 @@ if __name__ == "__main__":
             fov = np.asarray((nx, ny))
             imagexy -= fov / 2
 
+            # Dilate the polygon by the cosine of the tilt angle to account for
+            # the fact that the field of view is larger at higher tilts
+            dilated_poly_points = transformed_poly_points.copy()
+            dilated_poly_points[:,1] = (transformed_poly_points[:,1] - vy)*np.cos(np.deg2rad(tilts[itilts])) + vy
+
             # Remove images with insufficient overlap with the polygon
             imagexy = (
                 rectangles_with_overlap(
@@ -450,13 +476,15 @@ if __name__ == "__main__":
 
             imageshifts.append(imagexy)
 
-        ids, gid = plot_points_in_serial_EM_navigator(imageshifts[0], M, nx, ny, x, y)
+        ids, gid = plot_points_in_serial_EM_navigator(imageshifts[0], M, nx, ny, vx, vy)
+        
+        # Script can be configured to ask for user input to check if the montage is satisfactory
+        satisfactory = True
+        # satisfatory = sem.YesNoBox("Satisfactory?") == 1
 
-        satisfatory = sem.YesNoBox("Satisfactory?") == 1
-
-        if not satisfatory:
-            for id_ in ids[::-1]:
-                sem.DeleteNavigatorItem(id_)
+        # if not satisfatory:
+        #     for id_ in ids[::-1]:
+        #         sem.DeleteNavigatorItem(id_)
     # Calculate defocii to compensate for distance from tilt axis
     zs = calculate_defocii(imageshifts,tilts,M)
 
@@ -465,3 +493,132 @@ if __name__ == "__main__":
     # converted to basis aligned with tilt axis inside SerialEM
     write_tilts_and_image_shifts_to_file(fnamout,tilts,imageshifts,zs)
     print('Save {0}'.format(fnamout))
+
+def main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,polygonpoints=None,nx=5076,ny=4092,p=0.65):
+
+    overlapy,overlapx = [int(x) for x in overlap]
+
+    # Get coordinates from polygon and label from last acquired item
+    # this script is intended by run after acquisition using "Acquire at items"
+    # in serial-EM so the nav item will be the polygon
+    if polygonpoints is None:
+        polygonpoints = np.asarray([[-1.0,0.0],[-1.0,1.0],[-0.75,1.0],[-0.75,0.75],[0.75,0.75],[0.75,1.0],[1.0,1.0],[1.0,0.0]])
+    
+    vx,vy = np.mean(polygonpoints,axis=0)
+    
+
+    # Generate output filename using navigation item albel
+    fnamout = "Montage_imageshifts.txt"
+    fnamout = os.path.join(outdir, fnamout)
+
+    # Convert pixel size to micron
+    pmicron = p * 1e-4
+
+    # Generate tilt series
+    tilts = dose_symmetric_tilts(maxtilt, step, ntiltgroup)
+    print(
+        "{0} tilts between {1} and {2} in steps of {3}".format(
+            len(tilts), min(tilts), max(tilts), step
+        )
+    )
+    M = np.eye(2)*pmicron
+    Minv = np.linalg.inv(M)
+
+    # Get size (range) and origin of polygon to fit in initial guess of montage
+    # tiles
+    transformed_poly_points = (Minv @ polygonpoints.T).T
+    extent = np.ptp(transformed_poly_points, axis=0)
+    origin = (
+        np.max(transformed_poly_points, axis=0)
+        + np.min(transformed_poly_points, axis=0)
+    ) / 2
+
+    # Generate corners in pixel coordinates
+    cornersx = np.asarray([nx / 2 * (1 - 2 * ((i % 4) // 2)) for i in range(5)])
+    cornersy = np.asarray([ny / 2 * (1 - 2 * ((i + 1) % 4 // 2)) for i in range(5)])
+    corners = np.stack((cornersx, cornersy), axis=1)
+
+    satisfatory = False
+    while not satisfatory:
+
+        #sem.EnterString(
+         #   "inp",
+         #   "Enter montage tile x and y overlap factor (1/fractional overlap as a series of numbers.|\n eg. 5 4 8 8 for a 5 x 4 montage with 12.5% overlap",
+        #)
+        #inp = sem.GetVariable("inp").strip()
+        #overlapy, overlapx = [int(x) for x in inp.split(" ")]
+        ntilts = len(tilts)
+        o = [overlapy, overlapx]
+
+        imageshifts = []
+        for itilts in range(ntilts):
+
+            # Generate montage shifts for this tilt, shift by overlap
+            # output is in pixels
+            imagexy = generate_montage_shifts(
+                o,
+                [extent[0] / nx, extent[1] / ny],
+                [nx, ny],
+                shift=[(itilts / o[0]) % 1.0, (itilts / o[1]) % 1.0],
+            )
+
+            # Shift image shifts by 1/2 a Record field of view
+            fov = np.asarray((nx, ny))
+            imagexy -= fov / 2
+
+            # Dilate the polygon by the cosine of the tilt angle to account for
+            # the fact that the field of view is larger at higher tilts
+            dilated_transformed_points = transformed_poly_points.copy()
+            # dilated_transformed_points[:,1] = (transformed_poly_points[:,1] - vy)*np.cos(np.deg2rad(tilts[itilts])) + vy
+            
+            
+            # Remove images with insufficient overlap with the polygon
+            imagexy = (
+                rectangles_with_overlap(
+                    dilated_transformed_points, imagexy + origin, nx, ny, polyoverlapfrac
+                )
+                - origin + fov/2
+            )
+
+            fig,ax = plt.subplots()
+            ax.plot(*np.asarray(dilated_transformed_points).T,'k--')
+            points = np.asarray(imagexy+origin)
+            for imxy in points:
+                ax.plot(*(imxy+corners).T,'r-')
+            # ax.plot(*.T,'ro')
+            plt.show()
+            import sys;sys.exit()
+            imageshifts.append(imagexy)
+
+        # ids, gid = plot_points_in_serial_EM_navigator(imageshifts[0], M, nx, ny, x, y)
+        
+        # Script can be configured to ask for user input to check if the montage is satisfactory
+        satisfatory = True
+        # satisfatory = sem.YesNoBox("Satisfactory?") == 1
+
+        # if not satisfatory:
+        #     for id_ in ids[::-1]:
+        #         sem.DeleteNavigatorItem(id_)
+    # Calculate defocii to compensate for distance from tilt axis
+    zs = calculate_defocii(imageshifts,tilts,M)
+
+    # Save image shifts for Serial-EM in units of pixels in the camera
+    # basis (x and y aligned with camera axes). Imageshifts will be 
+    # converted to basis aligned with tilt axis inside SerialEM
+    write_tilts_and_image_shifts_to_file(fnamout,tilts,imageshifts,zs)
+    plot_tilts_and_image_shifts(polygonpoints,tilts,imageshifts,M,ny,nx,zs)
+    print('Save {0}'.format(fnamout))
+
+if __name__ == "__main__":
+
+    # Parse commandline arguments
+    step = 3
+    maxtilt = 60
+    ntiltgroup = 3
+    overlap= [5,7]
+    outdir = "./"
+    polyoverlapfrac = 0.2
+    
+    # main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac)
+    main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac)
+    

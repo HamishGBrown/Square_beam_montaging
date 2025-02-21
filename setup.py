@@ -17,6 +17,7 @@ setup(
         "matplotlib",
         "mrcfile",
         "argparse",
+        "shapely",
     ],
     entry_points={
         "console_scripts": [
