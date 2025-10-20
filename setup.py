@@ -17,6 +17,7 @@ setup(
         "matplotlib",
         "mrcfile",
         "argparse",
+        "h5py",
     ],
     entry_points={
         "console_scripts": [

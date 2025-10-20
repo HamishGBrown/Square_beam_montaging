@@ -16,6 +16,7 @@ import argparse
 import numpy as np
 from typing import List, Tuple, Dict, Any
 from Utilities import *
+from smoothn import smoothn
 
 
 def parse_commandline() -> Dict[str, Any]:
@@ -116,10 +117,35 @@ def parse_commandline() -> Dict[str, Any]:
         action="store_true",
     )
 
+    parser.add_argument(
+        "-mt",
+        "--maskthreshold",
+        help="threshold (as fraction of raw image median) for masking of beam.",
+        type=float,
+        default=0.4,
+        required=False,
+    )
+
+    parser.add_argument(
+        "-ma",
+        "--maskabsolutethreshold",
+        help="Absolute threshold (in number of image counts) for masking of beam.",
+        type=float,
+        default=None,
+        required=False,
+    )
+
+    parser.add_argument(
+        "-fb",
+        "--flattenbeam",
+        help="If True, the beam will be flattened by subtracting a 2D polynomial fit to the beam.",
+        action="store_true",
+    )
+
     return vars(parser.parse_args())
 
 
-def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None):
+def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None, medianthreshold=0.4, absolutethreshold=None):
     """
     Generate a gain reference image by averaging a series of input images.
 
@@ -151,7 +177,7 @@ def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None
         im = fourier_interpolate(im, [x // binning for x in img.shape])
 
         # Create a mask for the image
-        msk = make_mask(im, shrinkn=shrinkn / binning)
+        msk = make_mask(im, shrinkn=shrinkn / binning,medianthreshold=medianthreshold,absolutethreshold=absolutethreshold)
         return im, msk
 
     # Get target image
@@ -179,7 +205,7 @@ def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None
             if i == 0 and j == templateindex:
                 continue
             else:
-                # Align images to the template
+                # Align images to the templatex
                 y, x = cross_correlate_alignment(
                     template, np.where(msk, 1, 0), returncoords=True
                 )
@@ -253,90 +279,26 @@ def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorig
         tx1 = tx0 + X
         ty0 = -min(y0,0)
         ty1 = ty0 + Y
+        # fig,ax = plt.subplots(ncols=2)
+        # ax[0].imshow(im[tx0:tx1,ty0:ty1],cmap='gist_gray')
+        # ax[1].imshow(im[tx0:tx1,ty0:ty1],cmap='gist_gray')
+        # ax[1].imshow(msk[tx0:tx1,ty0:ty1],cmap='Reds',alpha=0.3)
+        # plt.show(block=True)
 
         canvas[cx0:cx1, cy0:cy1] += np.where(msk, im, 0)[tx0:tx1,ty0:ty1]
         overlap[cx0:cx1, cy0:cy1] += np.where(msk, np.uint8(1), np.uint8(0))[tx0:tx1,ty0:ty1]
 
     # Normalize the canvas by the overlap map to account for overlapping regions
     median = np.median(canvas[overlap == 1])
-    canvas[overlap < 1] = median
+    canvas[overlap>0] /= overlap[overlap>0]
+    
+    smoothed = smoothn(np.ma.masked_array(canvas,overlap <1),s=1e7,robust=True)
+    canvas = np.where(overlap < 1, smoothed, canvas)
+    # canvas[overlap < 1] = median
     overlap = np.where(overlap > 1, overlap, 1)
-    canvas /= overlap
+    
     return canvas
 
-
-def stitch(
-    ims, positions, msks, pixel_size, binning=1, montagewidth=None, montageorigin=None
-):
-    # Determine the global range of tiles in Angstroms
-    if montagewidth is None:
-        width = np.ptp(positions, axis=0) * 1e4
-    else:
-        width = montagewidth
-    if montageorigin is None:
-        origin = np.amin(positions, axis=0) * 1e4
-    else:
-        origin = montageorigin
-
-    pixels = ims[0].shape
-
-    # Calculate the size of the global montage canvas in pixels
-    size = (
-        np.asarray(width / pixel_size / binning, dtype=int)[::-1]
-        + pixels
-        + np.asarray([1, 1])
-    )
-
-    # Initialize the montage canvas and overlap map
-    canvas = np.zeros(size)
-    overlap = np.zeros(size, dtype=np.uint8)
-
-    # Place each image onto the canvas, applying the masks
-    for i, (im, position, msk) in enumerate(
-        tqdm(zip(ims, positions, msks), desc="Stitching")
-    ):
-        # s is shape of tile, size is shape of canvas
-        s = im.shape
-        # Desired coordinate of upper left of tile
-        y0, x0 = [int(x) for x in (position * 1e4 - origin) / pixel_size / binning]
-
-        # Skip tiles that have fallen off canvas
-        if x0 > size[0] or y0 > size[1]:
-            continue
-        if x0 + s[0] < 0 or y0 + s[1] < 0:
-            continue
-
-        # Truncate canvas coordinate beginnings to be >= 0
-        cy0, cx0 = [max(coord, 0) for coord in [y0, x0]]
-        # Truncate canvas coordinate maximum to be <= canvas array limits
-        cx1, cy1 = [
-            min(coord, limit) for coord, limit in zip([x0 + s[0], y0 + s[1]], size)
-        ]
-
-        # Size of tile that will make it onto the montage canvas
-        X = cx1 - cx0
-        Y = cy1 - cy0
-
-        # Coordinates of tile, if x0 (or y0) < 0 this implies some of the tile
-        # falls off the left (or upper) edge of canvas so is not included
-        tx0 = -min(x0, 0)
-        tx1 = tx0 + X
-        ty0 = -min(y0, 0)
-        ty1 = ty0 + Y
-
-        canvas[cx0:cx1, cy0:cy1] += np.where(msk, im, 0)[tx0:tx1, ty0:ty1]
-        overlap[cx0:cx1, cy0:cy1] += np.where(msk, np.uint8(1), np.uint8(0))[
-            tx0:tx1, ty0:ty1
-        ]
-
-    # Normalize the canvas by the overlap map to account for overlapping regions
-    median = np.median(canvas[overlap == 1])
-    canvas[overlap < 1] = median
-    canvas[overlap > 0] /= overlap[overlap > 0]
-    # canvas = iterative_edge_smoothing(canvas, overlap > 0, niterations=20, pow=4)
-    # overlap = np.where(overlap > 1, overlap, 1)
-
-    return canvas
 
 
 def montage(
@@ -355,6 +317,9 @@ def montage(
     maxshift=0.05,
     fringe_size=20,
     Matchgainrefmask=False,
+    maskthreshold=0.4,
+    maskabsolutethreshold=None,
+    flattenbeam=False,
 ):
     """
     Creates a montage image from a series of input images by aligning and stitching them together.
@@ -397,6 +362,8 @@ def montage(
     Matchgainrefmask : bool, optional
         If False, a mask will be generated for each tile. If True, masks will be generated
         by cross correlation alignment of the gain reference mask to each tile. Default is None.
+    medianthreshold : float, optional
+        Threshold for (as a fraction of the median) for masking the image. Default is 0.4.
     Returns:
     --------
     numpy.ndarray
@@ -440,16 +407,21 @@ def montage(
             # y0, x0 = center_of_mass(gainref)
         else:
             desc = "Generating masks"
+        if flattenbeam:
+            beam_rotation = determine_square_beam_angle(mrcmemmap.data[M][0])
+            print(beam_rotation)
         for position, img in tqdm(
             zip(positions[M], mrcmemmap.data[M]),
             total=len(positions[M]),
             desc=desc,
         ):
             # Load image from memory map and convert to numpy array
-            im = np.asarray(img)
+            im = copy.deepcopy(np.asarray(img))
             # Fourier interpolate if reqeusted
             if binning > 1:
                 im = fourier_interpolate(im, [x // binning for x in im.shape])
+
+            
 
             if Matchgainrefmask:
                 # Align beam in image tile to gain reference
@@ -459,11 +431,17 @@ def montage(
                 # Apply aligned gain reference
                 im[msks[-1]] /= np.roll(gainref, (-y, -x), axis=(-2, -1))[msks[-1]]
                 im = np.where(msks[-1], im, 0)
-
+                beam_posns.append([x, y])
             else:
                 # Generate a mask if none is provided
-                msks.append(make_mask(im, shrinkn=fringe_size / binning))
-
+                msks.append(make_mask(im, shrinkn=fringe_size / binning,medianthreshold=maskthreshold,absolutethreshold=maskabsolutethreshold))
+                # fig,ax = plt.subplots(ncols=2)
+                # ax[0].imshow(im,cmap='gist_gray',vmin=np.percentile(im,1),vmax=np.percentile(im,99))
+                # ax[1].imshow(im,cmap='gist_gray',vmin=np.percentile(im,1),vmax=np.percentile(im,99))
+                # ax[1].imshow(np.where(msks[-1],1,0),alpha=0.3,cmap='Reds')
+                # fig.savefig('masks/msk_{0}.pdf'.format(len(msks)))
+                # plt.close(fig)
+                # plt.show(block=True)
                 # Apply gain reference correction if provided
                 if gainref is not None:
                     y, x = cross_correlate_alignment(
@@ -474,10 +452,19 @@ def montage(
                     coords = [-y, -x]
                     msk = roll_no_periodic(gainrefmask, coords, axis=(-2, -1))
                     msks[-1] = msk
-                    im[msk] /= np.roll(gainref, coords, axis=(-2, -1))[msk]
+                    im[msk] = im[msk]/np.roll(gainref, coords, axis=(-2, -1))[msk]
                     im = np.where(msk, im, 0)
 
-            beam_posns.append([x, y])
+                    beam_posns.append([x, y])
+            if flattenbeam:
+                # Flatten the beam by subtracting a 2D polynomial fit
+                # from the image
+                # fig,ax = plt.subplots(ncols=2)
+                # ax[0].imshow(im,cmap='gist_gray')
+                
+                im = flatten_beam(im,msks[-1],rotation=beam_rotation)
+                # ax[1].imshow(im,cmap='gist_gray')
+                # plt.show(block=True)
             ims.append(im)
 
         print("Saving gain corrected images to {0}".format(gaincorrectedfile))
@@ -493,7 +480,7 @@ def montage(
             )
 
         for im in ims:
-            msks.append(make_mask(im, shrinkn=fringe_size / binning))
+            msks.append(make_mask(im, shrinkn=fringe_size / binning,medianthreshold=maskthreshold,absolutethreshold=maskabsolutethreshold))
 
     positionfile = os.path.join(
         outdir, os.path.split(image)[1].replace(".mrc", "_refined_positions.h5")
@@ -806,6 +793,7 @@ def cross_correlate_tiles(
             load_array_from_hdf5(cross_corr_param_file, x)
             for x in ("cross_correlations", "relative_shifts")
         ]
+    # plot_individual_cross_correlation(tiles,masks,positions,overlaps,pixel_size,filename_template='cross_corr_{0}_{1}.pdf')
     for ind, (i, j) in enumerate(tqdm(overlaps, desc="Cross-correlation alignment")):
         # Retrieve image shifts for the overlapping tiles
         x1 = positions[i]
@@ -824,13 +812,17 @@ def cross_correlate_tiles(
 
             # Make masks for (estimated) overlapping areas of each array
             reference_mask = np.zeros_like(masks[i], dtype=bool)
-            reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = masks[i][
+            reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(masks[i][
                 i1[0] : i1[1], j1[0] : j1[1]
-            ]
-            moving_mask = np.zeros_like(masks[j], dtype=bool)
-            moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = masks[j][
+            ],masks[j][
                 i2[0] : i2[1], j2[0] : j2[1]
-            ]
+            ])
+            moving_mask = np.zeros_like(masks[j], dtype=bool)
+            moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = np.logical_and(masks[i][
+                i1[0] : i1[1], j1[0] : j1[1]
+            ],masks[j][
+                i2[0] : i2[1], j2[0] : j2[1]
+            ])
             
             # Calculate shift by masked cross correlation with ordering (Y,X)
             detected_shift = phase_cross_correlation(
@@ -999,27 +991,31 @@ def plot_individual_cross_correlation(
         j1, j2 = array_overlap(dx[1], pixels[1])
         print(i1, i2, j1, j2)
         reference_mask = np.zeros_like(masks[i], dtype=bool)
-        reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = masks[i][
+        reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(masks[i][
             i1[0] : i1[1], j1[0] : j1[1]
-        ]
-        moving_mask = np.zeros_like(masks[j], dtype=bool)
-        moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = masks[j][
+        ],masks[j][
             i2[0] : i2[1], j2[0] : j2[1]
-        ]
+        ])
+        moving_mask = np.zeros_like(masks[j], dtype=bool)
+        moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = np.logical_and(masks[i][
+            i1[0] : i1[1], j1[0] : j1[1]
+        ],masks[j][
+            i2[0] : i2[1], j2[0] : j2[1]
+        ])
 
-        detected_shift, _ = _masked_phase_cross_correlation(
+        detected_shift = np.asarray(phase_cross_correlation(
             images[i], images[j], reference_mask=reference_mask, moving_mask=moving_mask
-        )
+        )[0])
 
         fig = plt.figure(figsize=(8, 12))
         axes = fig.subplot_mosaic([["Image1", "Image2"], ["Stitched", "Stitched"]])
         gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 2], hspace=0.3)
 
-        axes["Image1"].imshow(images[i], cmap="gray")
+        axes["Image1"].imshow(images[i], cmap="gray",vmin=np.percentile(images[i][masks[i]],1),vmax=np.percentile(images[i][masks[i]],99))
         axes["Image1"].imshow(reference_mask, alpha=0.5, cmap="Reds")
         axes["Image1"].set_title(f"Image {i} with Mask")
 
-        axes["Image2"].imshow(images[j], cmap="gray")
+        axes["Image2"].imshow(images[j], cmap="gray",vmin=np.percentile(images[j][masks[j]],1),vmax=np.percentile(images[j][masks[j]],99))
         axes["Image2"].imshow(moving_mask, alpha=0.5, cmap="Reds")
         axes["Image2"].set_title(f"Image {j} with Mask")
         print(
@@ -1156,7 +1152,7 @@ def setup_outputdir(args):
     return outputdir
 
 
-def setup_gainreference(gainreffile, filenames, outputdir, shrinkn=20):
+def setup_gainreference(gainreffile, filenames, outputdir, shrinkn=20, medianthreshold=0.4,maskabsolutethreshold=None):
     """
     Sets up the gain reference for image processing.
 
@@ -1175,7 +1171,7 @@ def setup_gainreference(gainreffile, filenames, outputdir, shrinkn=20):
         with mrcfile.open(gainreffile, "r+") as m:
             gainref = np.asarray(m.data)
     else:
-        gainref = make_gain_ref(filenames, binning=4)
+        gainref = make_gain_ref(filenames, binning=4, shrinkn=shrinkn, medianthreshold=medianthreshold,absolutethreshold=maskabsolutethreshold)
         gainreffile_ = os.path.join(outputdir, "gain.mrc")
         print("Saving generated Gain reference as {0}".format(gainreffile_))
         savetomrc(gainref.astype(np.float32), gainreffile_)
@@ -1344,7 +1340,7 @@ def main():
                         )
                     )
                     gainref = fourier_interpolate(gainref, imageshape)
-                    gainrefmask = make_mask(gainref, shrinkn=fringe_size / binning)
+                    gainrefmask = make_mask(gainref, shrinkn=fringe_size / binning,medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
 
                     gainref /= np.median(gainref[gainrefmask])
                     Image.fromarray(gainref).save(
@@ -1359,7 +1355,7 @@ def main():
                 )
                 checkforgainref = False
         if not checkforgainref:
-            gainref = make_gain_ref(files, binning=binning, shrinkn=fringe_size)
+            gainref = make_gain_ref(files, binning=binning, shrinkn=fringe_size, medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
             gainreffile = os.path.join(outdir, "gainref.mrc")
             print("Saving gain reference to {0}".format(gainreffile))
             savetomrc(gainref.astype(np.float32), gainreffile)
@@ -1417,6 +1413,9 @@ def main():
             gaincorrectedfile=args["gain_corrected_files"],
             maxshift=args["max_allowed_imshift_correction"],
             Matchgainrefmask=args["Matchgainrefmask"],
+            maskthreshold=args["maskthreshold"],
+            maskabsolutethreshold=args["maskabsolutethreshold"],
+            flattenbeam=args["flattenbeam"],
         )
 
 

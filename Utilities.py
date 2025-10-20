@@ -563,6 +563,163 @@ def Gaussian(sigma, gridshape):
     gaussian = np.exp(-(ysqr[:, None] + xsqr[None, :]) / sigma**2 / 2)
     return gaussian / np.sum(gaussian)
 
+def center_of_mass_2d(array):
+    """
+    Calculate the center of mass of a 2D array.
+
+    Parameters
+    ----------
+    array : 2D numpy array
+        Input array for which to calculate the center of mass.
+
+    Returns
+    -------
+    tuple
+        Coordinates of the center of mass (row, col).
+    """
+    total = np.sum(array)
+    if total == 0:
+        raise ValueError("The sum of the array elements is zero, cannot determine center of mass.")
+    
+    rows, cols = np.indices(array.shape)
+    center_row = np.sum(rows * array) / total
+    center_col = np.sum(cols * array) / total
+    
+    return center_row, center_col
+
+
+def broadcast_from_unmeshed(coords):
+    """
+    For an unmeshed set of coordinates broadcast to a meshed ND array.
+
+    Examples
+    --------
+    >>> broadcast_from_unmeshed([np.arange(5),np.arange(6)])
+    [array([[0, 0, 0, 0, 0, 0],
+       [1, 1, 1, 1, 1, 1],
+       [2, 2, 2, 2, 2, 2],
+       [3, 3, 3, 3, 3, 3],
+       [4, 4, 4, 4, 4, 4]]), array([[0, 1, 2, 3, 4, 5],
+       [0, 1, 2, 3, 4, 5],
+       [0, 1, 2, 3, 4, 5],
+       [0, 1, 2, 3, 4, 5],
+       [0, 1, 2, 3, 4, 5]])]
+    """
+
+    N = len(coords)
+    pixels = [a.shape[0] for a in coords]
+
+    # Broadcasting patterns
+    R = np.ones((N, N), dtype=np.int16) + np.diag(pixels) - np.eye(N, dtype=np.int16)
+
+    # Broadcast unmeshed grids
+    return [np.broadcast_to(a.reshape(rr), pixels) for a, rr in zip(coords, R)]
+
+
+def r_space_array(pixels, gridsize, meshed=True):
+    """
+    Return the appropriately scaled ND real space coordinates.
+
+    Parameters
+    -----------
+    pixels : (N,) array_like
+        Pixels in each dimension of a ND array
+    gridsize : (N,) array_like
+        Dimensions of the array in real space units
+    meshed : bool, optional
+        Option to output dense meshed grid (True) or output unbroadcasted
+        arrays (False)
+    """
+    # N is the dimensionality of grid
+    N = len(pixels)
+
+    # Calculate unmeshed grids
+    rspace = [np.fft.fftshift(np.fft.fftfreq(pixels[i], d=1 / gridsize[i])) for i in range(N)]
+
+    # At this point we can return the arrays without broadcasting
+    if meshed:
+        return broadcast_from_unmeshed(rspace)
+    else:
+        return rspace
+
+
+def flatten_beam(image,mask,rotation=0):
+    """
+    Flattens the beam profile in an image by fitting and subtracting a 4th order polynomial surface.
+
+    Parameters:
+    image (numpy.ndarray): The input 2D image array.
+    mask (numpy.ndarray): A boolean mask array where True values indicate the region of interest.
+    rotation (float, optional): The rotation angle in degrees to apply to the coordinates. Default is 0.
+
+    Returns:
+    numpy.ndarray: The flattened image with the beam profile subtracted.
+    """
+    im  = fourier_interpolate(image,[256,256])
+    msk = make_mask(im)
+    y,x = r_space_array(im.shape,gridsize=im.shape,meshed=True)
+    y0,x0= center_of_mass_2d(np.where(msk,1,0))
+    y = y - (y0 - image.shape[0]//2)
+    x = x - (x0 - image.shape[1]//2)
+    M = rotation_matrix(-rotation)
+    y,x = np.einsum('ij,jkl->ikl',M,np.array([y,x]))
+    
+    x_masked = x[msk].flatten()
+    y_masked = y[msk].flatten()
+    m_masked = im[msk].flatten()
+    # A = np.column_stack([x_masked.ravel()**4,y_masked.ravel()**4,np.ones_like(x_masked.ravel())])
+    A = np.column_stack([x_masked.ravel()**4,y_masked.ravel()**4,x_masked.ravel()**2,y_masked.ravel()**2,np.ones_like(x_masked.ravel())])
+    coeffs, _, _, _ = np.linalg.lstsq(A, m_masked, rcond=None)
+    fitted_2d = np.zeros_like(image)
+    fitted_2d = coeffs[0]*x**4+coeffs[1]*y**4+coeffs[2]*x**2+coeffs[3]*y**2
+    # fig,ax = plt.subplots(ncols=3)
+    # vmin=np.percentile(image[mask],1)
+    # vmax=np.percentile(image[mask],99)
+    # ax[0].imshow(image,vmin=vmin,vmax=vmax)
+    # ax[1].imshow(fitted_2d)
+    mean = np.mean(image[mask])
+    image[mask]= image[mask]-fourier_interpolate(fitted_2d,image.shape)[mask]+mean
+    # vmin=np.percentile(image[mask],1)
+    # vmax=np.percentile(image[mask],99)
+    # ax[1].imshow(image,vmin=vmin,vmax=vmax)
+    # ax[2].imshow(fourier_interpolate(fitted_2d,image.shape))
+    # plt.show(block=True)
+    # image[mask] -= fitted_2d[mask]
+    return image
+
+def determine_square_beam_angle(m):
+    """
+    Determines the orientation angle of a square beam in an image.
+    Parameters:
+    m (numpy.ndarray): The input 2D array representing the image of the square beam.
+    Returns:
+    float: The orientation angle of the square beam in degrees, adjusted to be within the range [-45, 45] degrees.
+    Notes:
+    - The function first resizes the image such that the longest axis is 128 pixels to speed up the calculation.
+    - It then pads the resized image with zeros.
+    - The Radon transform is applied to the padded image to compute the sinogram.
+    - The angle corresponding to the minimum value in the central row of the sinogram is determined.
+    - This angle is adjusted to be within the range [-45, 45] degrees.
+    """
+    
+    # Reshape so that longest axis is 128 pixels to speed up the calculation
+    if m.shape[0]>m.shape[1]:
+        news = [128,128*m.shape[1]//m.shape[0]]
+    else:    
+        news = [128*m.shape[0]//m.shape[1],128]
+    m_ = fourier_interpolate(m,news)
+
+    # Pad the image with zeros
+    m_ = np.pad(m_,((64,64),(64,64)))
+    
+    N = 180
+    theta = np.linspace(0, 180, N)
+
+    from skimage.transform import radon
+    sinogram = fourier_interpolate(radon(m_, theta=theta),[N,N])
+    rot = theta[np.argmin(sinogram[sinogram.shape[0]//2])]
+    rotmod45 = (rot+45)%90-45
+    return rotmod45
 
 def circular_mask(size, radius=None, center=None):
     """
@@ -616,7 +773,7 @@ def iterative_edge_smoothing(array, mask, niterations=5, pow=4, initial_radius=N
     return array
 
 
-def make_mask(im, shrinkn=20, smoothing_kernel=3):
+def make_mask(im, shrinkn=20, smoothing_kernel=3,medianthreshold=0.4,absolutethreshold=None):
     """
     Generate a binary mask from an image by applying a Gaussian filter, filling holes,
     and then shrinking the mask with morphological erosion.
@@ -639,7 +796,10 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3):
     smoothed_im = convolve(im, Gaussian(smoothing_kernel, im.shape))
 
     # Step 2: Create an initial binary mask based on a threshold (0.4 * median of the original image)
-    mask = smoothed_im > 0.4 * np.median(im)
+    if absolutethreshold is not None:
+        mask = smoothed_im > absolutethreshold
+    else:
+        mask = smoothed_im > medianthreshold * np.median(im)
 
     # Step 3: Fill any holes in the initial mask
     mask = binary_fill_holes(mask)
