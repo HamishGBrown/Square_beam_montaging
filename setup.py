@@ -18,6 +18,7 @@ setup(
         "mrcfile",
         "argparse",
         "h5py",
+        "shapely",
     ],
     entry_points={
         "console_scripts": [
