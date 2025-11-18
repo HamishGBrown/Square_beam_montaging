@@ -651,7 +651,7 @@ def flatten_beam(image,mask,rotation=0):
     image (numpy.ndarray): The input 2D image array.
     mask (numpy.ndarray): A boolean mask array where True values indicate the region of interest.
     rotation (float, optional): The rotation angle in degrees to apply to the coordinates. Default is 0.
-
+++
     Returns:
     numpy.ndarray: The flattened image with the beam profile subtracted.
     """

@@ -248,7 +248,7 @@ def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorig
 
     # Place each image onto the canvas, applying the masks
     for i, (im, position, msk) in enumerate(
-        tqdm(zip(ims, positions, msks), desc="Stitching")
+        zip(tqdm(ims, desc="Stitching"), positions, msks)
     ): 
         # s is shape of tile, size is shape of canvas
         s = im.shape
@@ -279,19 +279,27 @@ def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorig
         tx1 = tx0 + X
         ty0 = -min(y0,0)
         ty1 = ty0 + Y
-        # fig,ax = plt.subplots(ncols=2)
-        # ax[0].imshow(im[tx0:tx1,ty0:ty1],cmap='gist_gray')
-        # ax[1].imshow(im[tx0:tx1,ty0:ty1],cmap='gist_gray')
-        # ax[1].imshow(msk[tx0:tx1,ty0:ty1],cmap='Reds',alpha=0.3)
-        # plt.show(block=True)
 
         canvas[cx0:cx1, cy0:cy1] += np.where(msk, im, 0)[tx0:tx1,ty0:ty1]
         overlap[cx0:cx1, cy0:cy1] += np.where(msk, np.uint8(1), np.uint8(0))[tx0:tx1,ty0:ty1]
 
-    # Normalize the canvas by the overlap map to account for overlapping regions
-    median = np.median(canvas[overlap == 1])
-    canvas[overlap>0] /= overlap[overlap>0]
+    # # Normalize the canvas by the overlap map to account for overlapping regions
+    # median = np.median(canvas[overlap == 1])
+
+    # positions_pixel = (positions * 1e4) / pixel_size / binning
+    # for coords in np.nonzero(canvas[overlap>1]):
+    #     # Find closest montage tile
+    #     y_idx, x_idx = coords
+    #     pt = np.array([x_idx, y_idx])
+    #     closest_index = int(np.argmin(np.sum((positions_pixel - pt) ** 2, axis=1)))
+
+    #     # closest_position = positions_pixel[closest_index]
+    #     # closest_index is the index of the nearest tile; closest_position is its pixel coords
+
+        
+    # # canvas[overlap>0] /= overlap[overlap>0]
     
+    print("Smoothing background to montage")
     smoothed = smoothn(np.ma.masked_array(canvas,overlap <1),s=1e7,robust=True)
     canvas = np.where(overlap < 1, smoothed, canvas)
     # canvas[overlap < 1] = median
@@ -514,6 +522,7 @@ def montage(
                 "relative_shifts",
             ],
         )
+        
     elif os.path.exists(positionfile):
         # If requested to skip cross correlation and an older set of tile
         # alignments exist then load these.
@@ -522,6 +531,9 @@ def montage(
         original_positions = positions
     else:
         original_positions = positions
+
+    # Clip masks to ensure overlapping regions are only taken from closest tile
+    msks = clip_masks_to_overlaps(msks,positions[M],overlaps,pixels,pixel_size * binning)
 
     # Stitche the images together using the refined tile positions
     canvas = stitch(
@@ -708,6 +720,65 @@ def find_overlaps(positions, pixels, pixel_size, masks, minoverlapfrac=0.01, plo
     if plot:
         plt.show(block=True)
     return overlapping_inds
+
+def clip_masks_to_overlaps(masks, positions, overlaps, pixels, pixel_size):
+    """
+    Clip binary masks so when there is overlap, pixels are taken from the closest
+    tile to the pixel in the overlapping region.
+
+    Parameters:
+    -----------
+    masks : list of ndarrays
+        List of binary masks for each image tile.
+    positions : ndarray of shape (N, 2)
+        Array of (x, y) coordinates for each image tile in microns.
+    overlaps : list of tuples
+        List of pairs of indices representing which tiles overlap.
+    pixels : tuple or list of length 2
+        Dimensions of each image tile in pixels, as (height, width).
+    pixel_size : float
+        The size of each pixel in microns.
+
+    Returns:
+    --------
+    clipped_masks : list of ndarrays
+        List of modified binary masks with overlapping regions clipped to 
+        closest tile.
+    """
+    clipped_masks = [copy.deepcopy(msk) for msk in masks]
+    
+    x = np.arange(masks[0].shape[-1])
+    y = np.arange(masks[0].shape[-2])
+    distancefromcenter = np.zeros((len(masks[0]),*masks[0].shape[-2:]))
+    for i,mask in enumerate(masks):
+        y0,x0 = center_of_mass_2d(mask)
+        distancefromcenter[i] = (y[:,None]-y0)**2 + (x[None,:]-x0)**2
+
+    for i, j in overlaps:
+        x1 = positions[i]
+        x2 = positions[j]
+
+        # Calculate relative shift in pixels
+        dx = [int(x) for x in (x2 - x1) / pixel_size * 1e4][::-1]
+
+        # Get the indices for array overlap
+        i1, i2 = array_overlap(dx[0], pixels[0])
+        j1, j2 = array_overlap(dx[1], pixels[1])
+
+        # Update masks to only include overlapping regions
+        closer = np.less_equal(
+            distancefromcenter[i][i1[0] : i1[1], j1[0] : j1[1]],
+            distancefromcenter[j][i2[0] : i2[1], j2[0] : j2[1]],
+        )
+        clipped_masks[i][i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(closer,clipped_masks[i][i1[0] : i1[1], j1[0] : j1[1]])
+
+        closer = np.greater(
+            distancefromcenter[i][i1[0] : i1[1], j1[0] : j1[1]],
+            distancefromcenter[j][i2[0] : i2[1], j2[0] : j2[1]],
+        )
+        clipped_masks[j][i2[0] : i2[1], j2[0] : j2[1]] = np.logical_and(closer,clipped_masks[j][i2[0] : i2[1], j2[0] : j2[1]])
+
+    return clipped_masks
 
 
 def cross_correlate_tiles(
