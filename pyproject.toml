@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["processing_scripts"]
+
+[project]
+name = "SquareBeamMontaging"
+version = "1.0.0"
+description = "A tool for stitching square beam montage tomography data."
+authors = [{name = "HamishGBrown"}]
+requires-python = ">=3.6"
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.20,<2.1",  # 2.0.x has a memmap int32 overflow bug; 2.1+ requires Python>=3.10
+    "scipy",
+    "networkx",
+    "tqdm",
+    "scikit-image",
+    "pypng",
+    "Pillow",
+    "matplotlib",
+    "mrcfile",
+    "argparse",
+    "h5py>=3.11",
+    "shapely",
+]
+
+[project.scripts]
+stitch_square_beam              = "processing_scripts.stitch:main"
+stitch_by_adjacent_tilt         = "processing_scripts.stitchbyadjacenttilt:main"
+choose_fringe_size              = "processing_scripts.Choose_fringe_size:main"
+determine_overlap_fraction      = "processing_scripts.Determine_overlap_fraction:main"
+make_gainref                    = "processing_scripts.make_gainref:main"
+refine_montage_from_aretomo     = "processing_scripts.Refine_montage_from_aretomo:main"
+refine_montage_from_imod        = "processing_scripts.Refine_montage_from_imod_fiducials:main"
+crop_to_smallest_common_size    = "processing_scripts.Crop_to_smallest_common_size:main"
+generate_image_shifts           = "processing_scripts.Generate_Image_shifts_for_Montage:main"
+join_to_mrc                     = "processing_scripts.JointoMRC:main"
+masked_motioncorr               = "processing_scripts.masked_motioncorr:main"
+mask_and_inpaint                = "processing_scripts.mask_and_inpaint:main"
+inpaint_apply                   = "processing_scripts.inpaint_apply:main"

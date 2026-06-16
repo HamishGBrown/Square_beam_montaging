@@ -1,4 +1,5 @@
 import re
+import logging
 import networkx as nx
 from tqdm import tqdm
 from PIL import Image
@@ -15,8 +16,15 @@ import mrcfile
 import argparse
 import numpy as np
 from typing import List, Tuple, Dict, Any
-from Utilities import *
-from smoothn import smoothn
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from .Utilities import *
+from .smoothn import smoothn
+
+logger = logging.getLogger(__name__)
+
+
+
 
 
 def parse_commandline() -> Dict[str, Any]:
@@ -46,7 +54,7 @@ def parse_commandline() -> Dict[str, Any]:
     parser.add_argument(
         "-g",
         "--gainref",
-        help="Gain reference, if left blank a new gain reference will be calculated and saved in the output directory. If 'False' no gain reference will be used.",
+        help="Gain reference file path. If left blank or 'False', no gain reference will be calculated or applied.",
         required=False,
         type=str,
     )
@@ -142,6 +150,119 @@ def parse_commandline() -> Dict[str, Any]:
         action="store_true",
     )
 
+    parser.add_argument(
+        "-R",
+        "--ROI",
+        help="Region of interest in the montage to stitch in format x0:x1,y0:y1 (in pixels).",
+        type=int,
+        default=None,
+        required=False,
+        nargs=4,
+    )
+
+    parser.add_argument(
+        "-nt",
+        "--nthreads",
+        help="Number of threads for parralel implementation.",
+        type=int,
+        default=1,
+        required=False,
+    )
+
+    parser.add_argument(
+        "--nosmooth",
+        help="Disable smoothing of background regions in the stitched montage.",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--mark-uncovered",
+        help=(
+            "Instead of inpainting uncovered (no-tile) regions, mark them with "
+            "pixel value -1. Use this when the output will be processed by "
+            "mask_and_inpaint, which detects the sentinel automatically and "
+            "includes those regions in its initial mask."
+        ),
+        action="store_true",
+        default=False,
+        dest="mark_uncovered",
+    )
+
+    parser.add_argument(
+        "-pf",
+        "--positionfile",
+        help="Path to an HDF5 position file to use instead of the default (outdir/<image>_refined_positions.h5).",
+        type=str,
+        default=None,
+        required=False,
+    )
+
+    parser.add_argument(
+        "-T",
+        "--templatemask",
+        help="Path to a template mask file (TIFF or MRC) defining the beam shape. When provided, edge-based cross-correlation is used to align the template to each tile instead of threshold-based masking. For multi-frame MRC or TIFF files, append :INDEX to select a specific frame (e.g. mask.mrc:7).",
+        type=str,
+        default=None,
+        required=False,
+    )
+
+    parser.add_argument(
+        "--min_mean_intensity",
+        help="Tiles with a mean pixel value at or below this threshold are excluded from processing. Default is 20.",
+        type=float,
+        default=20,
+        required=False,
+    )
+
+    parser.add_argument(
+        "--correct_beam_edges",
+        help="Enable correction of beam edge darkening caused by inelastic (plasmon) "
+             "scattering.  The template provided via --templatemask is used as the "
+             "vacuum reference.  With no argument, plasmon parameters are fitted "
+             "independently for every tile.  With an integer argument N "
+             "(e.g. --correct_beam_edges 42), tile N is used to fit the parameters "
+             "once and those values are applied to all tiles — useful when a known "
+             "interior tile gives a better fit than edge tiles.  "
+             "Pass -1 to automatically use the tile closest to the centre of the montage.",
+        nargs="?",
+        const=True,
+        default=False,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--plasmon_energy",
+        help="Plasmon energy in eV used for beam-edge correction (--correct_beam_edges). "
+             "Default 21 eV, appropriate for vitreous ice / water.",
+        type=float,
+        default=21.0,
+        required=False,
+    )
+
+    parser.add_argument(
+        "--voltage",
+        help="Accelerating voltage in kV used for beam-edge correction "
+             "(--correct_beam_edges).  Default 300 kV.",
+        type=float,
+        default=300.0,
+        required=False,
+    )
+
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v", "--verbose",
+        help="Print detailed per-tile progress and diagnostic information.",
+        action="store_true",
+        default=False,
+    )
+    verbosity.add_argument(
+        "-q", "--quiet",
+        help="Suppress all output except warnings and errors.",
+        action="store_true",
+        default=False,
+    )
+
     return vars(parser.parse_args())
 
 
@@ -222,10 +343,41 @@ def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None
 
     return gainref
 
-def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorigin=None):
+
+def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorigin=None,smooth=True,nthreads=1,mark_uncovered=False):
+    """
+    Stitch a set of tiles into a single montage canvas.
+
+    Parameters
+    ----------
+    ims : sequence of numpy.ndarray
+        2D image tiles to place into the montage (shape: N, rows, cols).
+    positions : numpy.ndarray
+        Array of shape (N, 2) with tile positions in microns (x, y order).
+    msks : sequence of numpy.ndarray
+        Boolean/0-1 masks matching each tile; masked-out pixels are ignored.
+    pixel_size : float
+        Pixel size in Angstroms for the unbinned images.
+    binning : int, optional
+        Binning factor applied to the montage. Default is 1.
+    montagewidth : None or (2,) array_like, optional
+        Full montage size in Angstroms. If None, inferred from positions.
+    montageorigin : None or (2,) array_like, optional
+        Montage origin in Angstroms (most negative image shift). If None, inferred.
+    smooth : bool, optional
+        If True, smooth background (uncovered) regions; otherwise fill with median.
+
+    Returns
+    -------
+    canvas : numpy.ndarray
+        Stitched montage image (overlaps averaged).
+    indxmap : np.ndarray
+        Map of indicating index of tiles
+    """
     # Determine the global range of tiles in Angstroms
+    pixels = ims[0].shape
     if montagewidth is None:
-        width = np.ptp(positions, axis=0) * 1e4
+        width = np.ptp(positions, axis=0) * 1e4 + np.asarray(pixels[::-1]) * pixel_size * binning
     else:
         width = montagewidth
     if montageorigin is None:
@@ -233,22 +385,25 @@ def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorig
     else:
         origin = montageorigin
 
-    pixels = ims[0].shape
-
     # Calculate the size of the global montage canvas in pixels
     size = (
         np.asarray(width / pixel_size / binning, dtype=int)[::-1]
-        + pixels
-        + np.asarray([1, 1])
+        # + pixels
+        # + np.asarray([1, 1])
     )
 
+    logger.debug("Stitch canvas: %d × %d px  |  %d tile(s)", size[0], size[1], len(ims))
     # Initialize the montage canvas and overlap map
     canvas = np.zeros(size)
     overlap = np.zeros(size, dtype=np.uint8)
+    # Initialise the index map with n+1, where n is the number of tiles to identify
+    # indices that correspond to no tile, indices that correspond to a tile will be
+    # overwritten
+    indxmap = len(ims)*np.ones(size, dtype=np.uint16)
 
     # Place each image onto the canvas, applying the masks
     for i, (im, position, msk) in enumerate(
-        zip(tqdm(ims, desc="Stitching"), positions, msks)
+        zip(ims, positions, msks)
     ): 
         # s is shape of tile, size is shape of canvas
         s = im.shape
@@ -282,30 +437,21 @@ def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorig
 
         canvas[cx0:cx1, cy0:cy1] += np.where(msk, im, 0)[tx0:tx1,ty0:ty1]
         overlap[cx0:cx1, cy0:cy1] += np.where(msk, np.uint8(1), np.uint8(0))[tx0:tx1,ty0:ty1]
-
-    # # Normalize the canvas by the overlap map to account for overlapping regions
-    # median = np.median(canvas[overlap == 1])
-
-    # positions_pixel = (positions * 1e4) / pixel_size / binning
-    # for coords in np.nonzero(canvas[overlap>1]):
-    #     # Find closest montage tile
-    #     y_idx, x_idx = coords
-    #     pt = np.array([x_idx, y_idx])
-    #     closest_index = int(np.argmin(np.sum((positions_pixel - pt) ** 2, axis=1)))
-
-    #     # closest_position = positions_pixel[closest_index]
-    #     # closest_index is the index of the nearest tile; closest_position is its pixel coords
-
-        
-    # # canvas[overlap>0] /= overlap[overlap>0]
+        indxmap[cx0:cx1, cy0:cy1][msk[tx0:tx1,ty0:ty1]] = np.uint16(i)
     
-    print("Smoothing background to montage")
-    smoothed = smoothn(np.ma.masked_array(canvas,overlap <1),s=1e7,robust=True)
-    canvas = np.where(overlap < 1, smoothed, canvas)
-    # canvas[overlap < 1] = median
+    if mark_uncovered:
+        canvas[overlap < 1] = -1  # sentinel: picked up by mask_and_inpaint as uncovered
+    elif smooth:
+        logger.info("Smoothing background regions")
+        smoothed = smoothn(np.ma.masked_array(canvas, overlap < 1), s=1e7, max_iter=100, workers=nthreads)
+        canvas = np.where(overlap < 1, smoothed, canvas)
+    else:
+        canvas[overlap < 1] = 0 #np.median(canvas[overlap == 1])
+    
     overlap = np.where(overlap > 1, overlap, 1)
+    canvas /= overlap
     
-    return canvas
+    return canvas,indxmap
 
 
 
@@ -328,6 +474,15 @@ def montage(
     maskthreshold=0.4,
     maskabsolutethreshold=None,
     flattenbeam=False,
+    nthreads = 1,
+    positionfile=None,
+    smooth=True,
+    mark_uncovered=False,
+    template_mask=None,
+    min_mean_intensity=20,
+    correct_beam_edges=False,
+    E_plasmon_eV=21.0,
+    voltage_kV=300.0,
 ):
     """
     Creates a montage image from a series of input images by aligning and stitching them together.
@@ -353,6 +508,9 @@ def montage(
         Rotation angle of the tilt axis, used to correct the positions. Default is 0.
     gainref : numpy.ndarray, optional
         Gain reference image used to normalize the input images. Default is None.
+    skipcrosscorrelation : bool, optional
+        Skip masked cross correlation of tiles and rely on user provided tile positions
+        (if supplied through positionfile kwarg) or raw image tilts (if no positionfile supplied)
     montagewidth : None or (2,) array_like
         size in Angstrom of the full montage in both dimensions, useful for consistency
         with other tilts in the tilt series
@@ -372,6 +530,18 @@ def montage(
         by cross correlation alignment of the gain reference mask to each tile. Default is None.
     medianthreshold : float, optional
         Threshold for (as a fraction of the median) for masking the image. Default is 0.4.
+    positionfile : string, optional
+        hdf5 file containing already determined or refined tile positions, if provided masked
+        cross-correlation will be skipped (ie. this overrides)
+    correct_beam_edges : bool, optional
+        When True, beam edge darkening due to plasmon scattering is corrected
+        per-tile using plasmon_beam_correction().  The template_mask image is
+        used as the vacuum reference and is aligned to each tile via the same
+        edge cross-correlation used by make_mask.
+    E_plasmon_eV : float, optional
+        Plasmon energy in eV for beam-edge correction. Default 21 eV.
+    voltage_kV : float, optional
+        Accelerating voltage in kV for beam-edge correction. Default 300 kV.
     Returns:
     --------
     numpy.ndarray
@@ -394,9 +564,12 @@ def montage(
     # in the montage, if None is passed for tiles then all tiles are included
     # by default.
     if tiles is None:
-        M = slice(0, len(mrcmemmap.data))
+        M = np.ones(len(mrcmemmap.data), dtype=bool)
+    elif isinstance(tiles, slice):
+        M = np.zeros(len(mrcmemmap.data), dtype=bool)
+        M[tiles] = True
     else:
-        M = tiles
+        M = tiles  # assumes tiles is already a bool/index array
 
     # Convert positions from pixels to microns, remove 3rd dimension
     positions = positions[:, :2] * pixel_size * 1e-4
@@ -406,93 +579,160 @@ def montage(
 
     ims = []  # List to store the processed images
     beam_posns = []  # List to store the beam positions
-    if gaincorrectedfile is None:
-        gaincorrectedfile = os.path.join(
-            outdir, os.path.split(image)[1].replace(".mrc", "_gain_corrected.mrc")
-        )
-        if gainref is not None:
-            desc = "Applying gain reference"
-            # y0, x0 = center_of_mass(gainref)
-        else:
-            desc = "Generating masks"
-        if flattenbeam:
-            beam_rotation = determine_square_beam_angle(mrcmemmap.data[M][0])
-            print(beam_rotation)
-        for position, img in tqdm(
-            zip(positions[M], mrcmemmap.data[M]),
-            total=len(positions[M]),
-            desc=desc,
-        ):
-            # Load image from memory map and convert to numpy array
-            im = copy.deepcopy(np.asarray(img))
-            # Fourier interpolate if reqeusted
-            if binning > 1:
-                im = fourier_interpolate(im, [x // binning for x in im.shape])
 
-            
-
-            if Matchgainrefmask:
-                # Align beam in image tile to gain reference
-                y, x = cross_correlate_alignment(im, gainref, returncoords=True)
-                msks.append(roll_no_periodic(gainrefmask, (-y, -x), axis=(-2, -1)))
-
-                # Apply aligned gain reference
-                im[msks[-1]] /= np.roll(gainref, (-y, -x), axis=(-2, -1))[msks[-1]]
-                im = np.where(msks[-1], im, 0)
-                beam_posns.append([x, y])
-            else:
-                # Generate a mask if none is provided
-                msks.append(make_mask(im, shrinkn=fringe_size / binning,medianthreshold=maskthreshold,absolutethreshold=maskabsolutethreshold))
-                # fig,ax = plt.subplots(ncols=2)
-                # ax[0].imshow(im,cmap='gist_gray',vmin=np.percentile(im,1),vmax=np.percentile(im,99))
-                # ax[1].imshow(im,cmap='gist_gray',vmin=np.percentile(im,1),vmax=np.percentile(im,99))
-                # ax[1].imshow(np.where(msks[-1],1,0),alpha=0.3,cmap='Reds')
-                # fig.savefig('masks/msk_{0}.pdf'.format(len(msks)))
-                # plt.close(fig)
-                # plt.show(block=True)
-                # Apply gain reference correction if provided
-                if gainref is not None:
-                    y, x = cross_correlate_alignment(
-                        msks[-1], gainrefmask, returncoords=True
-                    )
-                    # QUICKFIX try using gainref ask mask since generating a mask for each tile
-                    # is problematic
-                    coords = [-y, -x]
-                    msk = roll_no_periodic(gainrefmask, coords, axis=(-2, -1))
-                    msks[-1] = msk
-                    im[msk] = im[msk]/np.roll(gainref, coords, axis=(-2, -1))[msk]
-                    im = np.where(msk, im, 0)
-
-                    beam_posns.append([x, y])
-            if flattenbeam:
-                # Flatten the beam by subtracting a 2D polynomial fit
-                # from the image
-                # fig,ax = plt.subplots(ncols=2)
-                # ax[0].imshow(im,cmap='gist_gray')
-                
-                im = flatten_beam(im,msks[-1],rotation=beam_rotation)
-                # ax[1].imshow(im,cmap='gist_gray')
-                # plt.show(block=True)
-            ims.append(im)
-
-        print("Saving gain corrected images to {0}".format(gaincorrectedfile))
-        savetomrc(np.asarray(ims, dtype="float32"), gaincorrectedfile)
-    else:
-        print("Loading gain corrected images from {0}".format(gaincorrectedfile))
-        ims = mrcfile.mrcmemmap.MrcMemmap(gaincorrectedfile).data  # [M]
-
-        # Check that binning of already gain corrected images is the same as requested
-        if np.any(ims.shape[-2:] != pixels):
-            raise ValueError(
-                "Binning of gain corrected images given in command line does not match requested binning"
+    # Identify template mask
+    if template_mask is None:
+        if correct_beam_edges:
+            logger.warning(
+                "correct_beam_edges is enabled but no --templatemask was provided; "
+                "falling back to tile 0 as the beam reference."
             )
+        logger.debug("No template mask provided — using tile 0 as template")
+        template_mask = np.asarray(mrcmemmap.data[0])
 
-        for im in ims:
-            msks.append(make_mask(im, shrinkn=fringe_size / binning,medianthreshold=maskthreshold,absolutethreshold=maskabsolutethreshold))
+    # Keep the raw (non-binary) template as the beam reference for plasmon correction.
+    raw_template = np.asarray(template_mask, dtype=float)
 
-    positionfile = os.path.join(
-        outdir, os.path.split(image)[1].replace(".mrc", "_refined_positions.h5")
-    )
+    smooth_template_mask = convolve(template_mask, Gaussian(3, template_mask.shape))
+    template_edges = np.hypot(sobel(smooth_template_mask, axis=0), sobel(smooth_template_mask, axis=1))
+    template_mask = make_mask(template_mask,shrinkn=0,medianthreshold=maskthreshold,absolutethreshold=maskabsolutethreshold)
+
+
+    # Plasmon correction parameter state.
+    # _plasmon_fixed: when the user passes --correct_beam_edges N, tile N is
+    #   fitted once before the thread pool and its (n, q_E) are locked in for
+    #   all other tiles, bypassing per-tile optimisation entirely.
+    # _plasmon_running: when no reference tile is given, each tile fits its own
+    #   parameters but uses the running mean of previous fits as a warm start,
+    #   skipping the 25×25 grid and going straight to Nelder-Mead.
+    _plasmon_fixed_n   = [None]
+    _plasmon_fixed_q_E = [None]
+
+    ref_tile_idx = correct_beam_edges if isinstance(correct_beam_edges, int) else None
+    correct_beam_edges = bool(correct_beam_edges)
+
+    if ref_tile_idx == -1:
+        # Auto-select the tile whose stage position is closest to the montage centre.
+        active_indices = np.where(M)[0]
+        active_positions = positions[M]
+        centre = active_positions.mean(axis=0)
+        ref_tile_idx = int(active_indices[np.argmin(
+            np.linalg.norm(active_positions - centre, axis=1)
+        )])
+        logger.info(f"Auto-selected centre tile {ref_tile_idx} as plasmon reference")
+
+    if ref_tile_idx is not None and correct_beam_edges:
+        logger.info(f"Fitting plasmon parameters on reference tile {ref_tile_idx} ...")
+        _ref_img = np.asarray(mrcmemmap.data[ref_tile_idx]).copy()
+        if binning > 1:
+            _ref_img = fourier_interpolate(_ref_img, [x // binning for x in _ref_img.shape])
+        _ref_mask = make_mask(
+            _ref_img,
+            shrinkn=fringe_size / binning,
+            medianthreshold=maskthreshold,
+            absolutethreshold=maskabsolutethreshold,
+            template_mask=template_mask,
+            template_edges=template_edges,
+        )
+        _, _plasmon_fixed_n[0], _plasmon_fixed_q_E[0] = plasmon_beam_correction(
+            _ref_img, raw_template, _ref_mask,
+            pixel_size_nm=pixel_size * binning / 10.0,
+            template_edges=template_edges,
+            E_plasmon_eV=E_plasmon_eV,
+            voltage_kV=voltage_kV,
+        )
+        logger.info(f"Reference tile fit: n={_plasmon_fixed_n[0]:.3f}  "
+                    f"q_E={_plasmon_fixed_q_E[0]:.5f} cyc/nm")
+
+    _plasmon_lock  = threading.Lock()
+    _plasmon_n_sum = [0.0]
+    _plasmon_qE_sum = [0.0]
+    _plasmon_count  = [0]
+
+    def _process_tile(img):
+        im = np.asarray(img).copy()
+        if binning > 1:
+            im = fourier_interpolate(im, [x // binning for x in im.shape])
+        if np.mean(im) <= min_mean_intensity:
+            return None
+        mask = make_mask(
+            im,
+            shrinkn=fringe_size / binning,
+            medianthreshold=maskthreshold,
+            absolutethreshold=maskabsolutethreshold,
+            template_mask=template_mask,
+            template_edges=template_edges,
+        )
+        if correct_beam_edges:
+            if _plasmon_fixed_n[0] is not None:
+                # Fixed-parameter mode: apply the reference tile's fit to every tile.
+                im, _, _ = plasmon_beam_correction(
+                    im, raw_template, mask,
+                    pixel_size_nm=pixel_size * binning / 10.0,
+                    template_edges=template_edges,
+                    E_plasmon_eV=E_plasmon_eV,
+                    voltage_kV=voltage_kV,
+                    n_fixed=_plasmon_fixed_n[0],
+                    q_E_fixed=_plasmon_fixed_q_E[0],
+                )
+            else:
+                # Per-tile mode: use running mean as warm start for the grid search.
+                with _plasmon_lock:
+                    count = _plasmon_count[0]
+                    n_hint   = _plasmon_n_sum[0]  / count if count else None
+                    q_E_hint = _plasmon_qE_sum[0] / count if count else None
+                im, n_fit, q_E_fit = plasmon_beam_correction(
+                    im, raw_template, mask,
+                    pixel_size_nm=pixel_size * binning / 10.0,
+                    template_edges=template_edges,
+                    E_plasmon_eV=E_plasmon_eV,
+                    voltage_kV=voltage_kV,
+                    n_hint=n_hint,
+                    q_E_hint=q_E_hint,
+                )
+                if n_fit > 0.0:
+                    with _plasmon_lock:
+                        _plasmon_n_sum[0]  += n_fit
+                        _plasmon_qE_sum[0] += q_E_fit
+                        _plasmon_count[0]  += 1
+        return im, mask
+
+
+    _quiet = not logger.isEnabledFor(logging.INFO)
+    max_workers = min(os.cpu_count() or 1, nthreads)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(
+            tqdm(
+                executor.map(_process_tile, mrcmemmap.data[M]),
+                total=len(positions[M]),
+                desc="Making masks",
+                disable=_quiet,
+            )
+        )
+    # Single threaded implementation for testing/debugging
+    # results = []
+    # for tile in mrcmemmap.data[M]:
+    #     result = _process_tile(tile)
+    #     results.append(result)
+
+    M_indices = np.where(M)[0]
+    excluded = [M_indices[i] for i, r in enumerate(results) if r is None]
+    if excluded:
+        logger.warning("Excluded %d low-intensity tile(s): indices %s", len(excluded), excluded)
+        M[excluded] = False
+    logger.debug("%d tile(s) retained after intensity filtering", sum(M))
+
+    ims = [r[0] for r in results if r is not None]
+    msks = [r[1] for r in results if r is not None]
+
+
+    if positionfile is None:
+        positionfile = os.path.join(
+            outdir, os.path.split(image)[1].replace(".mrc", "_refined_positions.h5")
+        )
+    else:
+        skipcrosscorrelation = True
+
     # Calculate the overlaps between adjacent tiles
     overlaps = find_overlaps(
         positions[M], pixels, pixel_size * binning, msks, plot=False
@@ -509,34 +749,30 @@ def montage(
             overlaps,
             pixel_size * binning,
             max_correction=maxshift,
+            max_workers=nthreads
         )
-
-        save_array_to_hdf5(
-            [original_positions, positions, xcorr, overlaps, np.asarray(deltas)],
-            positionfile,
-            [
-                "Original_positions",
-                "Refined_positions",
-                "cross_correlations",
-                "overlaps",
-                "relative_shifts",
-            ],
-        )
-        
     elif os.path.exists(positionfile):
         # If requested to skip cross correlation and an older set of tile
         # alignments exist then load these.
+        logger.info("Loading existing tile positions from %s", positionfile)
         positions = load_array_from_hdf5(positionfile, "Refined_positions")
-        xcorr = load_array_from_hdf5(positionfile, "cross_correlations")
+        # xcorr = load_array_from_hdf5(positionfile, "cross_correlations")
         original_positions = positions
     else:
         original_positions = positions
 
-    # Clip masks to ensure overlapping regions are only taken from closest tile
-    msks = clip_masks_to_overlaps(msks,positions[M],overlaps,pixels,pixel_size * binning)
+    # Recalculate overlaps before mask clipping since some tiles might have migrated
+    # since the last time we did this.
 
-    # Stitche the images together using the refined tile positions
-    canvas = stitch(
+    postrefineoverlaps = find_overlaps(
+        positions[M], pixels, pixel_size * binning, msks, plot=False,minoverlapfrac=1/np.prod(pixels)
+    )
+
+    # Clip masks to ensure overlapping regions are only taken from closest tile
+    msks = clip_masks_to_overlaps(msks,positions[M],postrefineoverlaps,pixels,pixel_size * binning)
+
+    # Stitch the images together using the refined tile positions
+    canvas,indxmap = stitch(
         ims,
         positions[M],
         msks,
@@ -544,64 +780,109 @@ def montage(
         binning=binning,
         montagewidth=montagewidth,
         montageorigin=montageorigin,
+        smooth=smooth,
+        mark_uncovered=mark_uncovered,
+        nthreads=nthreads,
+
     )
     fileout = os.path.join(
         outdir, os.path.splitext(os.path.split(image)[1])[0] + ".tif"
     )
-    if not skipcrosscorrelation:
-        ntiles = len(original_positions[M])
-        figsize = 2 * (int(np.ceil(np.sqrt(ntiles))),)
-        xcorfig, xcorax = plt.subplots(figsize=figsize)
-        cmean = np.mean(canvas)
-        cstd = np.std(canvas)
-        xcorax.imshow(
-            canvas,
-            cmap=plt.get_cmap("gist_gray"),
-            origin="lower",
-            vmin=cmean - cstd,
-            vmax=cmean + cstd,
-        )
-        s = np.asarray(ims[0].shape)[::-1]
-        posi = (original_positions[M] * 1e4 - montageorigin) / pixel_size / binning
-        posi += s / 2
-        xcorax.plot(*posi.T, "ko", label="Initial tile positions")
-        for i, pos in enumerate(posi):
-            xcorax.annotate(str(i), pos)
-        posi = (positions[M] * 1e4 - montageorigin) / pixel_size / binning
-        posi += s / 2
-        xcorax.plot(*posi.T, "bo", label="Refined tile positions")
-        # xcorrmax = np.amax(xcorr)
-        cmap = plt.get_cmap("viridis")
-        for ind, (i, j) in enumerate(overlaps):
-            # Retrieve image shifts for the overlapping tiles
-            x1 = (original_positions[M][i] * 1e4 - montageorigin) / pixel_size / binning
+    # if not skipcrosscorrelation:
+    ntiles = len(original_positions[M])
+    figsize = 2 * (int(np.ceil(np.sqrt(ntiles))),)
+    xcorfig, xcorax = plt.subplots(figsize=figsize)
+    cmean = np.mean(canvas)
+    cstd = np.std(canvas)
+    if montageorigin is None or montagewidth is None:
+        extent = None
+    else:
+        extent = [
+            montageorigin[0] ,
+            (montageorigin[0] + montagewidth[0]),
+            montageorigin[1] ,
+            (montageorigin[1] + montagewidth[1]),
+        ]
+        extent = np.asarray(extent) / pixel_size
+    xcorax.imshow(
+        canvas,
+        cmap=plt.get_cmap("gist_gray"),
+        origin="lower",
+        vmin=cmean - cstd,
+        vmax=cmean + cstd,
+        extent=extent,
+    )
+    # s in unbinned pixels so all coordinates share the same unit
+    s = np.asarray(ims[0].shape)[::-1] * binning
+    posi = (original_positions[M] * 1e4) / pixel_size
+    posi += s / 2
+    xcorax.plot(*posi.T, "ko", label="Initial tile positions")
+    for i, pos in enumerate(posi):
+        xcorax.annotate(str(i), pos)
+    posi = (positions[M] * 1e4) / pixel_size
+    posi += s / 2
+    xcorax.plot(*posi.T, "bo", label="Refined tile positions")
+    # xcorrmax = np.amax(xcorr)
+    cmap = plt.get_cmap("viridis")
+    for ind, (i, j) in enumerate(overlaps):
+        # Retrieve image shifts for the overlapping tiles
+        x1 = (original_positions[M][i] * 1e4) / pixel_size
 
-            x2 = (original_positions[M][j] * 1e4 - montageorigin) / pixel_size / binning
-            dx = [int(x) for x in (x2 - x1)][::-1]
-            x1 += s / 2
-            delta = (deltas[ind] * 1e4) / pixel_size / binning
+        x2 = (original_positions[M][j] * 1e4) / pixel_size
+        dx = [int(x) for x in (x2 - x1)][::-1]
+        x1 += s / 2
+        if not skipcrosscorrelation:
+            delta = (deltas[ind] * 1e4) / pixel_size
 
             shifttoolarge = (
                 np.linalg.norm(np.asarray(dx) - delta)
-                > maxshift / pixel_size / binning * 1e4
+                > maxshift / pixel_size * 1e4
             )
             if shifttoolarge:
                 linestyle = "--"
             else:
                 linestyle = "-"
+        
             xcorax.plot(
                 [x1[0], x1[0] + delta[1]],
                 [x1[1], x1[1] + delta[0]],
                 linestyle=linestyle,
                 color="b"
             )
-        plotfile = os.path.join(
-            outdir, os.path.split(image)[1].replace(".mrc", "_Plot.pdf")
-        )
-        xcorfig.savefig(plotfile)
+    # if skipcrosscorrelation:
+    #     xcorax.plot(*(original_positions[M].T * 1e4)/ pixel_size / binning)
+    xcorax.set_xlabel("x (unbinned pixels)")
+    xcorax.set_ylabel("y (unbinned pixels)")
+    plotfile = os.path.join(
+        outdir, os.path.split(image)[1].replace(".mrc", "_Plot.pdf")
+    )
+    xcorfig.savefig(plotfile)
     # Note that Python Image library does not support write 16-bit integer and writes
     # 32-bit real instead ¯\_(ツ)_/¯
-    Image.fromarray(canvas.astype(np.int16)).save(fileout)
+    # Image.fromarray(canvas).save(fileout.replace('.tif','float.tiff'),compression="tiff_lzw")
+    # Image.fromarray(canvas.astype(np.uint16)).save(fileout.replace('.tif','nolzw.tiff'))
+    # Clipping saves underflow errors upon conversion to uint16, sometimes images values can go
+    # negative from smoothing algorithm
+    if not skipcrosscorrelation:
+        save_array_to_hdf5(
+                [original_positions, positions, xcorr, overlaps, np.asarray(deltas),indxmap.astype(np.uint16),pixel_size/binning],
+                positionfile,
+                [
+                    "Original_positions",
+                    "Refined_positions",
+                    "cross_correlations",
+                    "overlaps",
+                    "relative_shifts",
+                    "index_map",
+                    "binned_pixel_size"
+                ],
+            )
+    Image.fromarray(indxmap.astype(np.uint16)).save(fileout.replace('.tif','_index.tif'),compression="tiff_lzw")
+    # Clip to signed 16-bit range.  When mark_uncovered is set, uncovered pixels
+    # are exactly -1 (no smoothn runs in that path so no other negatives exist).
+    # Otherwise clip negatives to 0 so smoothn artefacts don't become false sentinels.
+    lo_clip = -1 if mark_uncovered else 0
+    Image.fromarray(np.clip(canvas, lo_clip, 32767).astype(np.int16)).save(fileout, compression="tiff_lzw")
     save_array_as_png(canvas, fileout.replace('.tiff','.png'), cmap=plt.get_cmap('Greys'))
     # return canvas
 
@@ -749,7 +1030,7 @@ def clip_masks_to_overlaps(masks, positions, overlaps, pixels, pixel_size):
     
     x = np.arange(masks[0].shape[-1])
     y = np.arange(masks[0].shape[-2])
-    distancefromcenter = np.zeros((len(masks[0]),*masks[0].shape[-2:]))
+    distancefromcenter = np.zeros((len(masks),*masks[0].shape[-2:]))
     for i,mask in enumerate(masks):
         y0,x0 = center_of_mass_2d(mask)
         distancefromcenter[i] = (y[:,None]-y0)**2 + (x[None,:]-x0)**2
@@ -765,17 +1046,21 @@ def clip_masks_to_overlaps(masks, positions, overlaps, pixels, pixel_size):
         i1, i2 = array_overlap(dx[0], pixels[0])
         j1, j2 = array_overlap(dx[1], pixels[1])
 
-        # Update masks to only include overlapping regions
+        # Make a mask where pixels closer to center of tile i are True
         closer = np.less_equal(
             distancefromcenter[i][i1[0] : i1[1], j1[0] : j1[1]],
             distancefromcenter[j][i2[0] : i2[1], j2[0] : j2[1]],
         )
+        # Only consider pixels that are in the mask of tile j
+        closer = np.where(clipped_masks[j][i2[0] : i2[1], j2[0] : j2[1]],closer,True)
         clipped_masks[i][i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(closer,clipped_masks[i][i1[0] : i1[1], j1[0] : j1[1]])
 
-        closer = np.greater(
+
+        closer = np.greater_equal(
             distancefromcenter[i][i1[0] : i1[1], j1[0] : j1[1]],
             distancefromcenter[j][i2[0] : i2[1], j2[0] : j2[1]],
         )
+        closer = np.where(clipped_masks[i][i1[0] : i1[1], j1[0] : j1[1]],closer,True)
         clipped_masks[j][i2[0] : i2[1], j2[0] : j2[1]] = np.logical_and(closer,clipped_masks[j][i2[0] : i2[1], j2[0] : j2[1]])
 
     return clipped_masks
@@ -790,6 +1075,8 @@ def cross_correlate_tiles(
     max_correction=0.3,
     generate_plot=False,
     cross_corr_param_file=None,
+    parallelize=True,
+    max_workers=None,
 ):
     """
     Perform cross-correlation-based alignment of image tiles and adjust their positions.
@@ -808,6 +1095,8 @@ def cross_correlate_tiles(
         max_correction (float, optional): Maximum allowed correction (in microns) for shifts between tiles. Defaults to 0.1.
         generate_plot (bool or string, optional): Whether to generate a plot visualizing the tile positions and shift vectors. Defaults to False.
                                                   If a string this will be the filename that the plot will be saved as.
+        parallelize (bool, optional): Whether to parallelize cross-correlation work. Defaults to True.
+        max_workers (int, optional): Maximum worker threads to use when parallelizing. Defaults to a tuned value.
 
     Returns:
         ndarray: Updated Nx2 array of the adjusted x, y coordinates of the tiles.
@@ -858,14 +1147,17 @@ def cross_correlate_tiles(
     xcorr = []
     deltas = []
 
-    # TODO make this threaded
     if cross_corr_param_file is not None:
         xcorr, deltas = [
             load_array_from_hdf5(cross_corr_param_file, x)
             for x in ("cross_correlations", "relative_shifts")
         ]
     # plot_individual_cross_correlation(tiles,masks,positions,overlaps,pixel_size,filename_template='cross_corr_{0}_{1}.pdf')
-    for ind, (i, j) in enumerate(tqdm(overlaps, desc="Cross-correlation alignment")):
+    import concurrent.futures
+    import os
+
+    def _compute_overlap(args):
+        ind, (i, j) = args
         # Retrieve image shifts for the overlapping tiles
         x1 = positions[i]
         x2 = positions[j]
@@ -883,18 +1175,16 @@ def cross_correlate_tiles(
 
             # Make masks for (estimated) overlapping areas of each array
             reference_mask = np.zeros_like(masks[i], dtype=bool)
-            reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(masks[i][
-                i1[0] : i1[1], j1[0] : j1[1]
-            ],masks[j][
-                i2[0] : i2[1], j2[0] : j2[1]
-            ])
+            reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(
+                masks[i][i1[0] : i1[1], j1[0] : j1[1]],
+                masks[j][i2[0] : i2[1], j2[0] : j2[1]],
+            )
             moving_mask = np.zeros_like(masks[j], dtype=bool)
-            moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = np.logical_and(masks[i][
-                i1[0] : i1[1], j1[0] : j1[1]
-            ],masks[j][
-                i2[0] : i2[1], j2[0] : j2[1]
-            ])
-            
+            moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = np.logical_and(
+                masks[i][i1[0] : i1[1], j1[0] : j1[1]],
+                masks[j][i2[0] : i2[1], j2[0] : j2[1]],
+            )
+
             # Calculate shift by masked cross correlation with ordering (Y,X)
             detected_shift = phase_cross_correlation(
                 tiles[i],
@@ -904,12 +1194,42 @@ def cross_correlate_tiles(
             )[0]
             # delta is measured shift in microns
             delta = np.asarray(detected_shift) * pixel_size * 1e-4
-            # xcorr.append(xcorrmax)
-            deltas.append(delta)
         else:
             delta = deltas[ind]
             # xcorrmax = xcorr[ind]
             detected_shift = delta / pixel_size * 1e-4
+
+        return ind, i, j, dx, detected_shift, delta
+
+    if cross_corr_param_file is None:
+        deltas = [None] * len(overlaps)
+        use_parallel = parallelize and len(overlaps) > 1 and (max_workers is None or max_workers != 1)
+        if use_parallel:
+            worker_count = max_workers
+            if worker_count is None:
+                worker_count = min(32, (os.cpu_count() or 1) + 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(
+                    tqdm(
+                        executor.map(_compute_overlap, enumerate(overlaps)),
+                        total=len(overlaps),
+                        desc="Cross-correlation alignment",
+                    )
+                )
+        else:
+            results = [
+                _compute_overlap(args)
+                for args in enumerate(tqdm(overlaps, desc="Cross-correlation alignment"))
+            ]
+        for ind, _, _, _, _, delta in results:
+            deltas[ind] = delta
+    else:
+        results = [
+            _compute_overlap(args)
+            for args in enumerate(tqdm(overlaps, desc="Cross-correlation alignment"))
+        ]
+
+    for ind, i, j, dx, detected_shift, delta in results:
 
         # shifttoolarge=True
         if generate_plot:
@@ -1057,10 +1377,8 @@ def plot_individual_cross_correlation(
         x2 = positions[j]
 
         dx = [int(x) for x in (x2 - x1) / pixel_size * 1e4][::-1]
-        print(dx)
         i1, i2 = array_overlap(dx[0], pixels[0])
         j1, j2 = array_overlap(dx[1], pixels[1])
-        print(i1, i2, j1, j2)
         reference_mask = np.zeros_like(masks[i], dtype=bool)
         reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(masks[i][
             i1[0] : i1[1], j1[0] : j1[1]
@@ -1089,15 +1407,23 @@ def plot_individual_cross_correlation(
         axes["Image2"].imshow(images[j], cmap="gray",vmin=np.percentile(images[j][masks[j]],1),vmax=np.percentile(images[j][masks[j]],99))
         axes["Image2"].imshow(moving_mask, alpha=0.5, cmap="Reds")
         axes["Image2"].set_title(f"Image {j} with Mask")
-        print(
-            [positions[i], positions[i] + detected_shift * pixel_size * 1e-4],
-            detected_shift,
-        )
-        aligned_image = stitch(
-            [images[i], images[j]],
-            [positions[i], positions[i] + detected_shift[::-1] * pixel_size * 1e-4],
+        stitched_positions = np.array([
+            positions[i],
+            positions[i] + detected_shift[::-1] * pixel_size * 1e-4,
+        ])
+        clipped_masks = clip_masks_to_overlaps(
             [masks[i], masks[j]],
+            stitched_positions,
+            [(0, 1)],
+            pixels,
             pixel_size,
+        )
+        aligned_image, _ = stitch(
+            [images[i], images[j]],
+            stitched_positions,
+            clipped_masks,
+            pixel_size,
+            smooth=False,
         )
         # aligned_image = np.roll(images[j], shift=(-int(detected_shift[0]), -int(detected_shift[1])), axis=(0, 1))
         # axes[1, 0].imshow(images[i], cmap='gray')
@@ -1119,6 +1445,7 @@ def plot_individual_cross_correlation(
         else:
             plt.tight_layout()
             plt.show()
+        fig.clear()
 
 
 def parse_image_shifts(file_path, superres=1):
@@ -1161,40 +1488,6 @@ def generate_image_file_names_from_template(name, datadir, tilt, positions):
     return imagefiles
 
 
-def parse_mdoc(file_path):
-    parsed_data = {}
-    current_section = None
-
-    # Regular expressions to match key-value pairs and sections
-    key_value_regex = re.compile(r"(\S+)\s*=\s*(.+)")
-    section_regex = re.compile(r"\[(.+)\]")
-
-    with open(file_path, "r") as file:
-        for line in file:
-            line = line.strip()
-
-            # Skip empty lines
-            if not line:
-                continue
-
-            # Check if the line matches a section header in square brackets
-            section_match = section_regex.match(line)
-            if section_match:
-                current_section = section_match.group(1)
-                parsed_data[current_section] = {}
-                continue
-
-            # Match key-value pairs
-            key_value_match = key_value_regex.match(line)
-            if key_value_match:
-                key, value = key_value_match.groups()
-                if current_section:
-                    parsed_data[current_section][key] = value
-                else:
-                    parsed_data[key] = value
-    return parsed_data
-
-
 def extract_tilt_axis_angle(file_path):
     tilt_axis_angle = None
     section_regex = re.compile(r"\[T\s*=\s*.*Tilt\s+axis\s+angle\s*=\s*([-\d.]+)")
@@ -1217,7 +1510,7 @@ def setup_outputdir(args):
         outputdir = os.path.split(args["input"])[1].replace("*.mrc", "_output")
     else:
         outputdir = args["output"]
-    print("Results will be outputted to {0}".format(outputdir))
+    logger.info("Results will be written to: %s", outputdir)
     if not os.path.exists(outputdir):
         os.mkdir(outputdir)
     return outputdir
@@ -1244,7 +1537,7 @@ def setup_gainreference(gainreffile, filenames, outputdir, shrinkn=20, medianthr
     else:
         gainref = make_gain_ref(filenames, binning=4, shrinkn=shrinkn, medianthreshold=medianthreshold,absolutethreshold=maskabsolutethreshold)
         gainreffile_ = os.path.join(outputdir, "gain.mrc")
-        print("Saving generated Gain reference as {0}".format(gainreffile_))
+        logger.info("Saving generated gain reference to %s", gainreffile_)
         savetomrc(gainref.astype(np.float32), gainreffile_)
 
     # Create a mask of the gain reference, filling holes and using binary
@@ -1338,6 +1631,19 @@ def plot_positions(coordinates,fnam=None,fig = None,color='blue'):
 
 def main():
     args = parse_commandline()
+
+    if args["verbose"]:
+        log_level = logging.DEBUG
+    elif args["quiet"]:
+        log_level = logging.WARNING
+    else:
+        log_level = logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     outdir = setup_outputdir(args)
 
     # Binning constant
@@ -1346,34 +1652,55 @@ def main():
     files = glob.glob(args["input"])
     if len(files) < 1:
         raise FileNotFoundError("No files matching {0}".format(args["input"]))
+    logger.debug("Found %d MRC file(s) matching '%s'", len(files), args["input"])
     mdoc_files = [x.replace(".mrc", ".mrc.mdoc") for x in files]
 
     # Get pixel size, tilt axis rotation from first mdoc file
     mdoc = parse_mdoc(mdoc_files[0])
     pixelsize = float(mdoc["PixelSpacing"])
+    logger.debug("Pixel size: %.4f Å  |  binning: %d  |  effective pixel size: %.4f Å",
+                 pixelsize, binning, pixelsize * binning)
 
     # get tilts and image shifts from all mdoc files
-    tilts, imageshifts = [[], []]
-    indices = []
-    # sys.exit()
+    tilts, indices = [[], []]
+    imageshifts = parse_image_shifts(
+        args["image_shifts"], superres=args["correctimageshiftfilefactor"]
+    )
     for mdoc in mdoc_files:
         m = parse_mdoc(mdoc)
+
+        # Get the tilt from the mdoc file entries
         tilts.append(float(m["ZValue = 0"]["TiltAngle"]))
-        imageshifts.append([float(x) for x in m["ZValue = 0"]["ImageShift"].split(" ")])
+
+        # Get all dictionary entries that don't match 'ZValue = [0-9]*' pattern (header) and those that do (content)
+        non_zvalue_entries = {k: v for k, v in m.items() if not re.match(r'ZValue = \d+', k)}
+        zvalue_entries = {k: v for k, v in m.items() if re.match(r'ZValue = \d+', k)}
+                
+        # Combine common mdoc entries for each image shift
+        outputmdoc = combine_dicts(list(zvalue_entries.values()))
+        #Force some entries to remain (if present in original mdoc)
+        Mandatorykeys = ['StagePosition','DateTime','SubFramePath']
+        # Get keys in input mdoc
+        m_z0 = m.get('ZValue = 0', {})
+        # Prune Mandatorykeys not present in original mdoc
+        MandatoryEntries = {k: m_z0[k] for k in Mandatorykeys if k in m_z0}
+        ## QUICKFIX
+
+        # MandatoryEntries['pre_exposure_dose'] = 2.5* tilts[-1] /3 *2
+        outputmdoc = {**outputmdoc,**MandatoryEntries}
+        outputmdocfnam = os.path.join(outdir,os.path.split(mdoc.replace('.mrc.mdoc','.tif.mdoc'))[1])
+        write_mdoc({**non_zvalue_entries,**{'ZValue = 0':outputmdoc}},outputmdocfnam)
 
         # Split the string at '.mrc' and then find the integer before 'mrc'
         split_filename = mdoc.split(".mrc")[0]
         index = split_filename.split("_")[-1]
         indices.append(index)
 
-    imageshifts = np.asarray(imageshifts)
 
     # Get image shifts from file
     # TODO make SerialEM put this in the mdoc file in microns (not
     # weird TFS units) to obviate this step
-    imageshifts = parse_image_shifts(
-        args["image_shifts"], superres=args["correctimageshiftfilefactor"]
-    )
+    
     tiltsfromfile = [imageshifts[x][0] for x in range(len(imageshifts))]
     imageshifts = [imageshifts[x][1] for x in range(len(imageshifts))]
     reshapedimshifts = np.concatenate(imageshifts)[:, :2] * pixelsize
@@ -1383,12 +1710,50 @@ def main():
         mask = np.logical_and(*(np.abs(reshapedimshifts) < maxim).T)
     else:
         mask = np.ones(reshapedimshifts.shape[0], dtype=bool)
-    # Global range of tiles in Angstroms
-    globalwidth = np.ptp(reshapedimshifts[mask], axis=0)
-    globalorigin = np.amin(reshapedimshifts[mask], axis=0)
+    
+    if args['ROI'] is None:
+        tileFOV = pixelsize*np.asarray(mrcfile.mmap(files[0]).data.shape[1:])
+        # Global range of tiles in Angstroms
+        globalwidth = np.ptp(reshapedimshifts[mask], axis=0)+tileFOV
+        globalorigin = np.amin(reshapedimshifts[mask], axis=0)#+tileFOV
+    else:
+        roi = [float(x) for x in args['ROI']]
+        #Convert ROI from pixels (similar to image shifts file) to Angstroms)
+        globalorigin = np.array([roi[0],roi[2]])*pixelsize
+        globalwidth = np.array([roi[1]-roi[0],roi[3]-roi[2]])*pixelsize
+
+    canvas_px = (globalwidth / pixelsize / binning).astype(int)
+    logger.debug("Montage canvas: %d × %d px (binned)  |  %.1f × %.1f µm",
+                 canvas_px[0], canvas_px[1],
+                 globalwidth[0] * 1e-4, globalwidth[1] * 1e-4)
+    logger.info("Processing %d tilt(s)", len(files))
 
     fringe_size = args["fringe_size"]
-    skipgainref = args["gainref"] == "False"
+    skipgainref = args["gainref"] in (None, "False")
+
+    # Load template mask if provided
+    template_mask = None
+    if args["templatemask"] is not None:
+        tmask_path = args["templatemask"]
+        # Parse optional ":index" suffix, e.g. "file.mrc:7"
+        tmask_index = None
+        if ":" in os.path.basename(tmask_path):
+            tmask_path, idx_str = tmask_path.rsplit(":", 1)
+            tmask_index = int(idx_str)
+        if tmask_path.lower().endswith(".mrc"):
+            with mrcfile.open(tmask_path, "r") as m:
+                data = np.asarray(m.data)
+                template_mask = data[tmask_index] if tmask_index is not None else data
+        else:
+            #Need to flip y of tiff files to match mrc conventions
+            img = Image.open(tmask_path)
+            if tmask_index is not None:
+                img.seek(tmask_index)
+            template_mask = np.asarray(img)[::-1]
+        if binning > 1:
+            template_mask = fourier_interpolate(template_mask, [x // binning for x in template_mask.shape])
+        # template_mask = make_mask(template_mask,shrinkn=0,medianthreshold=args["maskthreshold"])
+        logger.info("Loaded template mask from %s", tmask_path)
 
     if not skipgainref:
         # Load gain ref if available make a new one if not
@@ -1396,7 +1761,7 @@ def main():
 
         if checkforgainref:
             if os.path.exists(args["gainref"]):
-                print("Loading gain reference {0}".format(args["gainref"]))
+                logger.info("Loading gain reference: %s", args["gainref"])
                 with mrcfile.open(args["gainref"], "r+") as m:
                     gainref = np.asarray(m.data)
                 # Check gain reference data size mismatch and interpolate if necessary
@@ -1405,10 +1770,9 @@ def main():
                 )
                 gainrefshape = np.asarray(gainref.shape)
                 if np.any(gainrefshape != imageshape):
-                    print(
-                        "Interpolating gain reference (original {0} x {1} ) to match binned image size ({2} x {3})".format(
-                            *gainrefshape, *imageshape
-                        )
+                    logger.warning(
+                        "Gain reference shape %s does not match binned image shape %s — interpolating",
+                        tuple(gainrefshape), tuple(imageshape)
                     )
                     gainref = fourier_interpolate(gainref, imageshape)
                     gainrefmask = make_mask(gainref, shrinkn=fringe_size / binning,medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
@@ -1419,16 +1783,12 @@ def main():
                     )
                     # gainref = np.where(gainrefmask, gainref, 1)
             else:
-                print(
-                    "Gain reference file {0} not found so making new one".format(
-                        args["gainref"]
-                    )
-                )
+                logger.warning("Gain reference file '%s' not found — generating a new one", args["gainref"])
                 checkforgainref = False
         if not checkforgainref:
             gainref = make_gain_ref(files, binning=binning, shrinkn=fringe_size, medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
             gainreffile = os.path.join(outdir, "gainref.mrc")
-            print("Saving gain reference to {0}".format(gainreffile))
+            logger.info("Saving gain reference to %s", gainreffile)
             savetomrc(gainref.astype(np.float32), gainreffile)
 
         # make gain reference mask
@@ -1446,27 +1806,24 @@ def main():
         gainref = None
         gainrefmask = None
 
+    _quiet = not logger.isEnabledFor(logging.INFO)
     for i, (file, tilt) in enumerate(
-        tqdm(zip(files, tilts), total=len(files), desc="Stitching montages")
+        tqdm(zip(files, tilts), total=len(files), desc="Stitching montages", disable=_quiet)
     ):
-        # positions = imageshifts[i][1]
+        logger.debug("[%d/%d] %s  (tilt %.1f°)", i + 1, len(files), os.path.basename(file), tilt)
         indx = find_closest_index(tiltsfromfile, tilt)
         positions = imageshifts[indx]
-        
-        # plot_positions(positions[:,:2])
+
         if args['maximageshift'] is not None:
             tiles = np.where(np.logical_and(*(np.abs(positions) < maxim).T))[0]
+            ntiles = sum(tiles)
         else:
             tiles = None
+            ntiles = len(positions)
+        logger.debug("  %d tile(s) selected", ntiles)
         # plot_positions(positions[tiles][:,:2],color='k')
 
-        # plot_positions(positions[:,:2])
-        if args["maximageshift"] is not None:
-            tiles = np.where(np.logical_and(*(np.abs(positions) < maxim).T))[0]
-        else:
-            tiles = None
-        # plot_positions(positions[tiles][:,:2],color='k')
-
+        
         mont = montage(
             file,
             outdir,
@@ -1487,6 +1844,15 @@ def main():
             maskthreshold=args["maskthreshold"],
             maskabsolutethreshold=args["maskabsolutethreshold"],
             flattenbeam=args["flattenbeam"],
+            nthreads = args["nthreads"],
+            positionfile=args["positionfile"],
+            smooth=not args["nosmooth"] and not args["mark_uncovered"],
+            mark_uncovered=args["mark_uncovered"],
+            template_mask=template_mask,
+            min_mean_intensity=args["min_mean_intensity"],
+            correct_beam_edges=args["correct_beam_edges"],
+            E_plasmon_eV=args["plasmon_energy"],
+            voltage_kV=args["voltage"],
         )
 
 

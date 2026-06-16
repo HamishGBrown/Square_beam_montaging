@@ -2,14 +2,16 @@ import h5py
 import numpy as np
 import math
 from typing import List, Tuple
-from scipy.ndimage import correlate
-from scipy.ndimage.morphology import binary_fill_holes, binary_erosion
+from scipy.ndimage import correlate, sobel
+from scipy.ndimage.morphology import binary_fill_holes, binary_erosion, binary_dilation
 from tqdm import tqdm
 import copy
 import mrcfile
 import matplotlib.pyplot as plt
 import os
 import png
+import re
+from typing import List, Tuple, Dict, Any
 
 def renormalize(array, oldmin=None, oldmax=None, newmax=1.0, newmin=0.0):
     """Rescales the array such that its maximum is newmax and its minimum is newmin."""
@@ -27,6 +29,90 @@ def renormalize(array, oldmin=None, oldmax=None, newmax=1.0, newmin=0.0):
         np.clip((array - min_) / (max_ - min_), 0.0, 1.0) * (newmax - newmin) + newmin
     )
 
+
+
+def parse_mdoc(file_path):
+    parsed_data = {}
+    current_section = None
+
+    # Regular expressions to match key-value pairs and sections
+    key_value_regex = re.compile(r"(\S+)\s*=\s*(.+)")
+    section_regex = re.compile(r"\[(.+)\]")
+
+    with open(file_path, "r") as file:
+        for line in file:
+            line = line.strip()
+
+            # Skip empty lines
+            if not line:
+                continue
+
+            # Check if the line matches a section header in square brackets
+            section_match = section_regex.match(line)
+            if section_match:
+                current_section = section_match.group(1)
+                parsed_data[current_section] = {}
+                continue
+
+            # Match key-value pairs
+            key_value_match = key_value_regex.match(line)
+            if key_value_match:
+                key, value = key_value_match.groups()
+                if current_section:
+                    parsed_data[current_section][key] = value
+                else:
+                    parsed_data[key] = value
+    return parsed_data
+
+
+def write_mdoc(parsed_data, file_path):
+    """
+    Write a dictionary (like that produced by parse_mdoc) back to an mdoc file.
+
+    Parameters:
+    parsed_data (dict): The dictionary to write.
+    file_path (str): The path to the output mdoc file.
+    """
+    with open(file_path, 'w') as f:
+        for key, value in parsed_data.items():
+            if isinstance(value, dict):
+                f.write(f'[{key}]\n')
+                for subkey, subval in value.items():
+                    f.write(f'{subkey} = {subval}\n')
+            else:
+                f.write(f'{key} = {value}\n')
+
+
+def combine_dicts(dict_list: List[Dict]) -> Dict:
+    """
+    Combines a set of dictionaries, only keeping key-value pairs that are identical across all dictionaries.
+
+    Parameters:
+    -----------
+    dict_list : list of dict
+        A list of dictionaries to combine.
+
+    Returns:
+    --------
+    dict
+        A dictionary containing only the key-value pairs that are identical in all input dictionaries.
+    """
+    if not dict_list:
+        return {}
+    
+    if len(dict_list) == 1:
+        return dict_list[0].copy()
+    
+    # Start with the first dictionary
+    common_dict = {}
+    
+    # Get all keys from the first dictionary
+    for key, value in dict_list[0].items():
+        # Check if this key-value pair is identical in all other dictionaries
+        if all(d.get(key) == value for d in dict_list[1:]):
+            common_dict[key] = value
+    
+    return common_dict
 
 
 def array_to_RGB(arrayin, cmap=plt.get_cmap("viridis"), vmin=None, vmax=None):
@@ -135,6 +221,8 @@ def save_array_to_hdf5(
     filename: str,
     dataset_names: List[str],
     filemode: str = "w",
+    compression ="gzip",
+    compression_opts=9
 ) -> None:
     """
     Saves a numpy array to an HDF5 file.
@@ -147,23 +235,34 @@ def save_array_to_hdf5(
     """
     with h5py.File(filename, filemode) as hdf:
         for name, data in zip(dataset_names, arrays):
-            hdf.create_dataset(name, data=data)
+            if isinstance(data, str):
+                hdf.create_dataset(name, data=data)
+            elif np.isscalar(data):
+                hdf.create_dataset(name, data=data)
+            else:
+                hdf.create_dataset(name, data=data, compression=compression, compression_opts=compression_opts)
 
 
-def load_array_from_hdf5(filename: str, dataset_name: str) -> np.ndarray:
+def load_array_from_hdf5(filename: str, dataset_name: str):
     """
-    Loads a numpy array from an HDF5 file.
+    Loads a dataset from an HDF5 file.
 
     Parameters:
-    filename (str): The name of the file from which to load the array.
+    filename (str): The name of the file from which to load the dataset.
     dataset_name (str): The name of the dataset in the HDF5 file.
 
     Returns:
-    np.ndarray: The numpy array loaded from the file.
+    The dataset as a numpy array, string, or scalar depending on what was stored.
     """
     with h5py.File(filename, "r") as hdf:
-        array = np.array(hdf[dataset_name])
-    return array
+        dataset = hdf[dataset_name]
+        if h5py.check_string_dtype(dataset.dtype):
+            value = dataset[()]
+            return value.decode("utf-8") if isinstance(value, bytes) else value
+        value = dataset[()]
+        if value.ndim == 0:
+            return value.item()
+        return np.array(value)
 
 
 def calc_row_idx(k: int, n: int) -> int:
@@ -579,7 +678,8 @@ def center_of_mass_2d(array):
     """
     total = np.sum(array)
     if total == 0:
-        raise ValueError("The sum of the array elements is zero, cannot determine center of mass.")
+        return array.shape[0] / 2, array.shape[1] / 2
+        # raise ValueError("The sum of the array elements is zero, cannot determine center of mass.")
     
     rows, cols = np.indices(array.shape)
     center_row = np.sum(rows * array) / total
@@ -641,6 +741,461 @@ def r_space_array(pixels, gridsize, meshed=True):
         return broadcast_from_unmeshed(rspace)
     else:
         return rspace
+
+
+def plot_plasmon_sweep(tile, ref_beam, mask, pixel_size_nm,
+                       E_plasmon_eV=21.0, voltage_kV=300.0,
+                       n_values=(1, 5, 10, 15, 20)):
+    """
+    Diagnostic plot: reference beam blurred by the plasmon kernel at a range of
+    n values alongside the actual tile.  All images are normalised to the tile's
+    mean within the mask so only profile *shape* differences are visible.
+    Use this to judge visually whether any n gives a good match to the tile and
+    whether q_E (the Lorentzian half-width) is physically reasonable.
+
+    Parameters
+    ----------
+    tile : (ny, nx) ndarray
+    ref_beam : (ny, nx) ndarray
+    mask : (ny, nx) bool ndarray
+    pixel_size_nm : float
+    E_plasmon_eV : float
+    voltage_kV : float
+    n_values : sequence of float
+        n values to sweep (default 1, 5, 10, 15, 20).
+    """
+    m0c2 = 511e3
+    beta2 = 1.0 - (m0c2 / (m0c2 + voltage_kV * 1e3)) ** 2
+    q_E = E_plasmon_eV / (1239.8 * np.sqrt(beta2))
+
+    ny, nx = ref_beam.shape
+    pad = max(16, int(np.ceil(3.0 / (q_E * pixel_size_nm))))
+    ref_padded = np.pad(ref_beam.astype(float), pad, mode='constant', constant_values=0.0)
+    ny_p, nx_p = ref_padded.shape
+    qy_p = np.fft.fftfreq(ny_p, d=pixel_size_nm)
+    qx_p = np.fft.fftfreq(nx_p, d=pixel_size_nm)
+    P_single_p = q_E ** 2 / (qy_p[:, None] ** 2 + qx_p[None, :] ** 2 + q_E ** 2)
+    ref_fft_p = np.fft.fft2(ref_padded)
+
+    n_list = [0] + list(n_values)
+    blurred = []
+    for n in n_list:
+        K_p = np.exp(n * (P_single_p - 1.0))
+        blurred.append(np.real(np.fft.ifft2(ref_fft_p * K_p))[pad:pad + ny, pad:pad + nx])
+
+    # Normalise every image to tile's mean within mask so shape is comparable
+    tile_mean = float(np.mean(tile[mask])) if mask.any() else float(np.mean(tile))
+    def _norm(img):
+        m = float(np.mean(img[mask])) if mask.any() else float(np.mean(img))
+        return img * (tile_mean / m) if m != 0 else img
+
+    panels      = [_norm(b) for b in blurred] + [tile.astype(float)]
+    panel_titles = [f"ref  n={n}" for n in n_list] + ["tile"]
+
+    n_panels = len(panels)
+    half = 50
+    row0, row1 = max(ny // 2 - half, 0), min(ny // 2 + half, ny)
+
+    fig = plt.figure(figsize=(3.0 * n_panels, 8))
+    gs  = fig.add_gridspec(2, n_panels, height_ratios=[3, 1], hspace=0.35, wspace=0.05)
+    img_axes = [fig.add_subplot(gs[0, i]) for i in range(n_panels)]
+    ax_ls    = fig.add_subplot(gs[1, :])   # linescan spans all columns
+
+    vmin, vmax = (np.percentile(tile[mask], [1, 99]) if mask.any()
+                  else (tile.min(), tile.max()))
+    for ax, img, title in zip(img_axes, panels, panel_titles):
+        ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax, origin="lower")
+        ax.axhline(row0, color="r", linewidth=0.5, linestyle="--")
+        ax.axhline(row1, color="r", linewidth=0.5, linestyle="--")
+        ax.set_title(title, fontsize=9)
+        ax.axis("off")
+
+    colors = plt.cm.viridis(np.linspace(0.0, 0.85, len(n_list)))
+    for img, n, color in zip(panels[:-1], n_list, colors):
+        ls = img[row0:row1, :].mean(axis=0)
+        ax_ls.plot(ls, color=color, linewidth=1.0, label=f"n={n}")
+    ax_ls.plot(tile[row0:row1, :].mean(axis=0), color="r", linewidth=1.5, label="tile")
+    ax_ls.set_xlim(0, nx - 1)
+    ax_ls.set_xlabel("x (px)")
+    ax_ls.set_ylabel("intensity (normalised)")
+    ax_ls.legend(fontsize=8, ncol=len(n_list) + 1, loc="upper center",
+                 bbox_to_anchor=(0.5, 1.18))
+
+    fig.suptitle(
+        f"Plasmon sweep  |  q_E = {q_E:.4f} cyc/nm  "
+        f"|  FWHM ≈ {0.5 / q_E / pixel_size_nm:.1f} px  "
+        f"|  pixel = {pixel_size_nm:.3f} nm",
+        fontsize=10,
+    )
+    plt.show()
+
+
+def _estimate_n_avg_lsq(tile, ref_beam, mask, q_E, pixel_size_nm, downsample=64):
+    """
+    Estimate n_avg by least-squares shape-matching on a downsampled image.
+
+    Finds the n_avg that minimises ||tile - a * I_exp(n_avg)||² within the
+    beam mask, where a is an analytically-optimal amplitude scale factor.
+    Fitting only the profile *shape* (not its amplitude) makes this robust to
+    overall intensity differences between reference and tile (e.g. from dose,
+    energy filtering, or thickness).
+    """
+    from scipy.optimize import minimize_scalar
+
+    ny, nx = tile.shape
+    ds_y = min(downsample, ny)
+    ds_x = min(downsample, nx)
+
+    tile_ds = fourier_interpolate(tile.astype(float), [ds_y, ds_x])
+    ref_ds  = fourier_interpolate(ref_beam.astype(float), [ds_y, ds_x])
+    mask_ds = fourier_interpolate(mask.astype(float), [ds_y, ds_x]) > 0.5
+    if not mask_ds.any():
+        mask_ds = np.ones((ds_y, ds_x), dtype=bool)
+
+    # Pixel size scales with downsampling factor
+    py = pixel_size_nm * ny / ds_y
+    px = pixel_size_nm * nx / ds_x
+    qy = np.fft.fftfreq(ds_y, d=py)
+    qx = np.fft.fftfreq(ds_x, d=px)
+    P_single_ds = q_E ** 2 / (qy[:, None] ** 2 + qx[None, :] ** 2 + q_E ** 2)
+    ref_fft_ds  = np.fft.fft2(ref_ds)
+
+    def residual(n):
+        K = np.exp(n * (P_single_ds - 1.0))
+        I_exp = np.real(np.fft.ifft2(ref_fft_ds * K))
+        t = tile_ds[mask_ds]
+        r = I_exp[mask_ds]
+        denom = float(np.dot(r, r))
+        if denom == 0.0:
+            return np.inf
+        amp = float(np.dot(t, r)) / denom  # optimal amplitude (closed-form)
+        return float(np.sum((t - amp * r) ** 2))
+
+    result = minimize_scalar(residual, bounds=(0.0, 20.0), method='bounded')
+    return max(0.0, float(result.x))
+
+
+def _estimate_plasmon_params_grid(tile, ref_beam, mask, pixel_size_nm,
+                                   n_range=(0.0, 25.0),
+                                   q_E_range=(0.003, 0.08),
+                                   n_points=25, q_E_points=25,
+                                   downsample=64, refine=True,
+                                   edge_width=10,
+                                   n_hint=None, q_E_hint=None):
+    """
+    2D grid search over (n, q_E) to find the plasmon parameters that best match
+    the tile beam-edge profile, followed by an optional local refinement.
+
+    Key design decisions
+    --------------------
+    Edge-only residual
+        The plasmon effect is only visible at the beam boundary.  Fitting the
+        flat interior (large area, noisy) dominates the residual and pulls the
+        optimiser toward unrealistic (n, q_E) values.  The residual is therefore
+        evaluated only on a ring of pixels near the beam boundary.
+
+    Zero-padding on the downsampled convolution
+        Without padding the FFT assumes periodic boundary conditions, which
+        wraps the beam signal across the frame and biases the fit.
+
+    Parameters
+    ----------
+    n_range : (float, float)    Search range for mean plasmon event count.
+    q_E_range : (float, float)  Search range for q_E in cycles nm⁻¹.
+                                Default covers E_plasmon ≈ 3–80 eV at 300 kV.
+    n_points, q_E_points : int  Grid resolution along each axis.
+    refine : bool               If True, run a local minimiser from the best
+                                grid point to sub-grid precision.
+    edge_width : int
+        Width of the beam-edge ring (in downsampled pixels) used for the
+        residual.  Default 10.
+
+    Returns
+    -------
+    n_best, q_E_best : float
+    residuals : (n_points, q_E_points) ndarray   full residual landscape
+    n_vals, q_E_vals : 1-D ndarrays              grid axes
+    """
+    from scipy.optimize import minimize
+
+    ny, nx = tile.shape
+    ds_y, ds_x = min(downsample, ny), min(downsample, nx)
+
+    tile_ds = fourier_interpolate(tile.astype(float), [ds_y, ds_x])
+    ref_ds  = fourier_interpolate(ref_beam.astype(float), [ds_y, ds_x])
+    mask_ds = fourier_interpolate(mask.astype(float), [ds_y, ds_x]) > 0.5
+    if not mask_ds.any():
+        mask_ds = np.ones((ds_y, ds_x), dtype=bool)
+
+    # Edge ring: pixels within edge_width of the beam boundary, on both sides.
+    # Inside ring: beam pixels excluded by erosion — captures the darkened rim.
+    # Outside ring: non-beam pixels included by dilation — captures the
+    #   plasmon-scattered halo, which is visible in this dataset.
+    struct = np.ones((edge_width, edge_width), dtype=bool)
+    eroded   = binary_erosion(mask_ds,  structure=struct)
+    dilated  = binary_dilation(mask_ds, structure=struct)
+    edge_mask_ds = (mask_ds & ~eroded) | (dilated & ~mask_ds)
+    if not edge_mask_ds.any():
+        edge_mask_ds = mask_ds  # beam too small to erode; use full mask
+
+    py = pixel_size_nm * ny / ds_y
+    px = pixel_size_nm * nx / ds_x
+
+    # Zero-pad so the FFT convolution does not wrap the beam across the frame.
+    pad_ds = max(4, int(np.ceil(3.0 / (q_E_range[0] * py))))
+    ref_ds_pad = np.pad(ref_ds, pad_ds, mode='constant', constant_values=0.0)
+    ds_yp, ds_xp = ref_ds_pad.shape
+    qy_p = np.fft.fftfreq(ds_yp, d=py)
+    qx_p = np.fft.fftfreq(ds_xp, d=px)
+    q2_p = qy_p[:, None] ** 2 + qx_p[None, :] ** 2
+    ref_fft_p = np.fft.fft2(ref_ds_pad)
+
+    t = tile_ds[edge_mask_ds]
+
+    def residual(n, q_E):
+        n   = max(n,   0.0)
+        q_E = max(q_E, 1e-6)
+        K = np.exp(n * (q_E ** 2 / (q2_p + q_E ** 2) - 1.0))
+        I_exp = np.real(np.fft.ifft2(ref_fft_p * K))[pad_ds:pad_ds + ds_y,
+                                                       pad_ds:pad_ds + ds_x]
+        r = I_exp[edge_mask_ds]
+        denom = float(np.dot(r, r))
+        if denom == 0.0:
+            return np.inf
+        amp = float(np.dot(t, r)) / denom
+        return float(np.sum((t - amp * r) ** 2))
+
+    if n_hint is not None and q_E_hint is not None:
+        # Warm start: skip the grid and go straight to local refinement.
+        n_best, q_E_best = float(n_hint), float(q_E_hint)
+        residuals = np.empty((0, 0))
+        n_vals = q_E_vals = np.empty(0)
+    else:
+        n_vals   = np.linspace(n_range[0],   n_range[1],   n_points)
+        q_E_vals = np.linspace(q_E_range[0], q_E_range[1], q_E_points)
+
+        residuals = np.array([[residual(n, q_E) for q_E in q_E_vals]
+                               for n in n_vals])
+
+        best = np.unravel_index(np.argmin(residuals), residuals.shape)
+        n_best, q_E_best = float(n_vals[best[0]]), float(q_E_vals[best[1]])
+
+    if refine:
+        result = minimize(
+            lambda x: residual(x[0], x[1]),
+            x0=[n_best, q_E_best],
+            method='Nelder-Mead',
+            options={'xatol': 1e-3, 'fatol': 1e-6, 'maxiter': 500},
+        )
+        n_best   = max(0.0,  float(result.x[0]))
+        q_E_best = max(1e-6, float(result.x[1]))
+
+    return n_best, q_E_best, residuals, n_vals, q_E_vals
+
+
+def _plot_plasmon_correction(tile, I_expected, corrected, mask,
+                              n_avg, n_avg_method, pixel_size_nm):
+    """Diagnostic plot for plasmon_beam_correction.  Call or comment out as needed."""
+    ny, nx = tile.shape
+    corrected_masked = np.where(mask, corrected, np.nan)
+
+    half = 50
+    row0, row1 = max(ny // 2 - half, 0), min(ny // 2 + half, ny)
+
+    ls_tile        = tile[row0:row1, :].mean(axis=0)
+    ls_corr_masked = np.nanmean(corrected_masked[row0:row1, :], axis=0)
+
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8),
+                             gridspec_kw={"height_ratios": [3, 1]})
+
+    def _clim(img, m):
+        valid = img[m] if m.any() else img[np.isfinite(img)]
+        valid = valid[np.isfinite(valid)]
+        return tuple(np.percentile(valid, [1, 99])) if len(valid) else (img.min(), img.max())
+
+    shared_clim = _clim(tile, mask)
+    clims = [shared_clim, _clim(I_expected, mask), _clim(corrected, mask), shared_clim]
+
+    for ax, img, title, (lo, hi) in zip(axes[0],
+                               [tile, I_expected, corrected, corrected_masked],
+                               ["tile (input)", "I_expected", "tile × correction",
+                                "tile × correction (masked)"],
+                               clims):
+        ax.imshow(img, cmap="gray", vmin=lo, vmax=hi, origin="lower")
+        ax.axhline(row0, color="r", linewidth=0.5, linestyle="--")
+        ax.axhline(row1, color="r", linewidth=0.5, linestyle="--")
+        ax.set_title(title)
+        ax.axis("off")
+
+    ax_ls = axes[1, 1]
+    ax_ls.plot(ls_tile,        color="C0", label="input")
+    ax_ls.plot(ls_corr_masked, color="C3", linestyle="--", label="masked corrected")
+    ax_ls.set_xlim(0, nx - 1)
+    ax_ls.set_xlabel("x (px)")
+    ax_ls.set_ylabel("intensity")
+    ax_ls.legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.35), ncol=2)
+
+    for ax in (axes[1, 0], axes[1, 2], axes[1, 3]):
+        ax.axis("off")
+
+    fig.suptitle(f"Plasmon correction  (n_avg = {n_avg:.3f},  method = {n_avg_method},  "
+                 f"pixel = {pixel_size_nm:.3f} nm)")
+    plt.tight_layout()
+    plt.show()
+
+
+def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
+                             template_edges=None, E_plasmon_eV=21.0, voltage_kV=300.0,
+                             n_avg_method='grid', downsample=64,
+                             n_range=(0.0, 25.0), q_E_range=(0.003, 0.08),
+                             n_hint=None, q_E_hint=None,
+                             n_fixed=None, q_E_fixed=None):
+    """
+    Correct beam edge darkening due to inelastic (plasmon) scattering.
+
+    Plasmon scattering blurs the diffraction-plane intensity via a Lorentzian
+    kernel (Mkhoyan et al. 2008, Eq. 11 in Brown et al. 2017).  In image space
+    this appears as an attenuation of high spatial frequencies, making beam
+    edges darker than the centre.
+
+    The correction is:
+        1. Align ref_beam to the beam position in tile via edge cross-correlation
+           (same approach as make_mask).
+        2. Build the single-plasmon Lorentzian in image k-space:
+               P(q) = q_E^2 / (q^2 + q_E^2)   [normalised: P(0) = 1]
+        3. Estimate n_avg — either by least-squares profile shape-matching
+           ('lsq', default) or by the log-ratio of mean intensities
+           ('log_ratio').
+        4. Form the multi-plasmon (Poisson) kernel:
+               K(q) = exp(n_avg * (P(q) - 1))
+        5. Compute the expected blurred reference: I_exp = IFFT(FFT(I_ref) * K)
+        6. Correction map: C = I_ref / I_exp  (applied within the beam mask)
+
+    Parameters
+    ----------
+    tile : (ny, nx) ndarray
+        Tile image to correct.
+    ref_beam : (ny, nx) ndarray
+        Raw (non-binary) reference beam image, typically the template image
+        acquired through vacuum at the same settings as the data.
+    mask : (ny, nx) bool ndarray
+        Valid pixel mask (beam interior); used to estimate n_avg and to
+        restrict where the correction is applied.
+    pixel_size_nm : float
+        Effective pixel size in nm (after any binning).
+    template_edges : (ny, nx) ndarray, optional
+        Pre-computed Sobel edge map of the reference beam, used for alignment.
+        If None it is computed from ref_beam.  Pass the same array used by
+        make_mask to avoid repeating the edge computation.
+    E_plasmon_eV : float
+        Plasmon energy in eV.  Default 21 eV (vitreous ice / water).
+    voltage_kV : float
+        Accelerating voltage in kV.  Default 300.
+    n_avg_method : {'grid', 'lsq', 'log_ratio'}
+        How to estimate plasmon parameters.
+        'grid' (default): 2-D grid search over both n and q_E on a downsampled
+        image, followed by Nelder-Mead refinement.  Both parameters are free,
+        so the fit does not rely on the physical E_plasmon_eV / voltage_kV
+        estimates.  The fitted q_E overrides the physics-based value.
+        'lsq': 1-D bounded search over n only, with q_E fixed from physics.
+        'log_ratio': fastest but coarsest — log(ref_mean / tile_mean).
+    downsample : int
+        Side length (pixels) of the image used for 'grid' / 'lsq' fitting.
+        Default 64.
+    n_range : (float, float)
+        Search bounds for n used by the 'grid' method.  Default (0, 25).
+    q_E_range : (float, float)
+        Search bounds for q_E in cycles nm⁻¹ used by the 'grid' method.
+        Default (0.003, 0.08), covering E_plasmon ≈ 3–80 eV at 300 kV.
+
+    Returns
+    -------
+    corrected : (ny, nx) ndarray
+        Tile with beam-edge darkening corrected.
+    """
+    # Align ref_beam to the beam position in this tile via edge cross-correlation,
+    # matching the approach used in make_mask so both share the same registration.
+    smoothed = convolve(tile.astype(float), Gaussian(3, tile.shape))
+    image_edges = np.hypot(sobel(renormalize(smoothed), axis=0),
+                           sobel(renormalize(smoothed), axis=1))
+    if template_edges is None:
+        smooth_ref = convolve(ref_beam.astype(float), Gaussian(3, ref_beam.shape))
+        template_edges = np.hypot(sobel(smooth_ref, axis=0), sobel(smooth_ref, axis=1))
+    dy, dx = cross_correlate_alignment(image_edges, template_edges, returncoords=True)
+    ref_beam = roll_no_periodic(ref_beam.astype(float), (-dy, -dx), axis=(0, 1))
+
+    #plot_plasmon_sweep(tile, ref_beam, mask, pixel_size_nm,
+                    #    E_plasmon_eV=E_plasmon_eV, voltage_kV=voltage_kV)
+
+    # Relativistic speed factor β
+    m0c2 = 511e3  # eV
+    beta2 = 1.0 - (m0c2 / (m0c2 + voltage_kV * 1e3)) ** 2
+
+    # Physics-based q_E in cycles nm^{-1} (used as fallback / starting point).
+    # hc = 2π·ħc ≈ 1239.8 eV·nm; fftfreq returns cycles/unit not rad/unit.
+    hc = 1239.8  # eV·nm
+    q_E = E_plasmon_eV / (hc * np.sqrt(beta2))
+
+    if n_fixed is not None and q_E_fixed is not None:
+        # Parameters locked in from a reference tile — skip all fitting.
+        n_avg, q_E = float(n_fixed), float(q_E_fixed)
+    elif n_avg_method == 'grid':
+        n_avg, q_E, _res, _nv, _qv = _estimate_plasmon_params_grid(
+            tile, ref_beam, mask, pixel_size_nm,
+            n_range=n_range, q_E_range=q_E_range, downsample=downsample,
+            n_hint=n_hint, q_E_hint=q_E_hint,
+        )
+        print(f"Grid fit: n_avg={n_avg:.3f}  q_E={q_E:.5f} cyc/nm  "
+              f"(E_eff≈{q_E * hc * np.sqrt(beta2):.1f} eV)")
+    elif n_avg_method == 'lsq':
+        n_avg = _estimate_n_avg_lsq(tile, ref_beam, mask, q_E, pixel_size_nm,
+                                    downsample=downsample)
+    else:
+        # Log-ratio: n_avg ≈ -ln(tile_mean / ref_mean); underestimates when
+        # images are energy-filtered because intensity loss is not purely from
+        # electrons leaving the beam mask.
+        valid = mask if mask.any() else np.ones_like(mask)  # fall back to full image if mask is empty to avoid mean([]) → nan
+        ref_mean  = float(np.mean(ref_beam[valid]))
+        tile_mean = float(np.mean(tile[valid]))
+        if ref_mean <= 0.0:
+            return tile.copy(), 0.0, q_E
+        n_avg = max(0.0, -np.log(np.clip(tile_mean / ref_mean, 1e-6, 1.0)))
+
+    if n_avg == 0.0:
+        return tile.copy(), 0.0, q_E
+
+    ny, nx = ref_beam.shape
+
+    # Zero-pad ref_beam before convolving to avoid wrap-around artefacts when
+    # the beam edge is near the image boundary.  Padding = 3 × kernel half-width
+    # in pixels; this is the minimum needed so the Lorentzian tail has decayed to
+    # a negligible level before it would wrap.  Direct spatial convolution is
+    # O(N²·R²) vs O((N+2P)²·log(N+2P)²) here — FFT wins for any realistic R.
+    pad = max(16, int(np.ceil(3.0 / (q_E * pixel_size_nm))))
+    ref_padded = np.pad(ref_beam, pad, mode='constant', constant_values=0.0)
+    ny_p, nx_p = ref_padded.shape
+    qy_p = np.fft.fftfreq(ny_p, d=pixel_size_nm)
+    qx_p = np.fft.fftfreq(nx_p, d=pixel_size_nm)
+    K_p = np.exp(n_avg * (q_E ** 2 / (qy_p[:, None] ** 2 + qx_p[None, :] ** 2 + q_E ** 2) - 1.0))
+
+    # Expected beam profile after plasmon blurring; crop back to original size
+    I_expected = np.real(np.fft.ifft2(np.fft.fft2(ref_padded) * K_p))[pad:pad + ny, pad:pad + nx]
+
+    # Correction map: ratio of reference to expected, clipped to avoid
+    # amplifying noise outside the beam or in low-signal regions
+    threshold = 0.05 * float(np.max(I_expected))
+    correction = np.where(
+        mask & (I_expected > threshold),
+        np.clip(ref_beam / np.where(I_expected > threshold, I_expected, 1.0), 0.0, 10.0),
+        1.0,
+    )
+
+    corrected = tile * correction
+
+    # _plot_plasmon_correction(tile, I_expected, corrected, mask,
+    #                          n_avg, n_avg_method, pixel_size_nm)
+
+    return corrected, n_avg, q_E
 
 
 def flatten_beam(image,mask,rotation=0):
@@ -773,10 +1328,15 @@ def iterative_edge_smoothing(array, mask, niterations=5, pow=4, initial_radius=N
     return array
 
 
-def make_mask(im, shrinkn=20, smoothing_kernel=3,medianthreshold=0.4,absolutethreshold=None):
+def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
+              absolutethreshold=None, template_mask=None,template_edges=None,):
     """
     Generate a binary mask from an image by applying a Gaussian filter, filling holes,
     and then shrinking the mask with morphological erosion.
+
+    When a template_mask is provided, edge-based cross-correlation is used to align
+    the template to the beam position in the image. This is more robust than
+    thresholding when thick sample regions are as bright as (or brighter than) the beam.
 
     Parameters:
     -----------
@@ -785,17 +1345,60 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3,medianthreshold=0.4,absolutethr
     shrinkn : int, optional
         Factor determining the size of the structuring element for shrinking the mask.
         Default is 20.
-    smoothing_kernel : float,optional
-        Sigma of the gaussian smoothing kernel before applying the mask (3 by default)
+    smoothing_kernel : float, optional
+        Sigma of the Gaussian smoothing kernel before applying the mask (3 by default).
+    medianthreshold : float, optional
+        Threshold as a fraction of the image median used in the fallback method. Default 0.4.
+    absolutethreshold : float, optional
+        If provided, used as an absolute threshold instead of the median-based one.
+    template_mask : numpy.ndarray, optional
+        A binary template of the expected beam shape. When provided, Sobel edge maps of
+        the (smoothed) image and of the template boundary are cross-correlated to locate
+        the beam, and the template is shifted to that position. The result is insensitive
+        to bright/dark sample regions inside the beam.
 
     Returns:
     --------
     numpy.ndarray : Binary mask of the same shape as the input image.
     """
+    if template_mask is not None:
+        # Resize template to match image shape if necessary
+        if template_mask.shape != im.shape:
+            template_mask = fourier_interpolate(
+                template_mask.astype(float), im.shape
+            ) > 0.5
+
+        # Compute Sobel edge magnitude on the smoothed image
+        smoothed_im = convolve(im, Gaussian(smoothing_kernel, im.shape))
+        norm_im = renormalize(smoothed_im)
+        image_edges = np.hypot(sobel(norm_im, axis=0), sobel(norm_im, axis=1))
+
+        # Compute Sobel edge magnitude on the template boundary
+        if template_edges is None:
+            tmpl_float = template_mask.astype(float)
+            template_edges = np.hypot(sobel(tmpl_float, axis=0), sobel(tmpl_float, axis=1))
+
+        
+
+        # Find the shift that best aligns template edges to image edges
+        dy, dx = cross_correlate_alignment(image_edges, template_edges, returncoords=True)
+
+        # Shift template to align with the beam
+        mask = roll_no_periodic(template_mask, (-dy, -dx), axis=(0, 1))
+
+
+        # Optionally erode to keep away from the beam edge
+        if shrinkn > 0:
+            struct_elem = circular_mask([shrinkn * 2, shrinkn * 2], radius=shrinkn / 2)
+            mask = binary_erosion(mask, structure=struct_elem)
+
+        return mask
+
+    # --- Fallback: original threshold-based approach ---
     # Step 1: Apply a Gaussian filter to smooth the image
     smoothed_im = convolve(im, Gaussian(smoothing_kernel, im.shape))
 
-    # Step 2: Create an initial binary mask based on a threshold (0.4 * median of the original image)
+    # Step 2: Create an initial binary mask based on a threshold
     if absolutethreshold is not None:
         mask = smoothed_im > absolutethreshold
     else:
@@ -805,10 +1408,11 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3,medianthreshold=0.4,absolutethr
     mask = binary_fill_holes(mask)
 
     # Step 4: Create a circular structuring element to use for binary erosion
-    struct_elem = circular_mask([shrinkn * 2, shrinkn * 2], radius=shrinkn / 2)
+    if shrinkn > 0:
+        struct_elem = circular_mask([shrinkn * 2, shrinkn * 2], radius=shrinkn / 2)
 
-    # Step 5: Apply binary erosion to shrink the mask
-    mask = binary_erosion(mask, structure=struct_elem)
+        # Step 5: Apply binary erosion to shrink the mask
+        mask = binary_erosion(mask, structure=struct_elem)
 
     return mask
 
@@ -1092,12 +1696,7 @@ def cross_correlate_tiles(
             moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = masks[j][
                 i2[0] : i2[1], j2[0] : j2[1]
             ]
-            # fig,ax = plt.subplots(nrows=2)
-            # ax = ax.flatten()
-            # for idx, (im, msk) in enumerate(zip([tiles[i],tiles[j]],[reference_mask,moving_mask])):
-            #     ax[idx].imshow(im,cmap=plt.get_cmap('gist_gray'))
-            #     ax[idx].imshow(msk,alpha=0.2)
-            # plt.show(block=True)
+
             # Calculate shift by masked cross correlation with ordering (Y,X)
             detected_shift, xcorrmax = _masked_phase_cross_correlation(
                 tiles[i],
@@ -1179,13 +1778,6 @@ def cross_correlate_tiles(
         for island in islands:
             island_points = [positions[i] for i in island]
 
-            # fig,ax = plt.subplots()
-            # ax.plot(*np.asarray(island_points).T,'ro',label='island')
-            # for idx, (x, y) in enumerate(island_points):
-            #     ax.annotate(str(idx), (x, y), textcoords="Island points", xytext=(5, 5), ha='center', fontsize=8)
-            # ax.plot(*np.asarray(largest_island_points).T,'bo',label='Anchor')
-            # for idx, (x, y) in enumerate(largest_island_points):
-            #     ax.annotate(str(idx), (x, y), textcoords="Anchor island points", xytext=(5, 5), ha='center', fontsize=8)
 
             i, j = find_closest_points_with_kdtree(island_points, largest_island_points)
 
@@ -1195,9 +1787,7 @@ def cross_correlate_tiles(
             x1 = positions[j]
             x2 = positions[i]
             delta = x1 - x2
-            # ax.plot([x1[0],x2[0]],[x1[1],x2[1]],'k-',label='connector')
-            # fig.legend()
-            # plt.show(block=True)
+
             # Loop over x and y components
             for jj in range(2):
                 # Make new row to add to A matrix
@@ -1239,95 +1829,3 @@ def cross_correlate_tiles(
     if show:
         plt.show(block=True)
     return newpositions, xcorr, deltas
-
-
-def plot_individual_cross_correlation(
-    images, masks, positions, overlaps, pixel_size, filename_template=None
-):
-    """
-    Generate a plot showing the two masks and the final aligned images for each pair of overlapping tiles.
-
-    Parameters:
-    -----------
-    images : list of numpy.ndarray
-        List of image tiles.
-    masks : list of numpy.ndarray
-        List of binary masks corresponding to the image tiles.
-    positions : numpy.ndarray
-        Array of shape (N, 2) containing the (x, y) coordinates for positioning each image in units of microns.
-    overlaps : list of tuples
-        List of pairs of indices representing which tiles overlap and should be aligned.
-    pixel_size : float
-        The pixel size in microns.
-    binning : int, optional
-        Binning factor to reduce the image size. Default is 1.
-
-    Returns:
-    --------
-    None
-    """
-    pixels = images[0].shape
-
-    for i, j in overlaps:
-        x1 = positions[i]
-        x2 = positions[j]
-
-        dx = [int(x) for x in (x2 - x1) / pixel_size * 1e4][::-1]
-        print(dx)
-        i1, i2 = array_overlap(dx[0], pixels[0])
-        j1, j2 = array_overlap(dx[1], pixels[1])
-        print(i1, i2, j1, j2)
-        reference_mask = np.zeros_like(masks[i], dtype=bool)
-        reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = masks[i][
-            i1[0] : i1[1], j1[0] : j1[1]
-        ]
-        moving_mask = np.zeros_like(masks[j], dtype=bool)
-        moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = masks[j][
-            i2[0] : i2[1], j2[0] : j2[1]
-        ]
-
-        detected_shift, _ = _masked_phase_cross_correlation(
-            images[i], images[j], reference_mask=reference_mask, moving_mask=moving_mask
-        )
-
-        fig = plt.figure(figsize=(8, 12))
-        axes = fig.subplot_mosaic([["Image1", "Image2"], ["Stitched", "Stitched"]])
-        gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 2], hspace=0.3)
-
-        axes["Image1"].imshow(images[i], cmap="gray")
-        axes["Image1"].imshow(reference_mask, alpha=0.5, cmap="Reds")
-        axes["Image1"].set_title(f"Image {i} with Mask")
-
-        axes["Image2"].imshow(images[j], cmap="gray")
-        axes["Image2"].imshow(moving_mask, alpha=0.5, cmap="Reds")
-        axes["Image2"].set_title(f"Image {j} with Mask")
-        print(
-            [positions[i], positions[i] + detected_shift * pixel_size * 1e-4],
-            detected_shift,
-        )
-        aligned_image = stitch(
-            [images[i], images[j]],
-            [positions[i], positions[i] + detected_shift[::-1] * pixel_size * 1e-4],
-            [masks[i], masks[j]],
-            pixel_size,
-        )
-        # aligned_image = np.roll(images[j], shift=(-int(detected_shift[0]), -int(detected_shift[1])), axis=(0, 1))
-        # axes[1, 0].imshow(images[i], cmap='gray')
-        # axes[1, 0].set_title(f"Image {i}")
-
-        axes["Stitched"].imshow(
-            aligned_image,
-            vmin=np.percentile(aligned_image, 10),
-            vmax=np.percentile(aligned_image, 90),
-            cmap="gray",
-        )
-        axes["Stitched"].set_title(f"Aligned Image {j}")
-
-        for a in axes.values():
-            a.axis("off")
-
-        if filename_template is not None:
-            fig.savefig(filename_template.format(i, j))
-        else:
-            plt.tight_layout()
-            plt.show()

@@ -109,14 +109,17 @@ if __name__ == "__main__":
             file.write(f"{tilt}\n")
 
     outputfile = os.path.join(outputdir, "tilt_series.mrc")
-    command = "newstack -tilt {0} {1} {2} ".format(
-        tilt_file, " ".join(cropped_names), outputfile
+    # command = "newstack -tilt {0} {1} {2} ".format(
+    #     tilt_file, " ".join(cropped_names), outputfile
+    # )
+    command = "newstack {0} {1} ".format(
+        " ".join(cropped_names), outputfile
     )
     print(command)
     os.system(command)
 
     # Delete intermediates
-    for mrcname in cropped_names:
-        print("Removing {0} and {0}~".format(mrcname))
-        os.system("rm {0}".format(mrcname))
-        os.system("rm {0}~".format(mrcname))
+    # for mrcname in cropped_names:
+    #     print("Removing {0} and {0}~".format(mrcname))
+    #     os.system("rm {0}".format(mrcname))
+    #     os.system("rm {0}~".format(mrcname))
