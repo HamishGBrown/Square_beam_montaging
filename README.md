@@ -2,136 +2,138 @@ Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montage
 
 # Install
 
-Download Github repo
-
-```git clone https://github.com/HamishGBrown/Square_beam_montaging.git```
-
-Install 
-
 ```
+git clone https://github.com/HamishGBrown/Square_beam_montaging.git
 cd Square_beam_montaging
 pip install -e .
 ```
 
-# Setting up the coordinates for a montage
+# Overview
 
-```
-$ python Generate_Image_shifts_for_Montage.py -h
+The full pipeline for montage tomography is:
 
-usage: Generate_Image_shifts_for_Montage.py [-h] -tr TILTAXISROTATION [-ts TILTSTEP] -tm
-                                            MAXTILT [-tg DOSESYMMETRICTILTGROUP] -p
-                                            PIXELSIZE -n CAMERAPIXELS CAMERAPIXELS -M
-                                            MONTAGETILES MONTAGETILES
-                                            [-ov MONTAGEOVERLAP MONTAGEOVERLAP]
-                                            [-o OUTPUT] [-plt]
+1. **Acquisition** — collect montage tilt series in SerialEM
+2. **Motion correction** — align raw frames per tile (`beam_mask_motioncorr`)
+3. **Stitching** — assemble tiles into full montage tilt series (`stitch_square_beam`)
+4. **Masking & inpainting** — isolate lamella signal and fill background (`mask_and_inpaint`)
+5. **Reconstruction** — tomogram reconstruction in IMOD or AreTomo2/3
 
-Stitch square beam montage tomography data.
+# Step 1: Collect in SerialEM
 
-optional arguments:
-  -h, --help            show this help message and exit
-  -tr TILTAXISROTATION, --tiltaxisrotation TILTAXISROTATION
-                        Rotation between tilt axis and camera axes (required)
-  -ts TILTSTEP, --tiltstep TILTSTEP
-                        Step of tomography tilt series in degrees (3 by default)
-  -tm MAXTILT, --maxtilt MAXTILT
-                        Maximum tilt in tilt series (required)
-  -tg DOSESYMMETRICTILTGROUP, --dosesymmetrictiltgroup DOSESYMMETRICTILTGROUP
-                        Number of tilts in dose-symmetric tilt group (3 by default)
-  -p PIXELSIZE, --pixelsize PIXELSIZE
-                        Pixel size of camera in Angstrom (required)
-  -n CAMERAPIXELS CAMERAPIXELS, --camerapixels CAMERAPIXELS CAMERAPIXELS
-                        Detector size in pixels (required)
-  -M MONTAGETILES MONTAGETILES, --montagetiles MONTAGETILES MONTAGETILES
-                        Number of tiles in montage (required)
-  -ov MONTAGEOVERLAP MONTAGEOVERLAP, --montageoverlap MONTAGEOVERLAP MONTAGEOVERLAP
-                        Montage overlap factor (1/overlap fraction), default 10
-  -o OUTPUT, --output OUTPUT
-                        Output basename (default Imageshifts)
-  -plt, --plot          Plot imageshifts (default True)
+Full details are in `Montage tomography SOP.docx`. In brief:
 
-```
+1. In low-dose mode, acquire Navigator maps of your lamellae using the View preset. Avoid low mag due to image shifts between magnifications.
+2. Away from any area of interest, run the DeterminOverlapFraction.txt to work out optimal beam overlap (aim for 10% in each direction), copy the values for beam rotation and overlap into the setupPolygonMontage.txt script.
+2. Draw navigator polygons around each of the items to acquire.
+3. Using the SerialEM "Acquire at items" feature, acquire viewmag images of each of the items of interest, tick the box to make navigator maps and set  the "SetupPolygonMontage.txt" script to run after each acquisition. Check that 'Imageshift*.txt" files have been generated for each navigator item.
+3. Set each of the new view image maps to acquire and run `acquire_montage.txt` at those points using the SerialEM "Acquire at items" feature.
+4. SerialEM collects one multi-frame TIFF per tile per tilt angle, saving them alongside a `.mdoc` metadata file.
 
-eg. to create a 4 x 3 montage with a K3 (4092 x 5760 pixels) at 50 kx magnfication (1.56 Å pixel size on our instrument) and a dose-symmetric tilt series between -60 and 60 with a step size of 3° and alternatig betwen positive and negative tilts every 3 tilt series. Use the following command:
-
-```
-$ python Generate_Image_shifts_for_Montage.py  -tr -96.7 -ts 3.0 -tm 60 -tg 3 -p 1.56 -n 4092 5760 -M 4 3 -o Imageshifts --plot
-41 tilts between -60.0 and 60.0 in steps of 3.0
-```
-
-Which (optionally) generates the following plot
-
-![image](https://github.com/user-attachments/assets/b4e5e8cc-04e5-46b0-974e-74dc991f787d)
-
-And a text file ```Imageshifts.txt``` which Serial-EM will read, transfer this to the Serial-EM computer
-
-# Running Serial-EM
-
-In low-dose mode create some nav points maps using the view preset and run the ```acquire_montage.txt``` script at these points using the "Acquire at items" feature of Serial-EM, the output for a single tilt will look like this:
+A single tilt's acquisition looks like this:
 
 ![image](https://github.com/HamishGBrown/Square_beam_montaging/blob/main/SingleMontage.gif)
 
-# Stitching montages
+---
 
-Use the python script ```stitch.py``` to stitch images in montage:
+# Step 3: Motion correction
 
-```
-$ python stitch.py -h
-
-usage: stitch.py [-h] -i INPUT [-o OUTPUT] -I IMAGE_SHIFTS [-g GAINREF] [-b BINNING]
-                 [-f FRINGE_SIZE] [-s] [-t TILTAXISROTATION]
-
-Stitch square beam montage tomography data.
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -i INPUT, --input INPUT
-                        *.mrc wildcard for raw data
-  -o OUTPUT, --output OUTPUT
-                        Output directory, if left blank output will be placed in a
-                        folder named ./[input_filename]_output
-  -I IMAGE_SHIFTS, --image_shifts IMAGE_SHIFTS
-                        Path to text file containing the tilts and a list of image
-                        shifts at every tilt (requried).
-  -g GAINREF, --gainref GAINREF
-                        Gain reference, if left blank a new gain reference will be
-                        calculated and saved in the output directory
-  -b BINNING, --binning BINNING
-                        Binning of input data, defaults to 1
-  -f FRINGE_SIZE, --fringe_size FRINGE_SIZE
-                        Size of Fresnel fringes at edge of beam, this will be removed
-                        from the gain reference (default 20).
-  -s, --skipcrosscorrelation
-                        Skip cross-correlation alignment of montage tiles and default to
-                        using imageshifts to stitch montage.
-  -t TILTAXISROTATION, --tiltaxisrotation TILTAXISROTATION
-                        Rotation of tilt axis relative to image, if not provided will
-                        take from .mdoc file.
-```
-
-For example:
+Raw frames from each tile are motion-corrected using `beam_mask_motioncorr`, which auto-detects the square beam boundary to restrict motion estimation to the illuminated area, then applies the derived shifts to the full detector frame so that downstream stitching is unaffected.
 
 ```
-$ python stitch.py -i  "/home/hbrown/Mount/KriosFalcon4/Brown/20240826_montaging/Montagingtest1_*.mrc" -b 4 -I Krios_imageshifts.txt  -t -3
+beam_mask_motioncorr \
+    --input "/data/frames/*.tif" \
+    --output-dir ./motioncorr \
+    --pixel-size 1.56 \
+    --gpu 0
 ```
 
-After this you will need to the ```Crop_to_smallest_common_size.py``` script to join all the montages into a single mrc for IMOD
+Key arguments:
+- `--input` — glob pattern or list of multi-frame TIFF files
+- `--output-dir` — where to write the motion-corrected MRCs
+- `--pixel-size` — pixel size in Å
+- `--mask-threshold` / `--mask-shrink` — tune beam detection if the default fails (use `choose_mask_params` to find values interactively)
+- `--save-diagnostic` — save a PNG showing the detected beam mask and crop region for each tile
+- `--split-frames` — also write odd/even frame sums to `output-dir/odd/` and `output-dir/even/` for cryoCARE denoising
+
+For large datasets, generate and submit a SLURM array job:
 
 ```
-$ python Crop_to_smallest_common_size.py -h
-usage: Crop_to_smallest_common_size.py [-h] -i INPUT [-o OUTPUT]
-
-Join Montage tiff files into single mrc for IMOD, filling blank areas in montage.
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -i INPUT, --input INPUT
-                        Directory containing stitched montage tilt series tiff files
-  -o OUTPUT, --output OUTPUT
-                        Output directory, if not supplied, output will be placed in same
-                        directory as input
-
+beam_mask_motioncorr --input "/data/frames/*.tif" --output-dir ./motioncorr \
+    --pixel-size 1.56 --print-slurm > mc2_job.sh
+sbatch mc2_job.sh
 ```
 
-Produces the following output (after rough alignment in IMOD):
+---
 
-![image](https://github.com/HamishGBrown/Square_beam_montaging/blob/main/tilt_series_preali.gif)
+# Step 4: Stitch montage tilt series
+
+Assemble the per-tile motion-corrected MRCs into a single montage tilt series per tilt angle, then join all tilts into one MRC stack:
+
+```
+stitch_square_beam \
+    -i ./motioncorr \
+    -I Imageshifts.txt \
+    -o ./stitched \
+    --mark-uncovered
+```
+
+Key arguments:
+- `-i` — directory of per-tile MRCs from `beam_mask_motioncorr`, or a glob of per-tilt MRC stacks
+- `-I` — image shifts file from `generate_image_shifts`
+- `-o` — output directory
+- `-g` — gain reference (omit to skip gain correction, e.g. if already applied during motion correction)
+- `-s` — skip cross-correlation refinement of tile positions and use image shifts directly
+- `--mark-uncovered` — mark regions with no tile coverage with pixel value −1 rather than inpainting them; **recommended** when the output will be processed by `mask_and_inpaint`, which detects this sentinel automatically
+- `-nt` — number of threads for parallel stitching
+- `--correct-beam-edges` — correct plasmon-scattering darkening at beam edges (requires `--templatemask`)
+
+Then join all the per-tilt stitched images into a single MRC tilt series for reconstruction:
+
+```
+crop_to_smallest_common_size -i ./stitched -o ./stitched_stack
+```
+
+This crops all tilt images to the smallest common size (accounting for changes in montage field of view with tilt angle) and writes a single `.mrc` stack.
+
+---
+
+# Step 5: Mask and inpaint
+
+The stitched montage contains background vacuum and thick regions outside the lamella, which degrade alignment and reconstruction. `mask_and_inpaint` provides an interactive GUI to define the lamella intensity window and inpaint everything outside it.
+
+```
+mask_and_inpaint Montage_stitched.mrc -o Montage_inpainted.mrc
+```
+
+In the GUI:
+1. **Click on the histogram peak** corresponding to the lamella (the main bright peak in the electron image). The tool fits a Gaussian to that peak and propagates the fit across all tilts, tracking the tilt-angle-dependent intensity drift automatically.
+2. Use the **N sigma** slider to widen or narrow the kept intensity window.
+3. Toggle **Smooth µ** to stabilise the peak fits at high tilts where the signal weakens.
+4. Use **Manual** mode to override the threshold for individual tilts where the automatic fit fails.
+5. Click **Generate Output** to inpaint all masked regions using smooth interpolation and write the output MRC.
+
+For large tilt series, use **Save SLURM Job** to write a batch script that applies the fitted parameters in parallel, then submit it:
+
+```
+sbatch Montage_stitched_inpaint_slurm.sh
+```
+
+---
+
+# Step 6: Reconstruction
+
+The inpainted tilt series `Montage_inpainted.mrc` is ready for standard tomographic reconstruction.
+
+**IMOD:** Import into etomo or use `tilt` directly after alignment with `tiltalign`. The montage tilt series is large so consider binning during reconstruction.
+
+**AreTomo2/3:** Use AreTomo3 for alignment (produces a `.aln` file) then AreTomo2 to apply the alignment and reconstruct. Because the montage tilt series is too large for a single GPU reconstruction, split the aligned tilt stack into horizontal strips and reconstruct each independently — the tilt axis will be along Y after alignment so each strip is self-contained.
+
+SLURM submission script templates for each step of the pipeline are provided in [`slurm_templates/`](slurm_templates/). Edit the `EDIT_ME` placeholders at the top of each script for your paths and parameters:
+
+| Script | Purpose |
+|---|---|
+| `01_motion_correction.sh` | Array job: motion-correct one TIFF per task |
+| `02_stitch.sh` | Stitch tiles into a tilt series MRC stack |
+| `03_inpaint_apply.sh` | Apply inpainting params (generated by `mask_and_inpaint` GUI) |
+| `04_aretomo3_aln_aretomo2_ali.sh` | AreTomo3 alignment + AreTomo2 aligned stack |
+| `05_aretomo2_strip_recon.sh` | Array job: reconstruct one horizontal strip per task |

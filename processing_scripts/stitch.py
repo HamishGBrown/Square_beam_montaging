@@ -24,6 +24,76 @@ from .smoothn import smoothn
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Per-tile MRC directory support
+# ---------------------------------------------------------------------------
+
+# Matches filenames like  Name_003_-12.0.mrc  →  groups (tile_idx, tilt_angle)
+_TILE_FNAME_RE = re.compile(r"^.+_(\d+)_(-?\d+\.?\d*)\.mrc$")
+
+
+class TileStack:
+    """Read-only adapter that presents a list of per-tile MRC files as a
+    virtual (N, H, W) stack, duck-typing the ``tiles`` interface
+    expected by :func:`montage`.
+
+    Supports integer indexing, boolean-mask indexing (returns a list), and
+    the ``.dtype`` / ``.shape`` attributes used by :func:`montage`.
+    """
+
+    def __init__(self, paths: list) -> None:
+        self._paths = paths
+        with mrcfile.mmap(paths[0], mode="r", permissive=True) as m:
+            self.dtype = m.data.dtype
+            self.shape = (len(paths),) + tuple(m.data.shape[-2:])
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, (int, np.integer)):
+            with mrcfile.mmap(self._paths[int(idx)], mode="r", permissive=True) as m:
+                return np.asarray(m.data)
+        # bool mask or index array → list, compatible with executor.map
+        if isinstance(idx, np.ndarray) and idx.dtype == bool:
+            indices = np.where(idx)[0]
+        else:
+            indices = np.asarray(idx, dtype=int)
+        return [self[i] for i in indices]
+
+
+def _group_per_tile_mrcs(directory: str):
+    """Group per-tile MRC files from a motioncorr output directory by tilt angle.
+
+    Expects filenames of the form ``{name}_{tile_index}_{tilt_angle}.mrc``
+    (the naming convention produced by ``beam_mask_motioncorr``).
+
+    Returns
+    -------
+    sorted_tilts : list of float
+    tile_paths   : dict mapping tilt_angle → list of paths sorted by tile index
+    """
+    groups: dict = {}
+    for path in glob.glob(os.path.join(directory, "*.mrc")):
+        m = _TILE_FNAME_RE.match(os.path.basename(path))
+        if not m:
+            continue
+        tile_idx = int(m.group(1))
+        tilt = float(m.group(2))
+        if tilt == -0.0:
+            tilt = 0.0
+        groups.setdefault(tilt, []).append((tile_idx, path))
+
+    sorted_tilts = sorted(groups)
+    tile_paths = {t: [p for _, p in sorted(groups[t])] for t in sorted_tilts}
+    return sorted_tilts, tile_paths
+
+
+def _first_tile_shape(file_or_stack):
+    """Return (H, W) of the first tile from either an MRC stack path or a TileStack."""
+    if isinstance(file_or_stack, str):
+        return mrcfile.mmap(file_or_stack).data.shape[-2:]
+    return file_or_stack.shape[-2:]
 
 
 
@@ -35,7 +105,16 @@ def parse_commandline() -> Dict[str, Any]:
         description="Stitch square beam montage tomography data."
     )
     parser.add_argument(
-        "-i", "--input", help="*.mrc wildcard for raw data", required=True, type=str
+        "-i", "--input",
+        help="Either a glob pattern matching per-tilt MRC stacks (e.g. '*.mrc'), "
+             "or a directory of per-tile MRC files produced by beam_mask_motioncorr "
+             "(files named {stem}_{tile_index}_{tilt_angle}.mrc).",
+        required=True, type=str,
+    )
+    parser.add_argument(
+        "--pixel-size", dest="pixel_size", type=float, default=None,
+        help="Pixel size in Ångström. Required when --input is a directory and the "
+             "MRC voxel_size header is not set; otherwise read from the mdoc or MRC header.",
     )
     parser.add_argument(
         "-o",
@@ -553,20 +632,20 @@ def montage(
             gainref is not None
         ), "Gain reference must be provided if Matchgainrefmask is True"
 
-    # Load images as mrc memory map
-    mrcmemmap = mrcfile.mrcmemmap.MrcMemmap(image)
+    # Load tile data: accept either an MRC stack path or a TileStack adapter.
+    tiles = mrcfile.mrcmemmap.MrcMemmap(image).data if isinstance(image, str) else image
 
     # Get the shape and data type of the montage tiles
-    dtype = mrcmemmap.data.dtype
-    pixels = np.asarray([x // binning for x in mrcmemmap.data.shape[-2:]], dtype=int)
+    dtype = tiles.dtype
+    pixels = np.asarray([x // binning for x in tiles.shape[-2:]], dtype=int)
 
     # M is the slice object describing the indices of the tiles to include
     # in the montage, if None is passed for tiles then all tiles are included
     # by default.
     if tiles is None:
-        M = np.ones(len(mrcmemmap.data), dtype=bool)
+        M = np.ones(len(tiles), dtype=bool)
     elif isinstance(tiles, slice):
-        M = np.zeros(len(mrcmemmap.data), dtype=bool)
+        M = np.zeros(len(tiles), dtype=bool)
         M[tiles] = True
     else:
         M = tiles  # assumes tiles is already a bool/index array
@@ -588,7 +667,7 @@ def montage(
                 "falling back to tile 0 as the beam reference."
             )
         logger.debug("No template mask provided — using tile 0 as template")
-        template_mask = np.asarray(mrcmemmap.data[0])
+        template_mask = np.asarray(tiles[0])
 
     # Keep the raw (non-binary) template as the beam reference for plasmon correction.
     raw_template = np.asarray(template_mask, dtype=float)
@@ -623,7 +702,7 @@ def montage(
 
     if ref_tile_idx is not None and correct_beam_edges:
         logger.info(f"Fitting plasmon parameters on reference tile {ref_tile_idx} ...")
-        _ref_img = np.asarray(mrcmemmap.data[ref_tile_idx]).copy()
+        _ref_img = np.asarray(tiles[ref_tile_idx]).copy()
         if binning > 1:
             _ref_img = fourier_interpolate(_ref_img, [x // binning for x in _ref_img.shape])
         _ref_mask = make_mask(
@@ -703,7 +782,7 @@ def montage(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(
             tqdm(
-                executor.map(_process_tile, mrcmemmap.data[M]),
+                executor.map(_process_tile, tiles[M]),
                 total=len(positions[M]),
                 desc="Making masks",
                 disable=_quiet,
@@ -711,7 +790,7 @@ def montage(
         )
     # Single threaded implementation for testing/debugging
     # results = []
-    # for tile in mrcmemmap.data[M]:
+    # for tile in tiles[M]:
     #     result = _process_tile(tile)
     #     results.append(result)
 
@@ -1649,52 +1728,73 @@ def main():
     # Binning constant
     binning = int(args["binning"])
 
-    files = glob.glob(args["input"])
-    if len(files) < 1:
-        raise FileNotFoundError("No files matching {0}".format(args["input"]))
-    logger.debug("Found %d MRC file(s) matching '%s'", len(files), args["input"])
-    mdoc_files = [x.replace(".mrc", ".mrc.mdoc") for x in files]
-
-    # Get pixel size, tilt axis rotation from first mdoc file
-    mdoc = parse_mdoc(mdoc_files[0])
-    pixelsize = float(mdoc["PixelSpacing"])
-    logger.debug("Pixel size: %.4f Å  |  binning: %d  |  effective pixel size: %.4f Å",
-                 pixelsize, binning, pixelsize * binning)
-
-    # get tilts and image shifts from all mdoc files
-    tilts, indices = [[], []]
     imageshifts = parse_image_shifts(
         args["image_shifts"], superres=args["correctimageshiftfilefactor"]
     )
-    for mdoc in mdoc_files:
-        m = parse_mdoc(mdoc)
 
-        # Get the tilt from the mdoc file entries
-        tilts.append(float(m["ZValue = 0"]["TiltAngle"]))
+    if os.path.isdir(args["input"]):
+        # ── Directory of per-tile MRC files from beam_mask_motioncorr ──────────
+        # Files named  {stem}_{tile_index}_{tilt_angle}.mrc  are grouped by tilt.
+        tilts, _tile_paths = _group_per_tile_mrcs(args["input"])
+        if not tilts:
+            raise FileNotFoundError(
+                "No per-tile MRC files matching the expected naming pattern "
+                f"found in directory: {args['input']}"
+            )
+        files = [TileStack(_tile_paths[t]) for t in tilts]
+        logger.debug(
+            "Directory input: %d tilt(s), %d tile(s) each",
+            len(tilts), len(files[0]),
+        )
 
-        # Get all dictionary entries that don't match 'ZValue = [0-9]*' pattern (header) and those that do (content)
-        non_zvalue_entries = {k: v for k, v in m.items() if not re.match(r'ZValue = \d+', k)}
-        zvalue_entries = {k: v for k, v in m.items() if re.match(r'ZValue = \d+', k)}
-                
-        # Combine common mdoc entries for each image shift
-        outputmdoc = combine_dicts(list(zvalue_entries.values()))
-        #Force some entries to remain (if present in original mdoc)
-        Mandatorykeys = ['StagePosition','DateTime','SubFramePath']
-        # Get keys in input mdoc
-        m_z0 = m.get('ZValue = 0', {})
-        # Prune Mandatorykeys not present in original mdoc
-        MandatoryEntries = {k: m_z0[k] for k in Mandatorykeys if k in m_z0}
-        ## QUICKFIX
+        # Pixel size: prefer explicit --pixel-size, then MRC voxel_size header
+        if args["pixel_size"] is not None:
+            pixelsize = args["pixel_size"]
+        else:
+            with mrcfile.mmap(_tile_paths[tilts[0]][0], mode="r", permissive=True) as _m:
+                pixelsize = float(_m.voxel_size.x)
+            if pixelsize == 0.0:
+                raise ValueError(
+                    "MRC voxel_size is not set; provide --pixel-size explicitly."
+                )
+        logger.debug("Pixel size: %.4f Å  |  binning: %d  |  effective: %.4f Å",
+                     pixelsize, binning, pixelsize * binning)
+        indices = [str(i) for i in range(len(tilts))]
 
-        # MandatoryEntries['pre_exposure_dose'] = 2.5* tilts[-1] /3 *2
-        outputmdoc = {**outputmdoc,**MandatoryEntries}
-        outputmdocfnam = os.path.join(outdir,os.path.split(mdoc.replace('.mrc.mdoc','.tif.mdoc'))[1])
-        write_mdoc({**non_zvalue_entries,**{'ZValue = 0':outputmdoc}},outputmdocfnam)
+    else:
+        # ── Glob of per-tilt MRC stacks (original path) ─────────────────────────
+        files = glob.glob(args["input"])
+        if len(files) < 1:
+            raise FileNotFoundError("No files matching {0}".format(args["input"]))
+        logger.debug("Found %d MRC file(s) matching '%s'", len(files), args["input"])
+        mdoc_files = [x.replace(".mrc", ".mrc.mdoc") for x in files]
 
-        # Split the string at '.mrc' and then find the integer before 'mrc'
-        split_filename = mdoc.split(".mrc")[0]
-        index = split_filename.split("_")[-1]
-        indices.append(index)
+        # Get pixel size, tilt axis rotation from first mdoc file
+        mdoc = parse_mdoc(mdoc_files[0])
+        pixelsize = args["pixel_size"] or float(mdoc["PixelSpacing"])
+        logger.debug("Pixel size: %.4f Å  |  binning: %d  |  effective pixel size: %.4f Å",
+                     pixelsize, binning, pixelsize * binning)
+
+        # Get tilts and write output mdoc files
+        tilts, indices = [], []
+        for mdoc in mdoc_files:
+            m = parse_mdoc(mdoc)
+            tilts.append(float(m["ZValue = 0"]["TiltAngle"]))
+
+            non_zvalue_entries = {k: v for k, v in m.items() if not re.match(r'ZValue = \d+', k)}
+            zvalue_entries = {k: v for k, v in m.items() if re.match(r'ZValue = \d+', k)}
+            outputmdoc = combine_dicts(list(zvalue_entries.values()))
+            Mandatorykeys = ['StagePosition', 'DateTime', 'SubFramePath']
+            m_z0 = m.get('ZValue = 0', {})
+            MandatoryEntries = {k: m_z0[k] for k in Mandatorykeys if k in m_z0}
+            outputmdoc = {**outputmdoc, **MandatoryEntries}
+            outputmdocfnam = os.path.join(
+                outdir, os.path.split(mdoc.replace('.mrc.mdoc', '.tif.mdoc'))[1]
+            )
+            write_mdoc({**non_zvalue_entries, **{'ZValue = 0': outputmdoc}}, outputmdocfnam)
+
+            split_filename = mdoc.split(".mrc")[0]
+            indices.append(split_filename.split("_")[-1])
 
 
     # Get image shifts from file
@@ -1712,7 +1812,7 @@ def main():
         mask = np.ones(reshapedimshifts.shape[0], dtype=bool)
     
     if args['ROI'] is None:
-        tileFOV = pixelsize*np.asarray(mrcfile.mmap(files[0]).data.shape[1:])
+        tileFOV = pixelsize * np.asarray(_first_tile_shape(files[0]))
         # Global range of tiles in Angstroms
         globalwidth = np.ptp(reshapedimshifts[mask], axis=0)+tileFOV
         globalorigin = np.amin(reshapedimshifts[mask], axis=0)#+tileFOV
@@ -1765,9 +1865,7 @@ def main():
                 with mrcfile.open(args["gainref"], "r+") as m:
                     gainref = np.asarray(m.data)
                 # Check gain reference data size mismatch and interpolate if necessary
-                imageshape = (
-                    np.asarray(mrcfile.mmap(files[0]).data.shape[1:]) // binning
-                )
+                imageshape = np.asarray(_first_tile_shape(files[0])) // binning
                 gainrefshape = np.asarray(gainref.shape)
                 if np.any(gainrefshape != imageshape):
                     logger.warning(
