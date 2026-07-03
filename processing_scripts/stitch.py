@@ -4,7 +4,6 @@ import networkx as nx
 from tqdm import tqdm
 from PIL import Image
 import os
-from scipy.ndimage import binary_fill_holes, binary_erosion
 
 from skimage.registration import phase_cross_correlation
 
@@ -20,6 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 from .Utilities import *
 from .smoothn import smoothn
+
+try:
+    from .beam_mask_motioncorr import _create_stack_locked
+except ImportError:
+    from beam_mask_motioncorr import _create_stack_locked
 
 logger = logging.getLogger(__name__)
 
@@ -113,15 +117,39 @@ def parse_commandline() -> Dict[str, Any]:
     )
     parser.add_argument(
         "--pixel-size", dest="pixel_size", type=float, default=None,
-        help="Pixel size in Ångström. Required when --input is a directory and the "
-             "MRC voxel_size header is not set; otherwise read from the mdoc or MRC header.",
+        help="Pixel size in Ångström. If omitted, read from the input MRC's "
+             "voxel_size header.",
     )
     parser.add_argument(
         "-o",
         "--output",
-        help="Output directory, if left blank output will be placed in a folder named ./[input_filename]_output",
+        help="Where to write stitched output. Three forms are accepted: "
+             "(1) omitted, or a directory — the current per-tilt TIFF (lzw) "
+             "behaviour, placed in ./[input_filename]_output if omitted; "
+             "(2) 'path/to/stack.mrc:N' — write directly into z-slice N of a "
+             "shared memory-mapped MRC stack at that path (created on first "
+             "use, flock-guarded, safe to call concurrently), skipping the "
+             "separate JointoMRC.py join step entirely; sets --tilt-index to "
+             "N unless --tilt-index is also given; (3) 'path/to/stack.mrc' "
+             "(no ':N') — write a single stitched TIFF, with the extension "
+             "forced to '.tiff', instead of treating the path as a directory. "
+             "Forms (2) and (3) require exactly one discovered tilt (use "
+             "--tilt-index, or the ':N' suffix, to select it).",
         required=False,
         type=str,
+    )
+    parser.add_argument(
+        "--tilt-index",
+        dest="tilt_index",
+        help="Restrict this invocation to stitching only the tilt at this "
+             "0-based rank (tilt angles sorted ascending) instead of the "
+             "whole series — pairs with --output pointing at an MRC stack to "
+             "run one SLURM array task per tilt, each writing only its own "
+             "slice. If omitted, every discovered tilt is stitched, as "
+             "before. Overrides any ':N' suffix on --output.",
+        type=int,
+        default=None,
+        required=False,
     )
     parser.add_argument(
         "-I",
@@ -131,19 +159,24 @@ def parse_commandline() -> Dict[str, Any]:
         type=str,
     )
     parser.add_argument(
-        "-g",
-        "--gainref",
-        help="Gain reference file path. If left blank or 'False', no gain reference will be calculated or applied.",
-        required=False,
-        type=str,
-    )
-    parser.add_argument(
         "-b",
         "--binning",
         help="Binning of input data, defaults to 1",
         required=False,
         type=int,
         default=1,
+    )
+    parser.add_argument(
+        "--rotate",
+        help="Rotate every input tile (and template mask) counter-clockwise "
+             "by this many degrees before masking/alignment/stitching. Must "
+             "be a multiple of 90. Useful when the camera's row/col axes are "
+             "rotated relative to the stage x/y axes assumed by the image "
+             "shift file. Default 0 (no rotation).",
+        required=False,
+        type=int,
+        choices=[0, 90, 180, 270],
+        default=0,
     )
     parser.add_argument(
         "-f",
@@ -158,27 +191,6 @@ def parse_commandline() -> Dict[str, Any]:
         "--skipcrosscorrelation",
         help="Skip cross-correlation alignment of montage tiles and default to using imageshifts to stitch montage.",
         action="store_true",
-    )
-    parser.add_argument(
-        "-t",
-        "--tiltaxisrotation",
-        help="Rotation of tilt axis relative to image, if not provided will take from .mdoc file.",
-        type=float,
-        required=False,
-    )
-    parser.add_argument(
-        "-G",
-        "--gain_corrected_files",
-        help="The program will write the files with the gain correction applied to an mrc. Use this option to re-use already gain corrected files and save time.",
-        type=str,
-        required=False,
-    )
-    parser.add_argument(
-        "-M",
-        "--maximageshift",
-        help="Limit the size of the total montage by excluding images in montage with image shift in microns greater than this value.",
-        type=float,
-        required=False,
     )
     parser.add_argument(
         "-m",
@@ -198,13 +210,6 @@ def parse_commandline() -> Dict[str, Any]:
         required=False,
     )
     parser.add_argument(
-        "-mg",
-        "--Matchgainrefmask",
-        help="If True, a mask will be generated for each tile by cross-correlation alignment of the gain reference mask to each tile. If False, a mask will be generated for each tile.",
-        action="store_true",
-    )
-
-    parser.add_argument(
         "-mt",
         "--maskthreshold",
         help="threshold (as fraction of raw image median) for masking of beam.",
@@ -220,13 +225,6 @@ def parse_commandline() -> Dict[str, Any]:
         type=float,
         default=None,
         required=False,
-    )
-
-    parser.add_argument(
-        "-fb",
-        "--flattenbeam",
-        help="If True, the beam will be flattened by subtracting a 2D polynomial fit to the beam.",
-        action="store_true",
     )
 
     parser.add_argument(
@@ -288,9 +286,9 @@ def parse_commandline() -> Dict[str, Any]:
 
     parser.add_argument(
         "--min_mean_intensity",
-        help="Tiles with a mean pixel value at or below this threshold are excluded from processing. Default is 20.",
+        help="Tiles with a mean pixel value at or below this threshold are excluded from processing. Default is 5.",
         type=float,
-        default=20,
+        default=5,
         required=False,
     )
 
@@ -344,83 +342,6 @@ def parse_commandline() -> Dict[str, Any]:
 
     return vars(parser.parse_args())
 
-
-def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None, medianthreshold=0.4, absolutethreshold=None):
-    """
-    Generate a gain reference image by averaging a series of input images.
-
-    This function processes a list of images to create a gain reference image.
-    The images are first binned to reduce their size, then aligned using cross-correlation,
-    and finally averaged together to produce the gain reference. The result is normalized
-    by the median value of the template region in the gain reference.
-
-    Parameters:
-    -----------
-    images : list of str
-        A list of file paths to the input images (in MRC format) that will be used to create the gain reference.
-    binning : int, optional
-        The factor by which the images are binned to reduce their size. Default is 8.
-    templateindex: int,optional
-        Which image to align all other images too.
-    maxnumber: int or None
-        Maximum number of frames that will be averaged to produce the gain reference.
-        If None, all available frames will be used.
-    Returns:
-    --------
-    numpy.ndarray
-        The resulting gain reference image, normalized by the median value of the template region.
-    """
-
-    def get_image_and_mask(img):
-        # Perform Fourier interpolation on the image to bin it
-        im = np.asarray(img)
-        im = fourier_interpolate(im, [x // binning for x in img.shape])
-
-        # Create a mask for the image
-        msk = make_mask(im, shrinkn=shrinkn / binning,medianthreshold=medianthreshold,absolutethreshold=absolutethreshold)
-        return im, msk
-
-    # Get target image
-    memmap = mrcfile.mrcmemmap.MrcMemmap(images[0])
-    img = memmap.data[templateindex]
-    im, msk = get_image_and_mask(img)
-    template = np.where(msk, 1, 0)  # Create the binary template mask
-    # Initialize the gain reference with the first image
-    gainref = copy.deepcopy(im)
-
-    # Weight will track the denominator for the averaging step later on
-    weight = np.ones_like(gainref)
-
-    count = 0
-
-    # Loop through each image file
-    for i, image in enumerate(tqdm(images, desc="Averaging images to gain ref")):
-        # Open the MRC file and read the image data
-        memmap = mrcfile.mrcmemmap.MrcMemmap(image)
-
-        for j, img in enumerate(tqdm(memmap.data, leave=False, desc="Frames in mrc")):
-            im, msk = get_image_and_mask(img)
-
-            # skip template image
-            if i == 0 and j == templateindex:
-                continue
-            else:
-                # Align images to the templatex
-                y, x = cross_correlate_alignment(
-                    template, np.where(msk, 1, 0), returncoords=True
-                )
-                gainref += roll_no_periodic(im, (-y, -x), axis=(-2, -1))
-                weight += roll_no_periodic(np.ones_like(im), (-y, -x), axis=(-2, -1))
-                count += 1
-            if maxnumber is not None:
-                if count >= maxnumber:
-                    break
-    gainref /= weight
-    # Normalize the gain reference by the median value of the template region
-    median = np.median(gainref[template == 1])
-    gainref /= median
-
-    return gainref
 
 
 def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorigin=None,smooth=True,nthreads=1,mark_uncovered=False):
@@ -540,20 +461,15 @@ def montage(
     positions,
     pixel_size,
     binning=8,
-    gainref=None,
-    gainrefmask=None,
     skipcrosscorrelation=False,
     montagewidth=None,
     montageorigin=None,
     tiles=None,
-    gaincorrectedfile=None,
     maxshift=0.05,
     fringe_size=20,
-    Matchgainrefmask=False,
     maskthreshold=0.4,
     maskabsolutethreshold=None,
-    flattenbeam=False,
-    nthreads = 1,
+    nthreads=1,
     positionfile=None,
     smooth=True,
     mark_uncovered=False,
@@ -562,13 +478,18 @@ def montage(
     correct_beam_edges=False,
     E_plasmon_eV=21.0,
     voltage_kV=300.0,
+    rotate=0,
+    output_mrc=None,
+    tilt_z_index=None,
+    n_tilts_total=None,
+    fileout_path=None,
 ):
     """
     Creates a montage image from a series of input images by aligning and stitching them together.
 
     This function takes a set of images, positions them according to provided coordinates,
     and aligns them based on mask images or generated masks. The images are then combined
-    into a single montage image, with optional gain reference correction.
+    into a single montage image.
 
     Parameters:
     -----------
@@ -583,10 +504,6 @@ def montage(
         The pixel size in Angstroms.
     binning : int, optional
         Binning factor to reduce the image size. Default is 8.
-    tiltaxisrotation : float, optional
-        Rotation angle of the tilt axis, used to correct the positions. Default is 0.
-    gainref : numpy.ndarray, optional
-        Gain reference image used to normalize the input images. Default is None.
     skipcrosscorrelation : bool, optional
         Skip masked cross correlation of tiles and rely on user provided tile positions
         (if supplied through positionfile kwarg) or raw image tilts (if no positionfile supplied)
@@ -599,14 +516,8 @@ def montage(
         series
     tiles : None or sliceobject, optional
         Slice object indicating tiles that will be stitched (mainly for testing purposes)
-    gaincorrectedimagefile : None or string,optional
-        Path to already gain corrected images, if not provided the program will generate
-        the gain corrected images and write them to a mrc file in the output directory.
     fringe_size : float, optional
-        Size of the fringe region in pixels for removal from gain reference. Default is 20.
-    Matchgainrefmask : bool, optional
-        If False, a mask will be generated for each tile. If True, masks will be generated
-        by cross correlation alignment of the gain reference mask to each tile. Default is None.
+        Size of the Fresnel fringe region excluded from the beam mask. Default is 20.
     medianthreshold : float, optional
         Threshold for (as a fraction of the median) for masking the image. Default is 0.4.
     positionfile : string, optional
@@ -621,34 +532,51 @@ def montage(
         Plasmon energy in eV for beam-edge correction. Default 21 eV.
     voltage_kV : float, optional
         Accelerating voltage in kV for beam-edge correction. Default 300 kV.
+    rotate : int, optional
+        Rotate every tile (and the template mask) counter-clockwise by this
+        many degrees before any further processing. Must be a multiple of
+        90. Default 0 (no rotation).
+    output_mrc : str or None, optional
+        When given, write the stitched canvas into z-slice ``tilt_z_index``
+        of a shared memory-mapped MRC stack at this path (created under a
+        file lock on first use), instead of only writing the per-tilt TIFF.
+        Requires ``tilt_z_index`` and ``n_tilts_total`` to also be given.
+    tilt_z_index : int or None, optional
+        0-based z-slice this tilt occupies in ``output_mrc``.
+    n_tilts_total : int or None, optional
+        Total number of tilts in the series — sizes ``output_mrc`` on creation.
+    fileout_path : str or None, optional
+        Explicit path for the stitched TIFF, overriding the default
+        ``outdir/<image>.tif`` naming. Ignored when ``output_mrc`` is given
+        (the TIFF is skipped entirely in that case).
     Returns:
     --------
     numpy.ndarray
         The resulting stitched montage image.
     """
-
-    if Matchgainrefmask:
-        assert (
-            gainref is not None
-        ), "Gain reference must be provided if Matchgainrefmask is True"
+    if rotate % 90 != 0:
+        raise ValueError("rotate must be a multiple of 90 degrees")
+    rot_k = (rotate // 90) % 4
 
     # Load tile data: accept either an MRC stack path or a TileStack adapter.
+    tile_selection = tiles  # save before overwriting with actual image data
     tiles = mrcfile.mrcmemmap.MrcMemmap(image).data if isinstance(image, str) else image
 
-    # Get the shape and data type of the montage tiles
-    dtype = tiles.dtype
     pixels = np.asarray([x // binning for x in tiles.shape[-2:]], dtype=int)
+    if rot_k % 2:
+        # A 90°/270° rotation swaps height and width for every tile.
+        pixels = pixels[::-1]
 
-    # M is the slice object describing the indices of the tiles to include
-    # in the montage, if None is passed for tiles then all tiles are included
-    # by default.
-    if tiles is None:
+    # M is the boolean mask describing which tiles to include.
+    # None → all tiles; slice or int-index array → convert to bool; bool array → use directly.
+    if tile_selection is None:
         M = np.ones(len(tiles), dtype=bool)
-    elif isinstance(tiles, slice):
+    elif isinstance(tile_selection, slice):
         M = np.zeros(len(tiles), dtype=bool)
-        M[tiles] = True
+        M[tile_selection] = True
     else:
-        M = tiles  # assumes tiles is already a bool/index array
+        M = np.zeros(len(tiles), dtype=bool)
+        M[tile_selection] = True
 
     # Convert positions from pixels to microns, remove 3rd dimension
     positions = positions[:, :2] * pixel_size * 1e-4
@@ -669,6 +597,9 @@ def montage(
         logger.debug("No template mask provided — using tile 0 as template")
         template_mask = np.asarray(tiles[0])
 
+    if rot_k:
+        template_mask = np.ascontiguousarray(np.rot90(template_mask, k=rot_k))
+
     # Keep the raw (non-binary) template as the beam reference for plasmon correction.
     raw_template = np.asarray(template_mask, dtype=float)
 
@@ -687,7 +618,7 @@ def montage(
     _plasmon_fixed_n   = [None]
     _plasmon_fixed_q_E = [None]
 
-    ref_tile_idx = correct_beam_edges if isinstance(correct_beam_edges, int) else None
+    ref_tile_idx = correct_beam_edges if (isinstance(correct_beam_edges, int) and not isinstance(correct_beam_edges, bool)) else None
     correct_beam_edges = bool(correct_beam_edges)
 
     if ref_tile_idx == -1:
@@ -703,6 +634,8 @@ def montage(
     if ref_tile_idx is not None and correct_beam_edges:
         logger.info(f"Fitting plasmon parameters on reference tile {ref_tile_idx} ...")
         _ref_img = np.asarray(tiles[ref_tile_idx]).copy()
+        if rot_k:
+            _ref_img = np.ascontiguousarray(np.rot90(_ref_img, k=rot_k))
         if binning > 1:
             _ref_img = fourier_interpolate(_ref_img, [x // binning for x in _ref_img.shape])
         _ref_mask = make_mask(
@@ -730,6 +663,8 @@ def montage(
 
     def _process_tile(img):
         im = np.asarray(img).copy()
+        if rot_k:
+            im = np.ascontiguousarray(np.rot90(im, k=rot_k))
         if binning > 1:
             im = fourier_interpolate(im, [x // binning for x in im.shape])
         if np.mean(im) <= min_mean_intensity:
@@ -809,7 +744,7 @@ def montage(
         positionfile = os.path.join(
             outdir, os.path.split(image)[1].replace(".mrc", "_refined_positions.h5")
         )
-    else:
+    elif os.path.exists(positionfile):
         skipcrosscorrelation = True
 
     # Calculate the overlaps between adjacent tiles
@@ -864,9 +799,10 @@ def montage(
         nthreads=nthreads,
 
     )
-    fileout = os.path.join(
-        outdir, os.path.splitext(os.path.split(image)[1])[0] + ".tif"
-    )
+    if output_mrc is None:
+        fileout = fileout_path if fileout_path is not None else os.path.join(
+            outdir, os.path.splitext(os.path.split(image)[1])[0] + ".tif"
+        )
     # if not skipcrosscorrelation:
     ntiles = len(original_positions[M])
     figsize = 2 * (int(np.ceil(np.sqrt(ntiles))),)
@@ -956,14 +892,38 @@ def montage(
                     "binned_pixel_size"
                 ],
             )
-    Image.fromarray(indxmap.astype(np.uint16)).save(fileout.replace('.tif','_index.tif'),compression="tiff_lzw")
+    # Image.fromarray(indxmap.astype(np.uint16)).save(fileout.replace('.tif','_index.tif'),compression="tiff_lzw")
     # Clip to signed 16-bit range.  When mark_uncovered is set, uncovered pixels
     # are exactly -1 (no smoothn runs in that path so no other negatives exist).
     # Otherwise clip negatives to 0 so smoothn artefacts don't become false sentinels.
     lo_clip = -1 if mark_uncovered else 0
-    Image.fromarray(np.clip(canvas, lo_clip, 32767).astype(np.int16)).save(fileout, compression="tiff_lzw")
-    save_array_as_png(canvas, fileout.replace('.tiff','.png'), cmap=plt.get_cmap('Greys'))
-    # return canvas
+    clipped = np.clip(canvas, lo_clip, 32767).astype(np.int16)
+    if output_mrc is None:
+        Image.fromarray(clipped).save(fileout, compression="tiff_lzw")
+        if isinstance(image, str):
+            # Stamp the source raw montage's mtime onto the stitched output so
+            # downstream tools (JointoMRC.py's --acquisition_order) can recover
+            # true acquisition order from file mtime, with no mdoc needed.
+            src_mtime = os.path.getmtime(image)
+            os.utime(fileout, (src_mtime, src_mtime))
+        save_array_as_png(canvas, fileout.replace('.tiff','.png'), cmap=plt.get_cmap('Greys'))
+
+    if output_mrc is not None:
+        if tilt_z_index is None or n_tilts_total is None:
+            raise ValueError("output_mrc requires both tilt_z_index and n_tilts_total")
+        # mode 1 = int16, matching JointoMRC.py's stack convention and the
+        # clipped int16 range already used for the TIFF above.
+        _create_stack_locked(
+            output_mrc, (n_tilts_total, *clipped.shape), pixel_size * binning, mrc_mode=1
+        )
+        with mrcfile.mmap(output_mrc, mode="r+") as out_mrc:
+            out_mrc.data[tilt_z_index] = clipped
+        logger.info(
+            "Wrote tilt directly into %s  [slice %d/%d]",
+            output_mrc, tilt_z_index, n_tilts_total,
+        )
+
+    return canvas
 
 
 def plot_overlaps(positions, overlaps, show=True):
@@ -1106,7 +1066,7 @@ def clip_masks_to_overlaps(masks, positions, overlaps, pixels, pixel_size):
         closest tile.
     """
     clipped_masks = [copy.deepcopy(msk) for msk in masks]
-    
+
     x = np.arange(masks[0].shape[-1])
     y = np.arange(masks[0].shape[-2])
     distancefromcenter = np.zeros((len(masks),*masks[0].shape[-2:]))
@@ -1114,12 +1074,19 @@ def clip_masks_to_overlaps(masks, positions, overlaps, pixels, pixel_size):
         y0,x0 = center_of_mass_2d(mask)
         distancefromcenter[i] = (y[:,None]-y0)**2 + (x[None,:]-x0)**2
 
-    for i, j in overlaps:
-        x1 = positions[i]
-        x2 = positions[j]
+    # Pre-compute per-tile canvas offsets using the same integer truncation as stitch,
+    # so that dx below matches the actual pixel-level placement of each tile.
+    # int(A - B) != int(A) - int(B) in general; computing the difference of rounded
+    # individual offsets avoids a systematic 1-pixel gap at seams.
+    origin = np.amin(positions, axis=0) * 1e4
+    canvas_offsets = np.array(
+        [[int(v) for v in (pos * 1e4 - origin) / pixel_size] for pos in positions]
+    )  # shape (N, 2): [x_offset, y_offset] per tile
 
-        # Calculate relative shift in pixels
-        dx = [int(x) for x in (x2 - x1) / pixel_size * 1e4][::-1]
+    for i, j in overlaps:
+        # Calculate relative shift in pixels, consistent with stitch's canvas placement
+        dx_raw = canvas_offsets[j] - canvas_offsets[i]  # [x_shift, y_shift]
+        dx = list(dx_raw[::-1])  # [row_shift, col_shift]
 
         # Get the indices for array overlap
         i1, i2 = array_overlap(dx[0], pixels[0])
@@ -1252,25 +1219,28 @@ def cross_correlate_tiles(
             i1, i2 = array_overlap(dx[0], pixels[0])
             j1, j2 = array_overlap(dx[1], pixels[1])
 
-            # Make masks for (estimated) overlapping areas of each array
-            reference_mask = np.zeros_like(masks[i], dtype=bool)
-            reference_mask[i1[0] : i1[1], j1[0] : j1[1]] = np.logical_and(
+            # Crop to the overlap region before cross-correlating.
+            # phase_cross_correlation internally FFTs at (2H × 2W) in
+            # complex128; using the full tiles wastes memory proportional to
+            # (full_tile / overlap)^2. Both crops already show the same
+            # physical region, so the algorithm returns only the fine
+            # correction; dx is added back to recover the total shift in
+            # full-tile coordinates.
+            overlap_mask = np.logical_and(
                 masks[i][i1[0] : i1[1], j1[0] : j1[1]],
                 masks[j][i2[0] : i2[1], j2[0] : j2[1]],
             )
-            moving_mask = np.zeros_like(masks[j], dtype=bool)
-            moving_mask[i2[0] : i2[1], j2[0] : j2[1]] = np.logical_and(
-                masks[i][i1[0] : i1[1], j1[0] : j1[1]],
-                masks[j][i2[0] : i2[1], j2[0] : j2[1]],
-            )
+            crop_ref = tiles[i][i1[0] : i1[1], j1[0] : j1[1]]
+            crop_mov = tiles[j][i2[0] : i2[1], j2[0] : j2[1]]
 
             # Calculate shift by masked cross correlation with ordering (Y,X)
-            detected_shift = phase_cross_correlation(
-                tiles[i],
-                tiles[j],
-                reference_mask=reference_mask,
-                moving_mask=moving_mask,
+            fine_shift = phase_cross_correlation(
+                crop_ref,
+                crop_mov,
+                reference_mask=overlap_mask,
+                moving_mask=overlap_mask,
             )[0]
+            detected_shift = fine_shift + np.array(dx)
             # delta is measured shift in microns
             delta = np.asarray(detected_shift) * pixel_size * 1e-4
         else:
@@ -1567,21 +1537,29 @@ def generate_image_file_names_from_template(name, datadir, tilt, positions):
     return imagefiles
 
 
-def extract_tilt_axis_angle(file_path):
-    tilt_axis_angle = None
-    section_regex = re.compile(r"\[T\s*=\s*.*Tilt\s+axis\s+angle\s*=\s*([-\d.]+)")
+def _resolve_output_target(output_arg):
+    """Classify the ``-o/--output`` argument into an output mode.
 
-    with open(file_path, "r") as file:
-        for line in file:
-            line = line.strip()
-
-            # Check if the line contains the "Tilt axis angle"
-            section_match = section_regex.search(line)
-            if section_match:
-                tilt_axis_angle = float(section_match.group(1))
-                break
-
-    return tilt_axis_angle
+    Returns
+    -------
+    mode : {"dir", "mrc", "tiff"}
+    path : str or None
+        Directory path (mode "dir", or None to derive from --input),
+        MRC stack path (mode "mrc"), or single TIFF path with the
+        extension forced to ``.tiff`` (mode "tiff").
+    slice_index : int or None
+        Z-slice parsed from a ``:N`` suffix in mode "mrc"; otherwise None.
+    """
+    if output_arg is None:
+        return "dir", None, None
+    base = os.path.basename(output_arg)
+    if ":" in base:
+        head, idx_str = output_arg.rsplit(":", 1)
+        if os.path.basename(head).lower().endswith(".mrc") and idx_str.lstrip("-").isdigit():
+            return "mrc", head, int(idx_str)
+    if base.lower().endswith(".mrc"):
+        return "tiff", os.path.splitext(output_arg)[0] + ".tiff", None
+    return "dir", output_arg, None
 
 
 def setup_outputdir(args):
@@ -1594,39 +1572,6 @@ def setup_outputdir(args):
         os.mkdir(outputdir)
     return outputdir
 
-
-def setup_gainreference(gainreffile, filenames, outputdir, shrinkn=20, medianthreshold=0.4,maskabsolutethreshold=None):
-    """
-    Sets up the gain reference for image processing.
-
-    Parameters:
-    gainreffile (str): Path to the gain reference file.
-    filenames (list of str): List of filenames to use for generating the gain reference if it does not exist.
-    outputdir (str): Directory where the generated gain reference file will be saved.
-    shrinkn (int, optional): Size of fringes for removal in unbinned pixels. Default is 20.
-
-    Returns:
-    tuple: A tuple containing:
-        - gainref (numpy.ndarray): The gain reference array.
-        - gainrefmask (numpy.ndarray): The mask of the gain reference after filling holes and applying binary erosion.
-    """
-    if os.path.exists(gainreffile):
-        with mrcfile.open(gainreffile, "r+") as m:
-            gainref = np.asarray(m.data)
-    else:
-        gainref = make_gain_ref(filenames, binning=4, shrinkn=shrinkn, medianthreshold=medianthreshold,absolutethreshold=maskabsolutethreshold)
-        gainreffile_ = os.path.join(outputdir, "gain.mrc")
-        logger.info("Saving generated gain reference to %s", gainreffile_)
-        savetomrc(gainref.astype(np.float32), gainreffile_)
-
-    # Create a mask of the gain reference, filling holes and using binary
-    # erosion to remove the fringes
-    gainrefmask = binary_fill_holes(gainref > 0.4 * np.median(gainref))
-    gainrefmask = binary_erosion(
-        gainrefmask, structure=circular_mask([shrinkn] * 2, radius=shrinkn)
-    )
-
-    return gainref, gainrefmask
 
 
 def plot_positions(coordinates, fnam=None, fig=None, color="blue"):
@@ -1723,7 +1668,18 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    outdir = setup_outputdir(args)
+    output_mode, output_target, output_slice = _resolve_output_target(args["output"])
+
+    if output_mode == "dir":
+        outdir = setup_outputdir(args)
+        mrc_path = None
+        tiff_path = None
+    else:
+        outdir = os.path.dirname(output_target) or "."
+        os.makedirs(outdir, exist_ok=True)
+        logger.info("Results will be written to: %s", output_target)
+        mrc_path = output_target if output_mode == "mrc" else None
+        tiff_path = output_target if output_mode == "tiff" else None
 
     # Binning constant
     binning = int(args["binning"])
@@ -1759,43 +1715,40 @@ def main():
                 )
         logger.debug("Pixel size: %.4f Å  |  binning: %d  |  effective: %.4f Å",
                      pixelsize, binning, pixelsize * binning)
-        indices = [str(i) for i in range(len(tilts))]
 
     else:
         # ── Glob of per-tilt MRC stacks (original path) ─────────────────────────
-        files = glob.glob(args["input"])
+        files = sorted(glob.glob(args["input"]))
         if len(files) < 1:
             raise FileNotFoundError("No files matching {0}".format(args["input"]))
         logger.debug("Found %d MRC file(s) matching '%s'", len(files), args["input"])
-        mdoc_files = [x.replace(".mrc", ".mrc.mdoc") for x in files]
 
-        # Get pixel size, tilt axis rotation from first mdoc file
-        mdoc = parse_mdoc(mdoc_files[0])
-        pixelsize = args["pixel_size"] or float(mdoc["PixelSpacing"])
+        # Pixel size: prefer explicit --pixel-size, then MRC voxel_size header
+        if args["pixel_size"] is not None:
+            pixelsize = args["pixel_size"]
+        else:
+            with mrcfile.mmap(files[0], mode="r", permissive=True) as _m:
+                pixelsize = float(_m.voxel_size.x)
+            if pixelsize == 0.0:
+                raise ValueError(
+                    "MRC voxel_size is not set; provide --pixel-size explicitly."
+                )
         logger.debug("Pixel size: %.4f Å  |  binning: %d  |  effective pixel size: %.4f Å",
                      pixelsize, binning, pixelsize * binning)
 
-        # Get tilts and write output mdoc files
-        tilts, indices = [], []
-        for mdoc in mdoc_files:
-            m = parse_mdoc(mdoc)
-            tilts.append(float(m["ZValue = 0"]["TiltAngle"]))
-
-            non_zvalue_entries = {k: v for k, v in m.items() if not re.match(r'ZValue = \d+', k)}
-            zvalue_entries = {k: v for k, v in m.items() if re.match(r'ZValue = \d+', k)}
-            outputmdoc = combine_dicts(list(zvalue_entries.values()))
-            Mandatorykeys = ['StagePosition', 'DateTime', 'SubFramePath']
-            m_z0 = m.get('ZValue = 0', {})
-            MandatoryEntries = {k: m_z0[k] for k in Mandatorykeys if k in m_z0}
-            outputmdoc = {**outputmdoc, **MandatoryEntries}
-            outputmdocfnam = os.path.join(
-                outdir, os.path.split(mdoc.replace('.mrc.mdoc', '.tif.mdoc'))[1]
-            )
-            write_mdoc({**non_zvalue_entries, **{'ZValue = 0': outputmdoc}}, outputmdocfnam)
-
-            split_filename = mdoc.split(".mrc")[0]
-            indices.append(split_filename.split("_")[-1])
-
+        # Tilt angle is parsed straight from each filename, e.g.
+        # Montage_182-A_-12.0.mrc -> -12.0. -0.0 normalises to 0.0 so tiles
+        # at zero tilt aren't treated as a distinct angle.
+        tilts = []
+        for f in files:
+            m = re.search(r"_(-?\d+\.?\d*)\.mrc$", os.path.basename(f))
+            if not m:
+                raise ValueError(
+                    f"Cannot parse tilt angle from filename: {f} "
+                    "(expected it to end in '_{tilt_angle}.mrc')"
+                )
+            t = float(m.group(1))
+            tilts.append(0.0 if t == -0.0 else t)
 
     # Get image shifts from file
     # TODO make SerialEM put this in the mdoc file in microns (not
@@ -1804,18 +1757,16 @@ def main():
     tiltsfromfile = [imageshifts[x][0] for x in range(len(imageshifts))]
     imageshifts = [imageshifts[x][1] for x in range(len(imageshifts))]
     reshapedimshifts = np.concatenate(imageshifts)[:, :2] * pixelsize
-    if args["maximageshift"] is not None:
-        # Convert image shift criterion from microns to Angstroms
-        maxim = args["maximageshift"] * 1e4
-        mask = np.logical_and(*(np.abs(reshapedimshifts) < maxim).T)
-    else:
-        mask = np.ones(reshapedimshifts.shape[0], dtype=bool)
-    
+
     if args['ROI'] is None:
-        tileFOV = pixelsize * np.asarray(_first_tile_shape(files[0]))
+        tile_shape = np.asarray(_first_tile_shape(files[0]))
+        if (args["rotate"] // 90) % 2:
+            # A 90°/270° rotation swaps each tile's height and width.
+            tile_shape = tile_shape[::-1]
+        tileFOV = pixelsize * tile_shape
         # Global range of tiles in Angstroms
-        globalwidth = np.ptp(reshapedimshifts[mask], axis=0)+tileFOV
-        globalorigin = np.amin(reshapedimshifts[mask], axis=0)#+tileFOV
+        globalwidth = np.ptp(reshapedimshifts, axis=0)+tileFOV
+        globalorigin = np.amin(reshapedimshifts, axis=0)#+tileFOV
     else:
         roi = [float(x) for x in args['ROI']]
         #Convert ROI from pixels (similar to image shifts file) to Angstroms)
@@ -1828,8 +1779,45 @@ def main():
                  globalwidth[0] * 1e-4, globalwidth[1] * 1e-4)
     logger.info("Processing %d tilt(s)", len(files))
 
+    # --output pointing at an MRC stack (mode "mrc") writes directly into a
+    # shared per-series MRC stack instead of the per-tilt TIFFs, skipping
+    # JointoMRC.py; mode "tiff" writes a single named TIFF instead of a
+    # per-tilt directory. Both require exactly one tilt to be selected.
+    # z-slice assignment is independent of files/tilts iteration order — it's
+    # always each tilt's 0-based rank when every discovered tilt angle is
+    # sorted ascending, matching JointoMRC.py's default tilt-angle ordering.
+    tilt_index = args["tilt_index"]
+    if output_mode == "mrc" and output_slice is not None and tilt_index is None:
+        tilt_index = output_slice
+
+    n_tilts_total = len(tilts)
+    z_index_map = {t: z for z, t in enumerate(sorted(tilts))}
+
+    if tilt_index is None and output_mode in ("mrc", "tiff"):
+        if n_tilts_total != 1:
+            raise ValueError(
+                f"--output {args['output']!r} names a single output file "
+                f"but {n_tilts_total} tilt(s) were discovered; pass "
+                "--tilt-index (or append ':N' to the MRC path) to select one."
+            )
+        tilt_index = 0
+
+    if tilt_index is not None:
+        if not (0 <= tilt_index < n_tilts_total):
+            raise ValueError(
+                f"--tilt-index {tilt_index} out of range for "
+                f"{n_tilts_total} discovered tilt(s)."
+            )
+        target_tilt = sorted(tilts)[tilt_index]
+        keep = [k for k, t in enumerate(tilts) if t == target_tilt]
+        files = [files[k] for k in keep]
+        tilts = [tilts[k] for k in keep]
+        logger.info(
+            "Restricting to tilt index %d/%d  (tilt angle %.2f°)",
+            tilt_index, n_tilts_total, target_tilt,
+        )
+
     fringe_size = args["fringe_size"]
-    skipgainref = args["gainref"] in (None, "False")
 
     # Load template mask if provided
     template_mask = None
@@ -1855,55 +1843,6 @@ def main():
         # template_mask = make_mask(template_mask,shrinkn=0,medianthreshold=args["maskthreshold"])
         logger.info("Loaded template mask from %s", tmask_path)
 
-    if not skipgainref:
-        # Load gain ref if available make a new one if not
-        checkforgainref = args["gainref"] is not None
-
-        if checkforgainref:
-            if os.path.exists(args["gainref"]):
-                logger.info("Loading gain reference: %s", args["gainref"])
-                with mrcfile.open(args["gainref"], "r+") as m:
-                    gainref = np.asarray(m.data)
-                # Check gain reference data size mismatch and interpolate if necessary
-                imageshape = np.asarray(_first_tile_shape(files[0])) // binning
-                gainrefshape = np.asarray(gainref.shape)
-                if np.any(gainrefshape != imageshape):
-                    logger.warning(
-                        "Gain reference shape %s does not match binned image shape %s — interpolating",
-                        tuple(gainrefshape), tuple(imageshape)
-                    )
-                    gainref = fourier_interpolate(gainref, imageshape)
-                    gainrefmask = make_mask(gainref, shrinkn=fringe_size / binning,medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
-
-                    gainref /= np.median(gainref[gainrefmask])
-                    Image.fromarray(gainref).save(
-                        os.path.join(outdir, "binned_gainref.tif")
-                    )
-                    # gainref = np.where(gainrefmask, gainref, 1)
-            else:
-                logger.warning("Gain reference file '%s' not found — generating a new one", args["gainref"])
-                checkforgainref = False
-        if not checkforgainref:
-            gainref = make_gain_ref(files, binning=binning, shrinkn=fringe_size, medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
-            gainreffile = os.path.join(outdir, "gainref.mrc")
-            logger.info("Saving gain reference to %s", gainreffile)
-            savetomrc(gainref.astype(np.float32), gainreffile)
-
-        # make gain reference mask
-        gainrefmask = binary_fill_holes(gainref > 0.7 * np.median(gainref))
-
-        # Remove Fresnel fringes from gain reference mask
-        gainrefmask = binary_erosion(
-            gainrefmask,
-            structure=circular_mask(
-                [fringe_size / binning] * 2, radius=fringe_size / binning
-            ),
-        )
-        gainref = np.where(gainrefmask, gainref, 1)
-    else:
-        gainref = None
-        gainrefmask = None
-
     _quiet = not logger.isEnabledFor(logging.INFO)
     for i, (file, tilt) in enumerate(
         tqdm(zip(files, tilts), total=len(files), desc="Stitching montages", disable=_quiet)
@@ -1912,13 +1851,8 @@ def main():
         indx = find_closest_index(tiltsfromfile, tilt)
         positions = imageshifts[indx]
 
-        if args['maximageshift'] is not None:
-            tiles = np.where(np.logical_and(*(np.abs(positions) < maxim).T))[0]
-            ntiles = sum(tiles)
-        else:
-            tiles = None
-            ntiles = len(positions)
-        logger.debug("  %d tile(s) selected", ntiles)
+        tiles = None
+        logger.debug("  %d tile(s) selected", len(positions))
         # plot_positions(positions[tiles][:,:2],color='k')
 
         
@@ -1928,21 +1862,15 @@ def main():
             positions,
             pixelsize,
             binning=binning,
-            gainref=gainref,
-            gainrefmask=gainrefmask,
             skipcrosscorrelation=args["skipcrosscorrelation"],
             montagewidth=globalwidth,
             montageorigin=globalorigin,
             tiles=tiles,
             fringe_size=fringe_size,
-            # tiles = [24,25,36,37,38,39,54,55,56,57],
-            gaincorrectedfile=args["gain_corrected_files"],
             maxshift=args["max_allowed_imshift_correction"],
-            Matchgainrefmask=args["Matchgainrefmask"],
             maskthreshold=args["maskthreshold"],
             maskabsolutethreshold=args["maskabsolutethreshold"],
-            flattenbeam=args["flattenbeam"],
-            nthreads = args["nthreads"],
+            nthreads=args["nthreads"],
             positionfile=args["positionfile"],
             smooth=not args["nosmooth"] and not args["mark_uncovered"],
             mark_uncovered=args["mark_uncovered"],
@@ -1951,6 +1879,11 @@ def main():
             correct_beam_edges=args["correct_beam_edges"],
             E_plasmon_eV=args["plasmon_energy"],
             voltage_kV=args["voltage"],
+            rotate=args["rotate"],
+            output_mrc=mrc_path,
+            tilt_z_index=z_index_map[tilt] if mrc_path is not None else None,
+            n_tilts_total=n_tilts_total if mrc_path is not None else None,
+            fileout_path=tiff_path,
         )
 
 

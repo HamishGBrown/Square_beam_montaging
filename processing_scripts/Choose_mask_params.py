@@ -5,6 +5,9 @@ Shows the mean of all sub-frames from a TIFF alongside the masked image with
 the largest inscribed square overlaid.  Drag the sliders to tune the erosion
 (shrink) and threshold until the square sits cleanly inside the beam.
 
+In the masked panel: enable Paint mode, then left-drag to add regions to the
+mask or right-drag to remove them.  The brush radius slider controls brush size.
+
 Pass the chosen values as --mask-shrink and (if needed) --mask-threshold to
 beam_mask_motioncorr.
 """
@@ -120,9 +123,26 @@ def main():
         else state["median"] * 0.4
     )
 
+    # ------------------------------------------------------------------ paint state
+    paint = {
+        "active": False,
+        "pressing": False,
+        "mode": "add",          # "add" or "remove" — set on mouse press
+        "add": np.zeros(image.shape, dtype=bool),
+        "remove": np.zeros(image.shape, dtype=bool),
+        "computed_mask": None,  # stored by refresh() so paint_at can combine
+    }
+
+    def apply_paint_overlay(computed_mask):
+        return (computed_mask | paint["add"]) & ~paint["remove"]
+
+    def reset_paint_arrays(shape):
+        paint["add"] = np.zeros(shape, dtype=bool)
+        paint["remove"] = np.zeros(shape, dtype=bool)
+
     # ------------------------------------------------------------------ figure
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    plt.subplots_adjust(bottom=0.42)
+    plt.subplots_adjust(bottom=0.50)
 
     im_raw = axes[0].imshow(image, cmap="gray", vmin=vmin, vmax=vmax)
     axes[0].set_title(os.path.basename(paths[0]))
@@ -134,6 +154,7 @@ def main():
         return mask, r, c, s
 
     mask0, r0, c0, s0 = compute_masked(image, initial_shrink, initial_threshold)
+    paint["computed_mask"] = mask0
 
     im_masked = axes[1].imshow(np.where(mask0, image, np.nan), cmap="gray",
                                vmin=vmin, vmax=vmax)
@@ -146,6 +167,11 @@ def main():
         linewidth=1.5, edgecolor="lime", facecolor="none",
     )
     axes[1].add_patch(rect_patch)
+
+    # Brush cursor circle (visible in paint mode)
+    brush_cursor = plt.Circle((0, 0), 5, fill=False, color="yellow",
+                               linestyle="--", linewidth=1.2, visible=False)
+    axes[1].add_patch(brush_cursor)
 
     def make_title(shrink_binned, threshold, median, side_binned, side_full):
         frac = threshold / median if median else 0.0
@@ -163,14 +189,14 @@ def main():
     )
 
     # ------------------------------------------------------------------ sliders
-    ax_shrink = plt.axes([0.15, 0.30, 0.70, 0.03])
+    ax_shrink = plt.axes([0.15, 0.40, 0.70, 0.03])
     shrink_slider = Slider(
         ax_shrink, "Shrink (display px)",
         0, max(200, initial_shrink * 3),
         valinit=initial_shrink, valstep=1, valfmt="%0.0f",
     )
 
-    ax_thresh = plt.axes([0.15, 0.21, 0.70, 0.03])
+    ax_thresh = plt.axes([0.15, 0.31, 0.70, 0.03])
     threshold_slider = Slider(
         ax_thresh, "Threshold (counts)",
         float(np.percentile(image, 0.5)),
@@ -178,11 +204,23 @@ def main():
         valinit=initial_threshold,
     )
 
+    ax_brush = plt.axes([0.15, 0.22, 0.70, 0.03])
+    brush_slider = Slider(
+        ax_brush, "Brush radius (px)",
+        1, 80,
+        valinit=5, valstep=1, valfmt="%0.0f",
+    )
+
     cmd_text = fig.text(
-        0.15, 0.13, "", fontsize=8, color="navy", family="monospace",
+        0.15, 0.15, "", fontsize=8, color="navy", family="monospace",
     )
     frac_text = fig.text(
-        0.15, 0.09, "", fontsize=8, color="dimgray",
+        0.15, 0.11, "", fontsize=8, color="dimgray",
+    )
+    paint_hint = fig.text(
+        0.15, 0.07,
+        "Paint mode: left-drag = add to mask   right-drag = remove from mask",
+        fontsize=8, color="dimgray", visible=False,
     )
 
     def update_cmd(shrink_binned, threshold, side_full):
@@ -201,8 +239,10 @@ def main():
 
     def refresh(img, shrink_binned, threshold):
         med = state["median"]
-        mask, r, c, s = compute_masked(img, shrink_binned, threshold)
-        masked_img = np.where(mask, img, np.nan)
+        computed_mask, r, c, s = compute_masked(img, shrink_binned, threshold)
+        paint["computed_mask"] = computed_mask
+        final_mask = apply_paint_overlay(computed_mask)
+        masked_img = np.where(final_mask, img, np.nan)
         im_masked.set_data(masked_img)
         rect_patch.set_xy((c, r))
         rect_patch.set_width(s)
@@ -221,12 +261,47 @@ def main():
     def on_slider_change(_val):
         refresh(state["image"], int(shrink_slider.val), threshold_slider.val)
 
+    def on_brush_changed(_val):
+        brush_cursor.set_radius(brush_slider.val)
+        fig.canvas.draw_idle()
+
     shrink_slider.on_changed(on_slider_change)
     threshold_slider.on_changed(on_slider_change)
+    brush_slider.on_changed(on_brush_changed)
+
+    # ------------------------------------------------------------------ paint buttons
+    ax_paint = plt.axes([0.08, 0.04, 0.14, 0.05])
+    btn_paint = Button(ax_paint, "Paint: OFF", color="lightgray", hovercolor="silver")
+
+    ax_reset_paint = plt.axes([0.24, 0.04, 0.14, 0.05])
+    btn_reset_paint = Button(ax_reset_paint, "Reset paint")
+
+    def on_paint_toggle(_e):
+        paint["active"] = not paint["active"]
+        if paint["active"]:
+            btn_paint.label.set_text("Paint: ON")
+            btn_paint.ax.set_facecolor("lightgreen")
+            paint_hint.set_visible(True)
+            brush_cursor.set_visible(False)  # shown on mouse-enter
+        else:
+            btn_paint.label.set_text("Paint: OFF")
+            btn_paint.ax.set_facecolor("lightgray")
+            paint_hint.set_visible(False)
+            brush_cursor.set_visible(False)
+        fig.canvas.draw_idle()
+
+    def on_reset_paint(_e):
+        reset_paint_arrays(state["image"].shape)
+        final_mask = apply_paint_overlay(paint["computed_mask"])
+        im_masked.set_data(np.where(final_mask, state["image"], np.nan))
+        fig.canvas.draw_idle()
+
+    btn_paint.on_clicked(on_paint_toggle)
+    btn_reset_paint.on_clicked(on_reset_paint)
 
     # ------------------------------------------------------------------ file navigation
-    ax_prev = plt.axes([0.25, 0.04, 0.15, 0.05])
-    ax_next = plt.axes([0.60, 0.04, 0.15, 0.05])
+    ax_prev = plt.axes([0.50, 0.04, 0.15, 0.05])
+    ax_next = plt.axes([0.76, 0.04, 0.15, 0.05])
     btn_prev = Button(ax_prev, "← Prev file")
     btn_next = Button(ax_next, "Next file →")
     file_label = fig.text(
@@ -236,6 +311,7 @@ def main():
 
     def load_and_refresh(idx: int):
         img = load_file(idx)
+        reset_paint_arrays(img.shape)
         new_vmin = float(np.percentile(img, 1))
         new_vmax = float(np.percentile(img, 99))
         im_raw.set_data(img)
@@ -254,7 +330,54 @@ def main():
     btn_prev.on_clicked(on_prev)
     btn_next.on_clicked(on_next)
 
-    # ------------------------------------------------------------------ initial cmd
+    # ------------------------------------------------------------------ paint mouse events
+    def paint_at(xdata, ydata, button):
+        if xdata is None or ydata is None:
+            return
+        img = state["image"]
+        h, w = img.shape
+        r = int(brush_slider.val)
+        cx, cy = int(round(xdata)), int(round(ydata))
+        ys, xs = np.ogrid[:h, :w]
+        circle = (ys - cy) ** 2 + (xs - cx) ** 2 <= r ** 2
+        if button == 1:  # left click — add to mask
+            paint["add"][circle] = True
+            paint["remove"][circle] = False
+        else:            # right click — remove from mask
+            paint["remove"][circle] = True
+            paint["add"][circle] = False
+        final_mask = apply_paint_overlay(paint["computed_mask"])
+        im_masked.set_data(np.where(final_mask, img, np.nan))
+        fig.canvas.draw_idle()
+
+    def on_mouse_press(event):
+        if not paint["active"] or event.inaxes != axes[1]:
+            return
+        paint["pressing"] = True
+        paint["mode"] = "add" if event.button == 1 else "remove"
+        paint_at(event.xdata, event.ydata, event.button)
+
+    def on_mouse_release(event):
+        paint["pressing"] = False
+
+    def on_mouse_motion(event):
+        if not paint["active"]:
+            return
+        in_panel = event.inaxes == axes[1] and event.xdata is not None
+        brush_cursor.set_visible(in_panel)
+        if in_panel:
+            brush_cursor.set_center((event.xdata, event.ydata))
+            brush_cursor.set_radius(brush_slider.val)
+            if paint["pressing"]:
+                btn = 1 if paint["mode"] == "add" else 3
+                paint_at(event.xdata, event.ydata, btn)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("button_press_event", on_mouse_press)
+    fig.canvas.mpl_connect("button_release_event", on_mouse_release)
+    fig.canvas.mpl_connect("motion_notify_event", on_mouse_motion)
+
+    # ------------------------------------------------------------------ initial render
     refresh(image, initial_shrink, initial_threshold)
 
     plt.show()

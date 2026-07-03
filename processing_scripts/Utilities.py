@@ -1,8 +1,9 @@
 import h5py
 import numpy as np
 import math
+import warnings
 from typing import List, Tuple
-from scipy.ndimage import correlate, sobel
+from scipy.ndimage import correlate, sobel, gaussian_filter, distance_transform_edt
 from scipy.ndimage.morphology import binary_fill_holes, binary_erosion, binary_dilation
 from tqdm import tqdm
 import copy
@@ -134,7 +135,13 @@ def RGB_to_PNG(RGB_array, fnam):
 
 def save_array_as_png(array, fnam, cmap=plt.get_cmap("viridis"), vmin=None, vmax=None):
     """Output a numpy array as a .png file."""
-    # Convert numpy array to RGB and then output to .png file
+    if vmin is None or vmax is None:
+        populated = array[array != 0]
+        data = populated if populated.size > 0 else array.ravel()
+        if vmin is None:
+            vmin = np.percentile(data, 2)
+        if vmax is None:
+            vmax = np.percentile(data, 98)
     RGB_to_PNG(array_to_RGB(array, cmap, vmin=vmin, vmax=vmax), fnam)
 
 def savetomrc(array, fnam, overwrite=True):
@@ -987,8 +994,8 @@ def _estimate_plasmon_params_grid(tile, ref_beam, mask, pixel_size_nm,
             method='Nelder-Mead',
             options={'xatol': 1e-3, 'fatol': 1e-6, 'maxiter': 500},
         )
-        n_best   = max(0.0,  float(result.x[0]))
-        q_E_best = max(1e-6, float(result.x[1]))
+        n_best   = max(0.0,              float(result.x[0]))
+        q_E_best = max(float(q_E_range[0]), float(result.x[1]))
 
     return n_best, q_E_best, residuals, n_vals, q_E_vals
 
@@ -1134,7 +1141,8 @@ def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
     # Physics-based q_E in cycles nm^{-1} (used as fallback / starting point).
     # hc = 2π·ħc ≈ 1239.8 eV·nm; fftfreq returns cycles/unit not rad/unit.
     hc = 1239.8  # eV·nm
-    q_E = E_plasmon_eV / (hc * np.sqrt(beta2))
+    q_E_phys = E_plasmon_eV / (hc * np.sqrt(beta2))
+    q_E = q_E_phys
 
     if n_fixed is not None and q_E_fixed is not None:
         # Parameters locked in from a reference tile — skip all fitting.
@@ -1147,6 +1155,15 @@ def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
         )
         print(f"Grid fit: n_avg={n_avg:.3f}  q_E={q_E:.5f} cyc/nm  "
               f"(E_eff≈{q_E * hc * np.sqrt(beta2):.1f} eV)")
+        if q_E < q_E_phys / 5:
+            warnings.warn(
+                f"Fitted q_E ({q_E:.5f} cyc/nm, E_eff≈{q_E * hc * np.sqrt(beta2):.2f} eV) "
+                f"is more than 5× below the physics-based value "
+                f"({q_E_phys:.5f} cyc/nm, E_plasmon={E_plasmon_eV:.1f} eV at {voltage_kV:.0f} kV). "
+                f"The reference tile is likely unsuitable (thick sample, no visible beam, or "
+                f"beam edge not in frame). Use --correct_beam_edges N to specify a different tile.",
+                RuntimeWarning, stacklevel=2,
+            )
     elif n_avg_method == 'lsq':
         n_avg = _estimate_n_avg_lsq(tile, ref_beam, mask, q_E, pixel_size_nm,
                                     downsample=downsample)
@@ -1172,6 +1189,7 @@ def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
     # a negligible level before it would wrap.  Direct spatial convolution is
     # O(N²·R²) vs O((N+2P)²·log(N+2P)²) here — FFT wins for any realistic R.
     pad = max(16, int(np.ceil(3.0 / (q_E * pixel_size_nm))))
+    pad = min(pad, max(ny, nx))  # guard: spurious small q_E can make pad >> tile size
     ref_padded = np.pad(ref_beam, pad, mode='constant', constant_values=0.0)
     ny_p, nx_p = ref_padded.shape
     qy_p = np.fft.fftfreq(ny_p, d=pixel_size_nm)
@@ -1193,7 +1211,7 @@ def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
     corrected = tile * correction
 
     # _plot_plasmon_correction(tile, I_expected, corrected, mask,
-    #                          n_avg, n_avg_method, pixel_size_nm)
+    #                           n_avg, n_avg_method, pixel_size_nm)
 
     return corrected, n_avg, q_E
 
@@ -1329,7 +1347,8 @@ def iterative_edge_smoothing(array, mask, niterations=5, pow=4, initial_radius=N
 
 
 def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
-              absolutethreshold=None, template_mask=None,template_edges=None,):
+              absolutethreshold=None, template_mask=None, template_edges=None,
+              bin_factor=8):
     """
     Generate a binary mask from an image by applying a Gaussian filter, filling holes,
     and then shrinking the mask with morphological erosion.
@@ -1394,27 +1413,33 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
 
         return mask
 
-    # --- Fallback: original threshold-based approach ---
-    # Step 1: Apply a Gaussian filter to smooth the image
-    smoothed_im = convolve(im, Gaussian(smoothing_kernel, im.shape))
+    # --- Fallback: fast threshold-based approach ---
+    # Step 1: Downsample — all heavy ops run at 1/bin_factor resolution
+    im_work = im[::bin_factor, ::bin_factor] if bin_factor > 1 else im
 
-    # Step 2: Create an initial binary mask based on a threshold
+    # Step 2: Separable Gaussian smooth (replaces full-image FFT convolution)
+    smoothed_im = gaussian_filter(im_work.astype(np.float32), sigma=smoothing_kernel)
+
+    # Step 3: Threshold
     if absolutethreshold is not None:
         mask = smoothed_im > absolutethreshold
     else:
-        mask = smoothed_im > medianthreshold * np.median(im)
+        mask = smoothed_im > medianthreshold * np.median(im_work)
 
-    # Step 3: Fill any holes in the initial mask
+    # Step 4: Fill holes
     mask = binary_fill_holes(mask)
 
-    # Step 4: Create a circular structuring element to use for binary erosion
+    # Step 5: Erode via distance transform — O(N) regardless of radius,
+    #         vs O(N * k^2) for binary_erosion with a large structuring element
     if shrinkn > 0:
-        struct_elem = circular_mask([shrinkn * 2, shrinkn * 2], radius=shrinkn / 2)
+        mask = distance_transform_edt(mask) >= (shrinkn / bin_factor)
 
-        # Step 5: Apply binary erosion to shrink the mask
-        mask = binary_erosion(mask, structure=struct_elem)
+    # Step 6: Upsample back to original resolution (nearest-neighbour)
+    if bin_factor > 1:
+        mask = np.repeat(np.repeat(mask, bin_factor, axis=0), bin_factor, axis=1)
+        mask = mask[:im.shape[0], :im.shape[1]]
 
-    return mask
+    return mask.astype(bool)
 
 
 def cross_correlate_alignment(im, template, returncoords=True):

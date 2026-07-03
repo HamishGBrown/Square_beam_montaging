@@ -14,11 +14,29 @@ Workflow
 
 The crop is used ONLY for motion estimation; the output MRC covers the
 full detector area, so downstream stitching is unaffected.
+
+Output modes
+------------
+By default each tile is written as its own single-slice MRC file, named
+``{stem}.mrc`` (or split into ``odd/`` and ``even/`` subdirectories with
+``--split-frames``). This is the layout ``stitch.py`` reads via its
+"directory of per-tile MRC files" input mode.
+
+Passing ``--stack-output`` instead accumulates every tile belonging to the
+same tilt angle into a single memory-mapped MRC stack (one 2-D section per
+tile), matching the layout of a raw SerialEM montage stack (e.g.
+``Montage_182-A_0.0.mrc``) that ``stitch.py`` reads via its "glob of
+per-tilt MRC stacks" input mode. This requires input filenames to follow
+the ``{base}_{tile_index}_{tilt_angle}.tif`` convention. It is safe to call
+from multiple concurrent SLURM array tasks (one task per tile): the stack
+file is created once under an flock, and each task subsequently writes
+only its own z-slice.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob
 import logging
 import os
@@ -28,6 +46,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+import time
 
 import mrcfile
 import numpy as np
@@ -216,6 +236,120 @@ def parse_motioncor2_shifts(text: str, n_frames: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Per-tilt memory-mapped MRC stack output
+# ---------------------------------------------------------------------------
+
+# Matches tile filenames like  Montage_182-A_182-A_003_-12.0  (stem, no ext)
+# -> groups (base, tile_index, tilt_angle)
+_TILE_FNAME_RE = re.compile(r"^(.+)_(\d+)_(-?\d+\.?\d*)$")
+
+
+def parse_tile_filename(path: str) -> tuple[str, int, float]:
+    """Parse ``{base}_{tile_index}_{tilt_angle}`` from a tile file's stem.
+
+    Returns (base, tile_index, tilt_angle); -0.0 is normalised to 0.0 so
+    tiles at zero tilt group together regardless of sign.
+    """
+    stem = Path(path).stem
+    m = _TILE_FNAME_RE.match(stem)
+    if not m:
+        raise ValueError(
+            f"'{path}' does not match the required "
+            "'{{base}}_{{tile_index}}_{{tilt_angle}}' naming convention "
+            "for --stack-output."
+        )
+    base, tile_idx, tilt = m.group(1), int(m.group(2)), float(m.group(3))
+    if tilt == -0.0:
+        tilt = 0.0
+    return base, tile_idx, tilt
+
+
+def stack_path_for(output_dir: str, base: str, tilt: float) -> str:
+    """Path of the shared per-tilt MRC stack for a given base name/tilt."""
+    return os.path.join(output_dir, f"{base}_{tilt:g}.mrc")
+
+
+def tile_index_range_for_tilt(input_path: str, base: str, tilt: float) -> tuple[int, int]:
+    """Return (min_idx, max_idx) of tile indices sharing ``base``/``tilt``.
+
+    ``tile_index`` in the ``{base}_{tile_index}_{tilt_angle}`` naming
+    convention is a cumulative counter across the *entire* tilt series — it
+    does not restart at each tilt — so a given tilt's tiles typically occupy
+    some contiguous sub-range like 960-1065 rather than 0-105. Callers
+    should subtract ``min_idx`` from a tile's raw index to get its 0-based
+    z-slice position within that tilt's stack.
+
+    Only inspects ``input_path``'s own directory (no recursion — cheap even
+    on a shared filesystem).
+    """
+    directory = os.path.dirname(os.path.abspath(input_path)) or "."
+    ext = os.path.splitext(input_path)[1]
+    min_idx, max_idx = None, None
+    for sibling in glob.glob(os.path.join(directory, f"*{ext}")):
+        try:
+            sib_base, sib_idx, sib_tilt = parse_tile_filename(sibling)
+        except ValueError:
+            continue
+        if sib_base == base and sib_tilt == tilt:
+            min_idx = sib_idx if min_idx is None else min(min_idx, sib_idx)
+            max_idx = sib_idx if max_idx is None else max(max_idx, sib_idx)
+    if min_idx is None:
+        raise ValueError(
+            f"No sibling tiles found matching base='{base}' tilt={tilt} "
+            f"next to {input_path}"
+        )
+    return min_idx, max_idx
+
+
+def _create_stack_locked(
+    path: str, shape: tuple[int, int, int], pixel_size: float, mrc_mode: int = 2
+) -> None:
+    """Create an empty MRC stack at ``path`` if it doesn't exist yet.
+
+    ``mrc_mode`` follows the mrcfile convention (2 = float32, the default;
+    1 = int16; 0 = int8, e.g. for binary mask stacks).
+
+    Guarded by an flock on a sibling ``.lock`` file so concurrent SLURM
+    array tasks racing to create the same stack don't step on each other;
+    only the task that wins the lock creates the file, everyone else opens
+    the resulting file afterwards. Requires a filesystem with working POSIX
+    advisory locks (fine on local/GPFS mounts; unreliable on some NFS setups).
+    """
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    lock_path = path + ".lock"
+    with open(lock_path, "w") as lockfh:
+        fcntl.flock(lockfh, fcntl.LOCK_EX)
+        try:
+            if not os.path.exists(path):
+                with mrcfile.new_mmap(path, shape=shape, mrc_mode=mrc_mode, overwrite=False) as mrc:
+                    mrc.voxel_size = pixel_size
+                log.info("Created MRC stack %s  shape=%s  mode=%d", path, shape, mrc_mode)
+        finally:
+            fcntl.flock(lockfh, fcntl.LOCK_UN)
+
+
+def write_tile_slice(
+    stack_path: str,
+    tile_idx: int,
+    n_tiles: int,
+    data: np.ndarray,
+    pixel_size: float,
+) -> None:
+    """Write ``data`` into z-slice ``tile_idx`` of a shared MRC stack.
+
+    Creates the stack — sized ``(n_tiles, *data.shape)`` — on first use.
+    Safe to call concurrently from multiple processes as long as each call
+    uses a distinct ``tile_idx``: writes land on disjoint byte ranges of
+    the memory-mapped file.
+    """
+    _create_stack_locked(stack_path, (n_tiles, *data.shape), pixel_size)
+    with mrcfile.mmap(stack_path, mode="r+") as mrc:
+        mrc.data[tile_idx] = data.astype(np.float32, copy=False)
+
+
+# ---------------------------------------------------------------------------
 # Shift application
 # ---------------------------------------------------------------------------
 
@@ -357,44 +491,85 @@ def process_one_tiff(
     keep_temp: bool = False,
     save_diagnostic: bool = False,
     diagnostic_binning: int = 4,
+    diagnostic_subdir: str | None = None,
     mc2_extra: list[str] | None = None,
     split_frames: bool = False,
+    stack_output: bool = False,
 ) -> str:
     """Process a single multi-frame TIFF; return path to the output MRC.
 
-    When ``split_frames`` is True, additional files are written:
-      {output_dir}/odd/{stem}.mrc  — sum of frames at indices 0, 2, 4, …
-      {output_dir}/even/{stem}.mrc — sum of frames at indices 1, 3, 5, …
-    These half-datasets are ready to use directly with cryoCARE or similar.
+    When ``split_frames`` is True, additional outputs are written for the
+    odd- and even-indexed frames — sum of frames at indices 0, 2, 4, … and
+    1, 3, 5, … respectively. These half-datasets are ready to use directly
+    with cryoCARE or similar.
+
+    When ``stack_output`` is False (default), each tile is written as its
+    own single-slice MRC: {output_dir}/{stem}.mrc (and
+    {output_dir}/{odd,even}/{stem}.mrc for the split frames).
+
+    When ``stack_output`` is True, ``input_path`` must be named
+    ``{base}_{tile_index}_{tilt_angle}.tif``. The tile is instead written
+    as one z-slice of a shared per-tilt MRC stack:
+    {output_dir}/{base}_{tilt}.mrc (and {output_dir}/{odd,even}/{base}_{tilt}.mrc),
+    sized to hold every tile sharing that base/tilt. This matches the raw
+    per-tilt montage stack layout ``stitch.py`` expects.
     """
     in_stem = Path(input_path).stem
-    out_mrc  = os.path.join(output_dir, f"{in_stem}.mrc")
-    out_odd  = os.path.join(output_dir, "odd",  f"{in_stem}.mrc")
-    out_even = os.path.join(output_dir, "even", f"{in_stem}.mrc")
 
-    skip = os.path.exists(out_mrc)
-    if split_frames:
-        skip = skip and os.path.exists(out_odd) and os.path.exists(out_even)
+    if stack_output:
+        base, raw_tile_idx, tilt = parse_tile_filename(input_path)
+        # tile_index is a cumulative counter across the whole tilt series
+        # (it does not reset per tilt), so re-base it to a 0-based z-slice
+        # position within this tilt's own stack.
+        min_idx, max_idx = tile_index_range_for_tilt(input_path, base, tilt)
+        tile_idx = raw_tile_idx - min_idx
+        n_tiles = max_idx - min_idx + 1
+        out_mrc  = stack_path_for(output_dir, base, tilt)
+        out_odd  = stack_path_for(os.path.join(output_dir, "odd"), base, tilt)
+        out_even = stack_path_for(os.path.join(output_dir, "even"), base, tilt)
+        # A shared stack file always "exists" once any tile has written to
+        # it, so use a per-tile sentinel to track completion instead.
+        marker_dir = os.path.join(output_dir, ".stack_markers")
+        marker = os.path.join(marker_dir, f"{in_stem}.done")
+        skip = os.path.exists(marker)
+    else:
+        out_mrc  = os.path.join(output_dir, f"{in_stem}.mrc")
+        out_odd  = os.path.join(output_dir, "odd",  f"{in_stem}.mrc")
+        out_even = os.path.join(output_dir, "even", f"{in_stem}.mrc")
+        skip = os.path.exists(out_mrc)
+        if split_frames:
+            skip = skip and os.path.exists(out_odd) and os.path.exists(out_even)
+
     if skip:
         log.info("Output already exists, skipping: %s", out_mrc)
         return out_mrc
 
-    # 1. Load frames
-    frames = load_multipage_tiff(input_path)  # (n, H, W)
-    if frames.ndim == 2:
-        frames = frames[np.newaxis]  # single frame
-    n_frames, H, W = frames.shape
+    # 1. Load first frame only for mask detection
+    t0 = time.perf_counter()
+    with Image.open(input_path) as img:
+        n_frames = getattr(img, "n_frames", 1)
+        img.seek(0)
+        first_frame = np.asarray(img.copy()).astype(np.float32)
+    log.info("%s: loaded first frame (of %d) in %.1f s",
+             in_stem, n_frames, time.perf_counter() - t0)
 
-    # 2. Beam mask from mean frame
-    mean_frame = frames.astype(np.float32).mean(axis=0)
+    # 2. Beam mask from first frame
+    t1 = time.perf_counter()
     if template_mask is not None:
-        mask = make_mask(mean_frame, template_mask=template_mask, shrinkn=mask_shrink,
+        mask = make_mask(first_frame, template_mask=template_mask, shrinkn=mask_shrink,
                          absolutethreshold=mask_threshold)
     else:
-        mask = make_mask(mean_frame, shrinkn=mask_shrink, absolutethreshold=mask_threshold)
+        mask = make_mask(first_frame, shrinkn=mask_shrink, absolutethreshold=mask_threshold)
+    log.info("%s: beam mask in %.1f s", in_stem, time.perf_counter() - t1)
 
     # 3. Largest inscribed square, rounded to an FFT-friendly size
-    row_top, col_left, side = largest_inscribed_square(mask)
+    t2 = time.perf_counter()
+    H, W = first_frame.shape
+    _lis_bin = 8  # run DP on downsampled mask, then scale coords back up
+    mask_small = mask[::_lis_bin, ::_lis_bin]
+    row_top_s, col_left_s, side_s = largest_inscribed_square(mask_small)
+    row_top, col_left, side = row_top_s * _lis_bin, col_left_s * _lis_bin, side_s * _lis_bin
+    log.info("%s: largest inscribed square in %.1f s", in_stem, time.perf_counter() - t2)
     if side < 64:
         raise ValueError(
             f"Largest inscribed square is only {side}px — beam mask may have failed."
@@ -418,20 +593,34 @@ def process_one_tiff(
 
     # 3b. Optional diagnostic plot (saved before MC2 runs so it exists even on failure)
     if save_diagnostic:
-        os.makedirs(output_dir, exist_ok=True)
-        diag_path = os.path.join(output_dir, f"{in_stem}_diagnostic.png")
+        diag_dir = os.path.join(output_dir, diagnostic_subdir) if diagnostic_subdir else output_dir
+        os.makedirs(diag_dir, exist_ok=True)
+        diag_path = os.path.join(diag_dir, f"{in_stem}_diagnostic.png")
+        t_diag = time.perf_counter()
         save_diagnostic_plot(
-            mean_frame, mask, row_top, col_left, side,
+            first_frame, mask, row_top, col_left, side,
             diag_path, binning=diagnostic_binning,
         )
+        log.info("%s: diagnostic plot in %.1f s", in_stem, time.perf_counter() - t_diag)
 
-    # 4. Crop frames and write temp TIFF
+    # 4. Load all frames
+    t2 = time.perf_counter()
+    frames = load_multipage_tiff(input_path)
+    if frames.ndim == 2:
+        frames = frames[np.newaxis]
+    log.info("%s: loaded all %d frames in %.1f s",
+             in_stem, n_frames, time.perf_counter() - t2)
+
+    # 5. Crop frames and write temp TIFF
     with tempfile.TemporaryDirectory(prefix="mc2_", suffix=f"_{in_stem}") as tmpdir:
+        t3 = time.perf_counter()
         cropped = frames[:, row_top : row_top + side, col_left : col_left + side]
         tmp_tiff = os.path.join(tmpdir, f"{in_stem}_crop.tif")
         write_multipage_tiff(cropped, tmp_tiff)
+        log.info("%s: crop + temp TIFF write in %.1f s", in_stem, time.perf_counter() - t3)
 
-        # 5. Run MotionCor2 on cropped TIFF
+        # 6. Run MotionCor2 on cropped TIFF
+        t4 = time.perf_counter()
         tmp_mrc = os.path.join(tmpdir, f"{in_stem}_mc2.mrc")
         stdout_text = run_motioncor2(
             in_tiff=tmp_tiff,
@@ -443,6 +632,7 @@ def process_one_tiff(
             motioncor2_path=motioncor2_path,
             extra_args=mc2_extra,
         )
+        log.info("%s: MotionCor2 in %.1f s", in_stem, time.perf_counter() - t4)
 
         if keep_temp:
             dest = os.path.join(output_dir, f"{in_stem}.mc2.log")
@@ -450,31 +640,46 @@ def process_one_tiff(
                 fh.write(stdout_text)
             log.info("Saved MC2 output: %s", dest)
 
-        # 6. Parse shifts from captured stdout
+        # 7. Parse shifts from captured stdout
         shifts_xy = parse_motioncor2_shifts(stdout_text, n_frames)
         log.info("Shifts (x,y px):\n%s", shifts_xy)
 
-    # 7. Apply shifts to full frames and sum
+    # 8. Apply shifts to full frames and sum
+    t5 = time.perf_counter()
     os.makedirs(output_dir, exist_ok=True)
     if split_frames:
         aligned_sum, odd_sum, even_sum = apply_shifts_split(frames, shifts_xy)
     else:
         aligned_sum = apply_shifts_and_sum(frames, shifts_xy)
+    log.info("%s: shift application in %.1f s", in_stem, time.perf_counter() - t5)
 
-    # 8. Write output MRC(s) (float32, single 2-D slice each)
-    with mrcfile.new(out_mrc, overwrite=True) as mrc:
-        mrc.set_data(aligned_sum)
-        mrc.voxel_size = pixel_size
+    # 9. Write output MRC(s) (float32, single 2-D slice each)
+    t6 = time.perf_counter()
+    if stack_output:
+        write_tile_slice(out_mrc, tile_idx, n_tiles, aligned_sum, pixel_size)
+        if split_frames:
+            for label, data, path in (
+                ("odd", odd_sum, out_odd), ("even", even_sum, out_even)
+            ):
+                write_tile_slice(path, tile_idx, n_tiles, data, pixel_size)
+                log.info("Wrote %s frames: %s [tile %d]", label, path, tile_idx)
+        os.makedirs(marker_dir, exist_ok=True)
+        Path(marker).touch()
+    else:
+        with mrcfile.new(out_mrc, overwrite=True) as mrc:
+            mrc.set_data(aligned_sum)
+            mrc.voxel_size = pixel_size
 
-    if split_frames:
-        for label, data in (("odd", odd_sum), ("even", even_sum)):
-            sub_dir = os.path.join(output_dir, label)
-            os.makedirs(sub_dir, exist_ok=True)
-            out_path = os.path.join(sub_dir, f"{in_stem}.mrc")
-            with mrcfile.new(out_path, overwrite=True) as mrc:
-                mrc.set_data(data)
-                mrc.voxel_size = pixel_size
-            log.info("Wrote %s frames: %s", label, out_path)
+        if split_frames:
+            for label, data in (("odd", odd_sum), ("even", even_sum)):
+                sub_dir = os.path.join(output_dir, label)
+                os.makedirs(sub_dir, exist_ok=True)
+                out_path = os.path.join(sub_dir, f"{in_stem}.mrc")
+                with mrcfile.new(out_path, overwrite=True) as mrc:
+                    mrc.set_data(data)
+                    mrc.voxel_size = pixel_size
+                log.info("Wrote %s frames: %s", label, out_path)
+    log.info("%s: MRC write in %.1f s", in_stem, time.perf_counter() - t6)
 
     return out_mrc
 
@@ -565,9 +770,11 @@ def main() -> None:
         help="Copy the MotionCor2 -Full.log files to the output directory.",
     )
     parser.add_argument(
-        "--save-diagnostic", action="store_true",
+        "--save-diagnostic", nargs="?", const="", default=None, metavar="SUBDIR",
         help="Save a PNG diagnostic plot ({stem}_diagnostic.png) showing the "
-             "mean frame, beam mask, and crop rectangle for each input file.",
+             "mean frame, beam mask, and crop rectangle for each input file. "
+             "Optionally give a sub-directory name (relative to output_dir) "
+             "to place the PNGs in, e.g. --save-diagnostic diagnostics.",
     )
     parser.add_argument(
         "--diagnostic-binning", type=int, default=4,
@@ -578,6 +785,18 @@ def main() -> None:
         help="Also write odd- and even-frame sums to {output_dir}/odd/ and "
              "{output_dir}/even/. Useful for cryoCARE and similar denoising "
              "tools that require two independent half-datasets.",
+    )
+    parser.add_argument(
+        "--stack-output", action="store_true",
+        help="Write tiles into a shared per-tilt memory-mapped MRC stack "
+             "(one z-slice per tile) instead of one MRC file per tile. "
+             "Matches the raw-montage-stack layout stitch.py reads, so its "
+             "output can be fed straight into stitch.py without going "
+             "through the per-tile-directory input mode. Requires input "
+             "filenames of the form {base}_{tile_index}_{tilt_angle}.tif "
+             "and is safe to call concurrently (e.g. one SLURM array task "
+             "per tile) — the stack file is created once under a file "
+             "lock and each task then writes only its own slice.",
     )
     parser.add_argument(
         "--mc2-args", nargs=argparse.REMAINDER, default=[],
@@ -659,10 +878,12 @@ def main() -> None:
                 mask_threshold=args.mask_threshold,
                 template_mask=template_mask,
                 keep_temp=args.keep_logs,
-                save_diagnostic=args.save_diagnostic,
+                save_diagnostic=args.save_diagnostic is not None,
                 diagnostic_binning=args.diagnostic_binning,
+                diagnostic_subdir=args.save_diagnostic or None,
                 mc2_extra=mc2_extra,
                 split_frames=args.split_frames,
+                stack_output=args.stack_output,
             )
             log.info("Wrote: %s", out)
             n_ok += 1

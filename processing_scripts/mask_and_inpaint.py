@@ -24,6 +24,7 @@ import numpy.ma as ma
 import mrcfile
 import matplotlib.pyplot as plt
 import matplotlib.widgets as mwidgets
+from matplotlib.path import Path as MplPath
 from scipy.ndimage import label, distance_transform_edt, zoom
 from scipy.optimize import curve_fit
 from tqdm import tqdm
@@ -36,19 +37,22 @@ from .inpaint_apply import DEFAULT_SLURM_TEMPLATE
 # Binning
 # ---------------------------------------------------------------------------
 
-def bin_tilt_series(data: np.ndarray, max_px: int = 1024):
-    ny, nx = data.shape[1], data.shape[2]
+def bin_tilt_series(mmap_data, max_px: int = 1024):
+    n, ny, nx = mmap_data.shape
     longest = max(ny, nx)
     if longest <= max_px:
-        return data.astype(np.float32), 1.0
+        return np.stack([mmap_data[i].astype(np.float32) for i in range(n)]), 1.0
     factor = max_px / longest
     print(
         f"Binning preview:  {ny}×{nx}  →  "
         f"{int(round(ny * factor))}×{int(round(nx * factor))}  "
         f"(factor {factor:.3f})"
     )
-    binned = zoom(data.astype(np.float32), (1.0, factor, factor), order=1)
-    return binned.astype(np.float32), factor
+    binned = np.stack([
+        zoom(mmap_data[i].astype(np.float32), (factor, factor), order=1)
+        for i in tqdm(range(n), desc="Binning preview")
+    ])
+    return binned, factor
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +72,7 @@ def fit_gaussian_peak(image: np.ndarray, center_hint: float,
     region; defaults to 30 % of the full intensity range.
     """
     flat = image.ravel().astype(float)
-    val_range = float(flat.max() - flat.min())
+    val_range = float(flat.max() - flat[flat>0].min())
     if val_range == 0:
         return float(center_hint), 1.0
 
@@ -76,7 +80,7 @@ def fit_gaussian_peak(image: np.ndarray, center_hint: float,
         search_window = 0.30 * val_range
 
     nbins = 512
-    counts, edges = np.histogram(flat, bins=nbins)
+    counts, edges = np.histogram(flat[flat>0], bins=nbins)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     in_window = np.abs(centers - center_hint) < search_window
@@ -165,13 +169,19 @@ def inpaint_tilt(image: np.ndarray, mask: np.ndarray,
 # ---------------------------------------------------------------------------
 
 class PeakMaskEditor:
-    def __init__(self, tilt_series: np.ndarray, input_path: str,
+    def __init__(self, mrc_mmap, input_path: str,
                  output_path: str = None, max_px: int = 1024,
                  n_sigma_default: float = 3.0,
                  slurm_template: str = None, slurm_cpus: int = 8,
                  slurm_mem: int = 32, slurm_time: str = "02:00:00"):
-        self.data_full = tilt_series.astype(np.float32)
-        self.data, self.bin_factor = bin_tilt_series(self.data_full, max_px)
+        self._mrc = mrc_mmap
+        self._mmap_data = mrc_mmap.data
+        if self._mmap_data.ndim == 2:
+            self._mmap_data = self._mmap_data[np.newaxis]
+        elif self._mmap_data.ndim != 3:
+            raise ValueError(f"Expected 2D or 3D MRC data, got shape {self._mmap_data.shape}")
+        self._full_shape = self._mmap_data.shape  # (n, h, w) — no data loaded yet
+        self.data, self.bin_factor = bin_tilt_series(self._mmap_data, max_px)
         self.n_tilts   = self.data.shape[0]
         self.input_path  = input_path
         self.output_path = output_path or (
@@ -197,6 +207,22 @@ class PeakMaskEditor:
         self.manual_mode     = False
         self.manual_overrides: dict = {}   # {tilt_idx: (lo, hi)}
         self._slider_updating = False      # guard against re-entrant slider updates
+
+        # --- Paint overlay state ---
+        self._paint_mode   = False
+        self._painting     = False
+        self._paint_dir    = "add"    # "add" or "remove" — set on press
+        self._paint_add:    dict = {} # {tilt_idx: bool ndarray, binned coords}
+        self._paint_remove: dict = {} # {tilt_idx: bool ndarray, binned coords}
+        self._brush_size   = 10       # radius in display pixels
+
+        # --- Top connected-component filter ---
+        self._keep_top_cc = False   # re-apply LCC to final mask after paint overlay
+
+        # --- Polygon drawing state ---
+        self._poly_mode       = False
+        self._poly_verts: list = []   # (x, y) in data coords
+        self._poly_commit_dir = "add" # "add" or "remove" — toggled by 'r' key
 
         # --- Sentinel detection (stitch --mark-uncovered writes -1 for no-tile regions) ---
         self._has_uncovered = bool((self.data < 0).any())
@@ -226,17 +252,21 @@ class PeakMaskEditor:
 
         mu, sigma = ref_mu, ref_sigma
         for i in range(ref_tilt + 1, self.n_tilts):
-            window = max(4.0 * sigma,
-                         0.05 * float(self.data[i].max() - self.data[i].min()))
-            mu, sigma = fit_gaussian_peak(self.data[i], mu, search_window=window)
+            img_i   = self.data[i]
+            valid_i = img_i[img_i >= 0] if self._has_uncovered else img_i.ravel()
+            rng     = float(valid_i.max() - valid_i.min()) if valid_i.size > 0 else float(img_i.max() - img_i.min())
+            window  = max(4.0 * sigma, 0.05 * rng)
+            mu, sigma = fit_gaussian_peak(img_i, mu, search_window=window)
             self.fitted_mu[i]    = mu
             self.fitted_sigma[i] = sigma
 
         mu, sigma = ref_mu, ref_sigma
         for i in range(ref_tilt - 1, -1, -1):
-            window = max(4.0 * sigma,
-                         0.05 * float(self.data[i].max() - self.data[i].min()))
-            mu, sigma = fit_gaussian_peak(self.data[i], mu, search_window=window)
+            img_i   = self.data[i]
+            valid_i = img_i[img_i >= 0] if self._has_uncovered else img_i.ravel()
+            rng     = float(valid_i.max() - valid_i.min()) if valid_i.size > 0 else float(img_i.max() - img_i.min())
+            window  = max(4.0 * sigma, 0.05 * rng)
+            mu, sigma = fit_gaussian_peak(img_i, mu, search_window=window)
             self.fitted_mu[i]    = mu
             self.fitted_sigma[i] = sigma
 
@@ -281,7 +311,7 @@ class PeakMaskEditor:
             mu    = float(self.fitted_mu[tilt_idx])
             sigma = float(self.fitted_sigma[tilt_idx])
 
-        return mu - self.n_sigma * sigma, mu + self.n_sigma * sigma, mu, sigma
+        return max(mu - self.n_sigma * sigma,0), mu + self.n_sigma * sigma, mu, sigma
 
     # ------------------------------------------------------------------
     # UI construction
@@ -289,7 +319,7 @@ class PeakMaskEditor:
 
     def _build_ui(self):
         self.fig = plt.figure(figsize=(14, 9))
-        full_shape    = self.data_full.shape
+        full_shape    = self._full_shape
         preview_shape = self.data.shape
         bin_note = (
             f"  —  preview {preview_shape[1]}×{preview_shape[2]}"
@@ -315,11 +345,19 @@ class PeakMaskEditor:
         ax_manual = self.fig.add_axes([0.04, 0.09, 0.50, 0.03])
 
         # ---- buttons (bottom row) ----
-        ax_btn_smooth  = self.fig.add_axes([0.04, 0.02, 0.11, 0.06])
-        ax_btn_manual  = self.fig.add_axes([0.16, 0.02, 0.11, 0.06])
-        ax_btn_overlay = self.fig.add_axes([0.28, 0.02, 0.11, 0.06])
-        ax_btn_slurm   = self.fig.add_axes([0.40, 0.02, 0.14, 0.06])
+        ax_btn_smooth   = self.fig.add_axes([0.04, 0.02, 0.06, 0.06])
+        ax_btn_manual   = self.fig.add_axes([0.11, 0.02, 0.06, 0.06])
+        ax_btn_overlay  = self.fig.add_axes([0.18, 0.02, 0.06, 0.06])
+        ax_btn_paint    = self.fig.add_axes([0.25, 0.02, 0.06, 0.06])
+        ax_btn_polygon  = self.fig.add_axes([0.32, 0.02, 0.06, 0.06])
+        ax_btn_top_cc   = self.fig.add_axes([0.39, 0.02, 0.06, 0.06])
+        ax_btn_slurm    = self.fig.add_axes([0.46, 0.02, 0.10, 0.06])
         ax_btn_gen     = self.fig.add_axes([0.57, 0.02, 0.17, 0.08])
+
+        # ---- brush slider + reset/save controls (right column, between mu-plot and buttons) ----
+        ax_brush            = self.fig.add_axes([0.57, 0.11, 0.40, 0.03])
+        ax_btn_reset_paint  = self.fig.add_axes([0.76, 0.06, 0.21, 0.04])
+        ax_chk_save_mask    = self.fig.add_axes([0.76, 0.02, 0.21, 0.04])
 
         # Tilt slider
         self.sl_tilt = mwidgets.Slider(
@@ -385,6 +423,47 @@ class PeakMaskEditor:
         )
         self.btn_gen.on_clicked(self._on_generate)
 
+        # Paint mode button
+        self.btn_paint = mwidgets.Button(
+            ax_btn_paint, "Paint: OFF",
+            color="lightgray", hovercolor="silver",
+        )
+        self.btn_paint.on_clicked(self._on_toggle_paint)
+
+        # Polygon mode button
+        self.btn_polygon = mwidgets.Button(
+            ax_btn_polygon, "Poly: OFF",
+            color="lightgray", hovercolor="silver",
+        )
+        self.btn_polygon.on_clicked(self._on_toggle_polygon)
+
+        # Top connected-component filter button
+        self.btn_top_cc = mwidgets.Button(
+            ax_btn_top_cc, "Top CC:\nOFF",
+            color="lightgray", hovercolor="silver",
+        )
+        self.btn_top_cc.on_clicked(self._on_toggle_top_cc)
+
+        # Brush radius slider
+        self.sl_brush = mwidgets.Slider(
+            ax_brush, "Brush (px)", 1, 80,
+            valinit=self._brush_size, valstep=1, valfmt="%0.0f",
+            color="sandybrown",
+        )
+        self.sl_brush.on_changed(self._on_brush_changed)
+
+        # Reset paint button
+        self.btn_reset_paint = mwidgets.Button(
+            ax_btn_reset_paint, "Reset paint",
+            color="lightsalmon", hovercolor="tomato",
+        )
+        self.btn_reset_paint.on_clicked(self._on_reset_paint)
+
+        # Save mask checkbox
+        self.chk_save_mask = mwidgets.CheckButtons(
+            ax_chk_save_mask, ["Save mask MRC"], [False]
+        )
+
         # ---- image display ----
         img0 = self.data[0]
         self._im = self.ax_img.imshow(
@@ -403,7 +482,23 @@ class PeakMaskEditor:
         self.ax_mu.set_xlabel("Tilt index", fontsize=7)
         self.ax_mu.tick_params(labelsize=7)
 
-        self.fig.canvas.mpl_connect("button_press_event", self._on_hist_click)
+        # Brush cursor circle drawn on the image axes
+        self._brush_cursor = plt.Circle(
+            (0, 0), self._brush_size,
+            fill=False, color="yellow", linestyle="--", linewidth=1.2,
+            visible=False,
+        )
+        self.ax_img.add_patch(self._brush_cursor)
+
+        # Polygon drawing artists (always present, hidden until used)
+        self._poly_line,       = self.ax_img.plot([], [], color="cyan", lw=1.5, ls="--")
+        self._poly_close_line, = self.ax_img.plot([], [], color="cyan", lw=1.0, ls=":")
+        self._poly_dots,       = self.ax_img.plot([], [], "o", color="cyan", ms=4)
+
+        self.fig.canvas.mpl_connect("button_press_event",   self._on_mouse_press)
+        self.fig.canvas.mpl_connect("button_release_event", self._on_mouse_release)
+        self.fig.canvas.mpl_connect("motion_notify_event",  self._on_mouse_motion)
+        self.fig.canvas.mpl_connect("key_press_event",      self._on_key_press)
 
     # ------------------------------------------------------------------
     # Display refresh
@@ -414,9 +509,21 @@ class PeakMaskEditor:
         lo, hi, mu, sigma = self._get_lo_hi(self.current_tilt)
 
         active = lo is not None
-        mask   = compute_mask_from_range(img, lo, hi) if active else \
-                 np.ones(img.shape, dtype=bool)
-        bad    = ~mask
+        auto_mask = compute_mask_from_range(img, lo, hi) if active else \
+                    np.ones(img.shape, dtype=bool)
+
+        # Apply paint overlay on top of the auto-computed mask
+        ti = self.current_tilt
+        p_add = self._paint_add.get(ti)
+        p_rem = self._paint_remove.get(ti)
+        mask = auto_mask.copy()
+        if p_add is not None:
+            mask |= p_add
+        if p_rem is not None:
+            mask &= ~p_rem
+        if self._keep_top_cc and mask.any():
+            mask = largest_connected_component(mask)
+        bad = ~mask
 
         # -- image + overlay --
         # Exclude sentinel pixels from contrast scaling so -1 doesn't crush the range
@@ -429,7 +536,15 @@ class PeakMaskEditor:
 
         rgba = np.zeros((*img.shape, 4), dtype=np.float32)
         if self.overlay_visible and active:
-            rgba[bad] = [1.0, 0.2, 0.2, 0.5]
+            # Auto-masked-out pixels (not overridden by paint-add): red
+            auto_bad_only = bad & ~(p_add if p_add is not None else np.zeros(img.shape, bool))
+            rgba[auto_bad_only] = [1.0, 0.2, 0.2, 0.5]
+            # Paint-remove strokes: orange
+            if p_rem is not None:
+                rgba[p_rem] = [1.0, 0.5, 0.0, 0.75]
+            # Paint-add strokes: cyan
+            if p_add is not None:
+                rgba[p_add] = [0.0, 0.8, 1.0, 0.45]
         self._overlay_im.set_data(rgba)
         self._overlay_im.set_extent(
             [-0.5, img.shape[1] - 0.5, -0.5, img.shape[0] - 0.5]
@@ -579,6 +694,8 @@ class PeakMaskEditor:
 
     def _on_tilt(self, val):
         self.current_tilt = int(round(val))
+        if self._poly_verts:
+            self._clear_polygon_drawing()
         if self.manual_mode:
             self._update_slider_for_tilt(self.current_tilt)
         self._refresh()
@@ -633,11 +750,51 @@ class PeakMaskEditor:
         )
         self._refresh()
 
-    def _on_hist_click(self, event):
+    def _on_toggle_top_cc(self, _event):
+        self._keep_top_cc = not self._keep_top_cc
+        if self._keep_top_cc:
+            self.btn_top_cc.label.set_text("Top CC:\nON")
+            self.btn_top_cc.ax.set_facecolor("lightgreen")
+        else:
+            self.btn_top_cc.label.set_text("Top CC:\nOFF")
+            self.btn_top_cc.ax.set_facecolor("lightgray")
+        self._refresh()
+
+    def _on_mouse_press(self, event):
+        # Polygon drawing on image panel
+        if self._poly_mode and event.inaxes is self.ax_img and event.xdata is not None:
+            if event.button == 3:
+                # Right-click: commit as REMOVE (bonus shortcut where it works)
+                if len(self._poly_verts) >= 3:
+                    self._finalize_polygon("remove")
+                    self._clear_polygon_drawing()
+                    self._refresh()
+                else:
+                    self._clear_polygon_drawing()
+                return
+            # Left-click: place vertex, or close and commit if near start or double-click
+            if event.dblclick or self._is_near_poly_start(event.xdata, event.ydata):
+                if len(self._poly_verts) >= 3:
+                    self._finalize_polygon(self._poly_commit_dir)
+                    self._refresh()
+                self._clear_polygon_drawing()
+            else:
+                self._poly_verts.append((event.xdata, event.ydata))
+                self._update_poly_display(cursor_xy=None)
+            return
+
+        # Paint on image panel
+        if self._paint_mode and event.inaxes is self.ax_img and event.xdata is not None:
+            self._painting = True
+            self._paint_dir = "add" if event.button == 1 else "remove"
+            self._paint_at(event.xdata, event.ydata)
+            return
+
+        # Histogram peak selection (existing behaviour)
         if event.inaxes is not self.ax_hist or event.xdata is None:
             return
         if self.manual_mode:
-            return  # clicks on histogram are for Gaussian mode only
+            return
         x_click = float(event.xdata)
         img = self.data[self.current_tilt]
         print(f"Fitting peak near x={x_click:.2f}  (tilt {self.current_tilt + 1}) …")
@@ -645,7 +802,6 @@ class PeakMaskEditor:
         print(f"  Fitted:  µ={mu:.2f}  σ={sigma:.2f}")
         print(f"Propagating fit across all {self.n_tilts} tilts …")
         self._fit_all_tilts(self.current_tilt, mu, sigma)
-        # Invalidate any previous smooth fit so it is recomputed on demand
         self.smooth_mu    = None
         self.smooth_sigma = None
         if self.use_smooth:
@@ -653,6 +809,267 @@ class PeakMaskEditor:
             self._compute_smooth_mu()
         print("Done.")
         self._refresh()
+
+    def _on_mouse_release(self, _event):
+        self._painting = False
+
+    def _on_mouse_motion(self, event):
+        # Polygon mode: update the rubber-band close-line following the cursor
+        if self._poly_mode and self._poly_verts:
+            in_img = event.inaxes is self.ax_img and event.xdata is not None
+            if in_img:
+                self._update_poly_display(cursor_xy=(event.xdata, event.ydata))
+            self.fig.canvas.draw_idle()
+            return
+
+        if not self._paint_mode:
+            return
+        in_img = event.inaxes is self.ax_img and event.xdata is not None
+        self._brush_cursor.set_visible(in_img)
+        if in_img:
+            self._brush_cursor.set_center((event.xdata, event.ydata))
+            self._brush_cursor.set_radius(self._brush_size)
+            if self._painting:
+                self._paint_at(event.xdata, event.ydata)
+        self.fig.canvas.draw_idle()
+
+    def _paint_at(self, xdata: float, ydata: float):
+        """Apply one brush stamp at (xdata, ydata) in image data coordinates."""
+        h, w = self.data.shape[1], self.data.shape[2]
+        ti   = self.current_tilt
+        r    = self._brush_size
+        cx, cy = int(round(xdata)), int(round(ydata))
+        ys, xs = np.ogrid[:h, :w]
+        circle = (ys - cy) ** 2 + (xs - cx) ** 2 <= r ** 2
+        if self._paint_dir == "add":
+            if ti not in self._paint_add:
+                self._paint_add[ti] = np.zeros((h, w), dtype=bool)
+            self._paint_add[ti][circle] = True
+            if ti in self._paint_remove:
+                self._paint_remove[ti][circle] = False
+        else:
+            if ti not in self._paint_remove:
+                self._paint_remove[ti] = np.zeros((h, w), dtype=bool)
+            self._paint_remove[ti][circle] = True
+            if ti in self._paint_add:
+                self._paint_add[ti][circle] = False
+        self._refresh()
+
+    def _on_brush_changed(self, val):
+        self._brush_size = int(val)
+        self._brush_cursor.set_radius(self._brush_size)
+        self.fig.canvas.draw_idle()
+
+    def _on_reset_paint(self, _event):
+        ti = self.current_tilt
+        self._paint_add.pop(ti, None)
+        self._paint_remove.pop(ti, None)
+        self._refresh()
+
+    # ------------------------------------------------------------------
+    # Polygon drawing
+    # ------------------------------------------------------------------
+
+    def _poly_btn_label(self):
+        return f"Poly: {'ON' if self._poly_mode else 'OFF'} [{self._poly_commit_dir.upper()}]"
+
+    def _on_toggle_polygon(self, _event):
+        self._poly_mode = not self._poly_mode
+        if self._poly_mode:
+            # Deactivate paint mode so they don't interfere
+            if self._paint_mode:
+                self._paint_mode = False
+                self.btn_paint.label.set_text("Paint: OFF")
+                self.btn_paint.ax.set_facecolor("lightgray")
+                self._brush_cursor.set_visible(False)
+            self.btn_polygon.ax.set_facecolor("lightcyan")
+            print(
+                "Polygon mode ON  —  left-click: place vertex  |  "
+                "click near start or Enter: commit  |  "
+                "c: close via nearest edge points (min-area) then commit  |  "
+                "r: toggle add/remove  |  "
+                "Backspace: undo last vertex  |  "
+                "Esc: cancel"
+            )
+        else:
+            self._clear_polygon_drawing()
+            self.btn_polygon.ax.set_facecolor("lightgray")
+        self.btn_polygon.label.set_text(self._poly_btn_label())
+        self.fig.canvas.draw_idle()
+
+    def _on_toggle_paint(self, _event):
+        self._paint_mode = not self._paint_mode
+        if self._paint_mode:
+            # Deactivate polygon mode so they don't interfere
+            if self._poly_mode:
+                self._poly_mode = False
+                self._clear_polygon_drawing()
+                self.btn_polygon.label.set_text("Poly: OFF")
+                self.btn_polygon.ax.set_facecolor("lightgray")
+            self.btn_paint.label.set_text("Paint: ON")
+            self.btn_paint.ax.set_facecolor("lightgreen")
+        else:
+            self.btn_paint.label.set_text("Paint: OFF")
+            self.btn_paint.ax.set_facecolor("lightgray")
+            self._brush_cursor.set_visible(False)
+        self.fig.canvas.draw_idle()
+
+    def _is_near_poly_start(self, xdata: float, ydata: float) -> bool:
+        """True if (xdata, ydata) is within ~10 display pixels of the first vertex."""
+        if len(self._poly_verts) < 2:
+            return False
+        x0, y0 = self._poly_verts[0]
+        disp_click = self.ax_img.transData.transform((xdata, ydata))
+        disp_start = self.ax_img.transData.transform((x0, y0))
+        return float(np.hypot(*(disp_click - disp_start))) < 10.0
+
+    def _update_poly_display(self, cursor_xy=None):
+        """Redraw the polygon outline artists from current vertices."""
+        if not self._poly_verts:
+            self._poly_line.set_data([], [])
+            self._poly_close_line.set_data([], [])
+            self._poly_dots.set_data([], [])
+            return
+        xs = [v[0] for v in self._poly_verts]
+        ys = [v[1] for v in self._poly_verts]
+        # Main line connecting placed vertices
+        self._poly_line.set_data(xs, ys)
+        self._poly_dots.set_data(xs, ys)
+        # Rubber-band line: from last vertex to cursor (and dotted back to start)
+        if cursor_xy is not None:
+            cx, cy = cursor_xy
+            self._poly_close_line.set_data(
+                [xs[-1], cx, xs[0]], [ys[-1], cy, ys[0]]
+            )
+        else:
+            self._poly_close_line.set_data([], [])
+
+    def _finalize_polygon(self, direction: str):
+        """Commit the current polygon interior to the paint overlay."""
+        if len(self._poly_verts) < 3:
+            return
+        h, w = self.data.shape[1], self.data.shape[2]
+        verts = self._poly_verts + [self._poly_verts[0]]  # close the path
+        path = MplPath(verts)
+        yy, xx = np.mgrid[:h, :w]
+        pts = np.column_stack([xx.ravel(), yy.ravel()])
+        inside = path.contains_points(pts).reshape(h, w)
+        ti = self.current_tilt
+        if direction == "add":
+            if ti not in self._paint_add:
+                self._paint_add[ti] = np.zeros((h, w), dtype=bool)
+            self._paint_add[ti] |= inside
+            if ti in self._paint_remove:
+                self._paint_remove[ti] &= ~inside
+        else:  # "remove"
+            if ti not in self._paint_remove:
+                self._paint_remove[ti] = np.zeros((h, w), dtype=bool)
+            self._paint_remove[ti] |= inside
+            if ti in self._paint_add:
+                self._paint_add[ti] &= ~inside
+
+    def _clear_polygon_drawing(self):
+        """Discard in-progress polygon vertices and hide artists."""
+        self._poly_verts = []
+        self._poly_line.set_data([], [])
+        self._poly_close_line.set_data([], [])
+        self._poly_dots.set_data([], [])
+
+    def _close_via_edge(self):
+        """
+        Snap each open endpoint perpendicularly to the nearest image boundary
+        point (anywhere on the edge, not just corners), then walk the boundary
+        between those two snap points in the direction that minimises the
+        enclosed polygon area (shoelace), then finalise.
+        """
+        if not self._poly_verts:
+            return
+        h, w  = self.data.shape[1], self.data.shape[2]
+        W, H  = float(w - 1), float(h - 1)
+        P     = 2.0 * (W + H)   # perimeter
+
+        # Clockwise corners: BL, BR, TR, TL
+        corners  = [(0.0, 0.0), (W, 0.0), (W, H), (0.0, H)]
+        corner_s = [0.0, W, W + H, 2.0*W + H]
+
+        def snap(x, y):
+            """Project (x, y) onto the nearest image boundary edge."""
+            x, y = float(np.clip(x, 0, W)), float(np.clip(y, 0, H))
+            d_l, d_r, d_b, d_t = x, W - x, y, H - y
+            best = min(d_l, d_r, d_b, d_t)
+            if best == d_l: return (0.0, y)
+            if best == d_r: return (W,   y)
+            if best == d_b: return (x,   0.0)
+            return                  (x,   H)
+
+        def to_s(px, py):
+            """Clockwise boundary parameter s ∈ [0, P) for a point on the boundary."""
+            if py == 0.0: return px                    # bottom  (left → right)
+            if px == W:   return W + py                # right   (bottom → top)
+            if py == H:   return W + H + (W - px)     # top     (right → left)
+            return                W + H + W + (H - py) # left    (top → bottom)
+
+        def arc(s_from, pt_from, s_to, pt_to, cw: bool):
+            """Boundary vertices from pt_from to pt_to via CW (cw=True) or CCW arc."""
+            if cw:
+                span     = (s_to - s_from) % P
+                delta_fn = lambda cs: (cs - s_from) % P
+            else:
+                span     = (s_from - s_to) % P
+                delta_fn = lambda cs: (s_from - cs) % P
+            if span == 0:
+                return [pt_from, pt_to]
+            mid = sorted(
+                (delta_fn(cs), corners[i])
+                for i, cs in enumerate(corner_s)
+                if 0 < delta_fn(cs) < span
+            )
+            return [pt_from] + [pt for _, pt in mid] + [pt_to]
+
+        def shoelace(verts):
+            n  = len(verts)
+            xs = [v[0] for v in verts]
+            ys = [v[1] for v in verts]
+            return abs(sum(xs[i]*ys[(i+1)%n] - xs[(i+1)%n]*ys[i]
+                           for i in range(n))) / 2.0
+
+        user     = list(self._poly_verts)
+        pt_last  = snap(*user[-1])
+        pt_first = snap(*user[0])
+        s_last   = to_s(*pt_last)
+        s_first  = to_s(*pt_first)
+
+        path_cw  = arc(s_last, pt_last, s_first, pt_first, cw=True)
+        path_ccw = arc(s_last, pt_last, s_first, pt_first, cw=False)
+
+        chosen = path_cw if shoelace(user + path_cw) <= shoelace(user + path_ccw) \
+                         else path_ccw
+        self._poly_verts.extend(chosen)
+        self._finalize_polygon(self._poly_commit_dir)
+        self._clear_polygon_drawing()
+        self._refresh()
+
+    def _on_key_press(self, event):
+        if not self._poly_mode:
+            return
+        if event.key == "escape":
+            self._clear_polygon_drawing()
+            self.fig.canvas.draw_idle()
+        elif event.key == "enter" and len(self._poly_verts) >= 3:
+            self._finalize_polygon(self._poly_commit_dir)
+            self._clear_polygon_drawing()
+            self._refresh()
+        elif event.key == "c" and self._poly_verts:
+            self._close_via_edge()
+        elif event.key == "backspace" and self._poly_verts:
+            self._poly_verts.pop()
+            self._update_poly_display()
+            self.fig.canvas.draw_idle()
+        elif event.key == "r":
+            self._poly_commit_dir = "remove" if self._poly_commit_dir == "add" else "add"
+            self.btn_polygon.label.set_text(self._poly_btn_label())
+            print(f"Polygon direction → {self._poly_commit_dir.upper()}")
+            self.fig.canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # Output generation
@@ -668,26 +1085,60 @@ class PeakMaskEditor:
               f"{'manual' if self.manual_mode else ('smooth µ' if self.use_smooth else 'Gaussian')}")
         print(f"  Output path  : {self.output_path}")
 
-        output = np.empty_like(self.data_full, dtype=np.float32)
+        h_bin,  w_bin  = self.data.shape[1],     self.data.shape[2]
+        _, h_full, w_full = self._full_shape
+        save_mask = bool(self.chk_save_mask.get_status()[0])
+        ti = self.current_tilt
+        comparison_orig = None
+        comparison_proc = None
 
-        for i in tqdm(range(self.n_tilts), desc="Inpainting tilts"):
-            img = self.data_full[i].astype(float)
-            lo, hi, _, _ = self._get_lo_hi(i)
-            mask = compute_mask_from_range(img, lo, hi)
-            if (~mask).any():
-                output[i] = inpaint_tilt(img, mask).astype(np.float32)
-            else:
-                output[i] = img.astype(np.float32)
+        mask_path = os.path.splitext(self.output_path)[0] + "_mask.mrc"
+        mask_mrc = (
+            mrcfile.new_mmap(mask_path, shape=(self.n_tilts, h_full, w_full),
+                             mrc_mode=0, overwrite=True)
+            if save_mask else None
+        )
 
-        with mrcfile.new(self.output_path, overwrite=True) as mrc:
-            mrc.set_data(output)
+        try:
+            with mrcfile.new_mmap(self.output_path,
+                                  shape=(self.n_tilts, h_full, w_full),
+                                  mrc_mode=2, overwrite=True) as out_mrc:
+                for i in tqdm(range(self.n_tilts), desc="Inpainting tilts"):
+                    img = self._mmap_data[i].astype(float)
+                    lo, hi, _, _ = self._get_lo_hi(i)
+                    mask = compute_mask_from_range(img, lo, hi)
+
+                    p_add = self._paint_add.get(i)
+                    p_rem = self._paint_remove.get(i)
+                    if p_add is not None:
+                        mask |= zoom(p_add.astype(np.float32),
+                                     (h_full / h_bin, w_full / w_bin), order=0) > 0.5
+                    if p_rem is not None:
+                        mask &= ~(zoom(p_rem.astype(np.float32),
+                                       (h_full / h_bin, w_full / w_bin), order=0) > 0.5)
+                    if self._keep_top_cc and mask.any():
+                        mask = largest_connected_component(mask)
+
+                    result = inpaint_tilt(img, mask).astype(np.float32) if (~mask).any() \
+                             else img.astype(np.float32)
+                    out_mrc.data[i] = result
+                    if mask_mrc is not None:
+                        mask_mrc.data[i] = mask.astype(np.int8)
+                    if i == ti:
+                        comparison_orig = img.astype(np.float32)
+                        comparison_proc = result
+        finally:
+            if mask_mrc is not None:
+                mask_mrc.close()
+
         print(f"Saved → {self.output_path}")
-        self._show_comparison(output)
+        if save_mask:
+            print(f"Mask  → {mask_path}")
 
-    def _show_comparison(self, output: np.ndarray):
+        self._show_comparison(comparison_orig, comparison_proc)
+
+    def _show_comparison(self, orig: np.ndarray, proc: np.ndarray):
         ti   = self.current_tilt
-        orig = self.data_full[ti]
-        proc = output[ti]
         lo, hi, mu, sigma = self._get_lo_hi(ti)
         mask = compute_mask_from_range(orig, lo, hi)
         bad  = ~mask
@@ -721,13 +1172,15 @@ class PeakMaskEditor:
     # ------------------------------------------------------------------
 
     def _save_params_json(self) -> str:
-        """Serialise per-tilt (lo, hi) thresholds to JSON. Returns the file path."""
-        if not self._peak_selected and not self.manual_overrides:
-            print("No peak selected and no manual overrides — nothing to save.")
+        """Serialise per-tilt thresholds (and paint overlays) to JSON + optional mask MRC."""
+        has_paint = bool(self._paint_add or self._paint_remove)
+        if not self._peak_selected and not self.manual_overrides and not has_paint:
+            print("No peak selected, no manual overrides, and no paint overlays — nothing to save.")
             return None
 
         stem = os.path.splitext(self.input_path)[0]
         params_path = stem + "_inpaint_params.json"
+
         tilts = {}
         for i in range(self.n_tilts):
             lo, hi, _, _ = self._get_lo_hi(i)
@@ -736,11 +1189,41 @@ class PeakMaskEditor:
             tilts[str(i)] = {"lo": float(lo), "hi": float(hi)}
 
         payload = {
-            "input":        os.path.abspath(self.input_path),
-            "output":       os.path.abspath(self.output_path),
+            "input":         os.path.abspath(self.input_path),
+            "output":        os.path.abspath(self.output_path),
             "edge_blend_px": 15,
-            "tilts":        tilts,
+            "save_mask":     bool(self.chk_save_mask.get_status()[0]),
+            "tilts":         tilts,
         }
+
+        # If paint/polygon overlays exist, or Top CC is on, bake the final spatial
+        # masks into a companion MRC so that inpaint_apply.py uses them exactly.
+        if has_paint or self._keep_top_cc:
+            h_bin, w_bin      = self.data.shape[1],    self.data.shape[2]
+            _, h_full, w_full = self._full_shape
+            mask_mrc_path  = stem + "_inpaint_mask.mrc"
+            with mrcfile.new_mmap(mask_mrc_path,
+                                  shape=(self.n_tilts, h_full, w_full),
+                                  mrc_mode=0, overwrite=True) as mrc:
+                for i in tqdm(range(self.n_tilts), desc="Baking masks"):
+                    lo, hi, _, _ = self._get_lo_hi(i)
+                    img = self._mmap_data[i].astype(float)
+                    m   = compute_mask_from_range(img, lo, hi) if lo is not None \
+                          else np.ones((h_full, w_full), dtype=bool)
+                    p_add = self._paint_add.get(i)
+                    p_rem = self._paint_remove.get(i)
+                    if p_add is not None:
+                        m |= zoom(p_add.astype(np.float32),
+                                  (h_full / h_bin, w_full / w_bin), order=0) > 0.5
+                    if p_rem is not None:
+                        m &= ~(zoom(p_rem.astype(np.float32),
+                                    (h_full / h_bin, w_full / w_bin), order=0) > 0.5)
+                    if self._keep_top_cc and m.any():
+                        m = largest_connected_component(m)
+                    mrc.data[i] = m.astype(np.int8)
+            payload["mask_mrc"] = os.path.abspath(mask_mrc_path)
+            print(f"Mask MRC  → {mask_mrc_path}")
+
         with open(params_path, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"Params JSON → {params_path}")
@@ -840,30 +1323,27 @@ def main():
     if not os.path.exists(args.input):
         sys.exit(f"Error: file not found: {args.input}")
 
-    print(f"Loading {args.input} …")
-    with mrcfile.open(args.input, mode="r", permissive=True) as mrc:
-        data = mrc.data.copy()
-
-    if data.ndim == 2:
-        data = data[np.newaxis]
-    elif data.ndim != 3:
-        sys.exit(f"Error: expected 2-D or 3-D MRC data, got shape {data.shape}")
-
-    print(
-        f"Loaded:  {data.shape[0]} tilts,  "
-        f"{data.shape[1]} × {data.shape[2]} px,  "
-        f"intensity [{float(data.min()):.4g}, {float(data.max()):.4g}]"
-    )
-
-    editor = PeakMaskEditor(
-        data, args.input, args.output,
-        max_px=args.max_pixels, n_sigma_default=args.n_sigma,
-        slurm_template=args.slurm_template,
-        slurm_cpus=args.slurm_cpus,
-        slurm_mem=args.slurm_mem,
-        slurm_time=args.slurm_time,
-    )
-    editor.show()
+    print(f"Opening {args.input} as memory-map …")
+    with mrcfile.mmap(args.input, mode="r", permissive=True) as mrc:
+        ndim = mrc.data.ndim
+        if ndim not in (2, 3):
+            sys.exit(f"Error: expected 2-D or 3-D MRC data, got shape {mrc.data.shape}")
+        shape = mrc.data.shape
+        n = 1 if ndim == 2 else shape[0]
+        h, w = shape[-2], shape[-1]
+        print(
+            f"Opened:  {n} tilt(s),  {h} × {w} px  "
+            f"({n * h * w * mrc.data.itemsize / 1e9:.2f} GB on disk)"
+        )
+        editor = PeakMaskEditor(
+            mrc, args.input, args.output,
+            max_px=args.max_pixels, n_sigma_default=args.n_sigma,
+            slurm_template=args.slurm_template,
+            slurm_cpus=args.slurm_cpus,
+            slurm_mem=args.slurm_mem,
+            slurm_time=args.slurm_time,
+        )
+        editor.show()
 
 
 if __name__ == "__main__":

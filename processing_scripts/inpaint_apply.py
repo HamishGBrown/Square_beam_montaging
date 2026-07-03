@@ -17,6 +17,10 @@ JSON params format (produced by the GUI's "Save SLURM" button)
       "input":        "/abs/path/to/input.mrc",
       "output":       "/abs/path/to/output.mrc",
       "edge_blend_px": 15,
+      "mask_mrc":     "/abs/path/to/mask.mrc",   # optional; present when paint/polygon
+                                                  # overlays were drawn in the GUI.
+                                                  # When present, the spatial mask
+                                                  # overrides per-tilt lo/hi thresholds.
       "tilts": {
         "0":  {"lo": 40.5,  "hi": 253.0},
         "1":  {"lo": 38.2,  "hi": 248.1},
@@ -30,15 +34,16 @@ import json
 import multiprocessing
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
 import numpy as np
 import numpy.ma as ma
 import mrcfile
 from scipy.ndimage import label
 from tqdm import tqdm
 
-from .smoothn import smoothn
+try:
+    from .smoothn import smoothn
+except ImportError:
+    from smoothn import smoothn
 
 
 # ---------------------------------------------------------------------------
@@ -73,29 +78,38 @@ def _process_tilt(args: tuple) -> tuple:
 
     Opening the MRC inside each worker avoids serialising large arrays across
     the process boundary while still allowing concurrent reads (mmap, read-only).
+
+    If mask_path is provided the pre-baked spatial mask is used directly (paint/
+    polygon overlays from the GUI are already baked in); otherwise the mask is
+    recomputed from the lo/hi intensity thresholds.
     """
-    tilt_idx, input_path, lo, hi, smoothn_workers = args
+    tilt_idx, input_path, lo, hi, smoothn_workers, mask_path = args
 
     # Concurrent read-only mmap access is safe on all major OS/filesystems
     with mrcfile.mmap(input_path, mode='r', permissive=True) as mrc:
         img = np.array(mrc.data[tilt_idx], dtype=float)
 
-    # --- mask: largest connected component inside [lo, hi] ---
-    raw = (img >= lo) & (img <= hi)
-    if raw.any():
-        labeled, n_feat = label(raw)
-        if n_feat > 0:
-            sizes = np.bincount(labeled.ravel())
-            sizes[0] = 0
-            mask = (labeled == sizes.argmax()).astype(bool)
+    if mask_path is not None:
+        # Use the pre-baked spatial mask (includes paint/polygon overlays)
+        with mrcfile.mmap(mask_path, mode='r', permissive=True) as mrc:
+            mask = mrc.data[tilt_idx].astype(bool)
+    else:
+        # --- mask: largest connected component inside [lo, hi] ---
+        raw = (img >= lo) & (img <= hi)
+        if raw.any():
+            labeled, n_feat = label(raw)
+            if n_feat > 0:
+                sizes = np.bincount(labeled.ravel())
+                sizes[0] = 0
+                mask = (labeled == sizes.argmax()).astype(bool)
+            else:
+                mask = raw.astype(bool)
         else:
             mask = raw.astype(bool)
-    else:
-        mask = raw.astype(bool)
 
     bad = ~mask
     if not bad.any():
-        return tilt_idx, img.astype(np.float32)
+        return tilt_idx, img.astype(np.float32), mask.astype(np.int8)
 
     # --- inpaint with smoothn ---
     inpainted = smoothn(ma.array(img, mask=bad), s=1e7, max_iter=500,
@@ -104,14 +118,7 @@ def _process_tilt(args: tuple) -> tuple:
     result = img.copy()
     result[bad] = inpainted[bad]
 
-    # # --- soft edge blend ---
-    # dist_inside = distance_transform_edt(mask).astype(float)
-    # blend = (dist_inside > 0) & (dist_inside < edge_blend_px)
-    # if blend.any():
-    #     alpha = np.clip(dist_inside[blend] / edge_blend_px, 0.0, 1.0)
-    #     result[blend] = alpha * img[blend] + (1.0 - alpha) * inpainted[blend]
-
-    return tilt_idx, result.astype(np.float32)
+    return tilt_idx, result.astype(np.float32), mask.astype(np.int8)
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +127,15 @@ def _process_tilt(args: tuple) -> tuple:
 
 def run(input_path: str, output_path: str, params: dict,
         n_cpus: int = None, edge_blend_px: int = None,
-        smoothn_workers: int = None) -> None:
+        smoothn_workers: int = None, save_mask: bool = False) -> None:
     """
     Apply per-tilt masks from *params["tilts"]* to *input_path* and write the
-    inpainted stack to *output_path*, processing tilts in parallel.
+    inpainted stack to *output_path*.
+
+    If *save_mask* is True, also write the binary mask stack to
+    ``<output_stem>_mask.mrc`` (mrc_mode=0, int8).  When a pre-baked
+    ``mask_mrc`` is already referenced in *params*, the same mask data is
+    re-emitted per-tilt so both outputs sit alongside each other.
     """
     tilt_params = params["tilts"]
     n_tilts     = len(tilt_params)
@@ -132,39 +144,45 @@ def run(input_path: str, output_path: str, params: dict,
     total_cpus = multiprocessing.cpu_count()
     if n_cpus is None:
         n_cpus = total_cpus
-    # Divide remaining CPUs across smoothn's DCT/IDCT threads so tilt processes
-    # and FFT threads together use all available cores without oversubscribing.
+    # Tilts are processed serially; all CPUs go to smoothn's DCT/IDCT threads.
     if smoothn_workers is None:
-        smoothn_workers = max(1, total_cpus // n_cpus)
+        smoothn_workers = n_cpus
+
+    mask_path = params.get("mask_mrc")   # None when no paint/polygon overlays were saved
 
     print(f"Input           : {input_path}")
     print(f"Output          : {output_path}")
     print(f"Tilts           : {n_tilts}")
-    print(f"Tilt workers    : {n_cpus}")
     print(f"smoothn workers : {smoothn_workers}  (DCT threads per tilt)")
     print(f"Blend px        : {edge_blend_px}")
+    if mask_path:
+        print(f"Spatial mask    : {mask_path}  (paint/polygon overlays baked in)")
+    else:
+        print("Spatial mask    : none  (using lo/hi intensity thresholds)")
 
     with mrcfile.mmap(input_path, mode='r', permissive=True) as mrc:
         shape = tuple(mrc.data.shape)
 
-    # Pre-create the output MRC and memory-map it so each tilt is written
-    # directly to disk as it finishes — avoids holding the full stack in RAM.
-    with mrcfile.new_mmap(output_path, shape=shape, mrc_mode=2,
-                          overwrite=True) as out_mrc:
-        worker_args = [
-            (int(i), input_path,
-             float(tilt_params[str(i)]["lo"]),
-             float(tilt_params[str(i)]["hi"]),
-             smoothn_workers)
-            for i in range(n_tilts)
-        ]
+    mask_out_path = os.path.splitext(output_path)[0] + "_mask.mrc" if save_mask else None
 
-        with ProcessPoolExecutor(max_workers=n_cpus) as pool:
-            futures = {pool.submit(_process_tilt, a): a[0] for a in worker_args}
-            for future in tqdm(as_completed(futures), total=n_tilts,
-                               desc="Inpainting tilts"):
-                tilt_idx, result = future.result()
-                out_mrc.data[tilt_idx] = result
+    def _write_tilts(out_mrc, mask_mrc):
+        for i in tqdm(range(n_tilts), desc="Inpainting tilts"):
+            _, result, mask = _process_tilt((i, input_path,
+                                             float(tilt_params[str(i)]["lo"]),
+                                             float(tilt_params[str(i)]["hi"]),
+                                             smoothn_workers,
+                                             mask_path))
+            out_mrc.data[i] = result
+            if mask_mrc is not None:
+                mask_mrc.data[i] = mask
+
+    with mrcfile.new_mmap(output_path, shape=shape, mrc_mode=2, overwrite=True) as out_mrc:
+        if mask_out_path:
+            with mrcfile.new_mmap(mask_out_path, shape=shape, mrc_mode=0, overwrite=True) as mask_mrc:
+                _write_tilts(out_mrc, mask_mrc)
+            print(f"Mask  → {mask_out_path}")
+        else:
+            _write_tilts(out_mrc, None)
 
     print(f"Saved → {output_path}")
 
@@ -190,6 +208,10 @@ def main() -> None:
     parser.add_argument("--edge-blend", type=int, default=None,
                         dest="edge_blend_px",
                         help="Edge-blend width in pixels (overrides params file value)")
+    parser.add_argument("--save-mask", action="store_true", default=False,
+                        dest="save_mask",
+                        help="Also write the binary mask stack to "
+                             "<output>_mask.mrc (int8, mrc_mode=0)")
     args = parser.parse_args()
 
     for path, label_ in [(args.input, "input"), (args.params, "params")]:
@@ -201,9 +223,13 @@ def main() -> None:
     with open(args.params) as f:
         params = json.load(f)
 
+    # The GUI "Save mask MRC" checkbox writes save_mask=true into the JSON;
+    # the --save-mask CLI flag is an override for manual invocations.
+    save_mask = args.save_mask or bool(params.get("save_mask", False))
+
     run(args.input, output, params,
         n_cpus=args.cpus, edge_blend_px=args.edge_blend_px,
-        smoothn_workers=args.smoothn_workers)
+        smoothn_workers=args.smoothn_workers, save_mask=save_mask)
 
 
 if __name__ == "__main__":

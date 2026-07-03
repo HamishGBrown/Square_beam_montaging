@@ -1,21 +1,20 @@
 """
 Join a tilt-series of stitched montage TIFFs into a single MRC stack for IMOD/AreTomo,
-writing companion files: .rawtlt, tiltAngles.txt, a merged .mdoc, and an HDF5 file
-containing the refined tile positions and index maps from each tilt.
+writing companion files: .rawtlt, tiltAngles.txt, and an HDF5 file containing the
+refined tile positions and index maps from each tilt.
 """
 
 import argparse
 import glob
 import os
 import re
-from datetime import datetime
 
 import mrcfile
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from .Utilities import parse_mdoc, write_mdoc, load_array_from_hdf5, save_array_to_hdf5
+from .Utilities import load_array_from_hdf5, save_array_to_hdf5
 
 # Disable PIL's safety limit — montage TIFFs are legitimately very large.
 Image.MAX_IMAGE_PIXELS = None
@@ -44,20 +43,16 @@ def parse_commandline():
         help="Path to text file containing tilts and image shifts at every tilt",
     )
     parser.add_argument(
-        "-e", "--dose_per_tilt",
-        required=False,
+        "-p", "--pixel_size",
+        required=True,
         type=float,
-        help="Dose per tilt (used for dose weighting in Relion)",
+        help="Pixel size in Angstroms (of the binned, stitched montage tiles).",
     )
     parser.add_argument(
         "-O", "--acquisition_order",
         action="store_true",
-        help="Stack images in acquisition order instead of tilt order (e.g. for Relion dose weighting)",
-    )
-    parser.add_argument(
-        "-M", "--noMdoc",
-        action="store_true",
-        help="Skip writing a joined mdoc file",
+        help="Stack images in acquisition order (by file mtime) instead of tilt order "
+             "(e.g. for Relion dose weighting).",
     )
     return vars(parser.parse_args())
 
@@ -69,13 +64,14 @@ def extract_number(filename):
 
 
 def sort_files(fnams, acquisition_order=True):
-    """Sort TIFFs either by acquisition time (for dose weighting) or by tilt angle."""
+    """Sort TIFFs either by acquisition time (for dose weighting) or by tilt angle.
+
+    Acquisition order uses each file's mtime rather than any embedded
+    metadata: stitch.py preserves the source raw montage's mtime on its
+    stitched output, so file mtime order matches true acquisition order.
+    """
     if acquisition_order:
-        mdocs = [parse_mdoc(f.replace(".tif", ".tif.mdoc")) for f in fnams]
-        fmt = "%d-%b-%Y %H:%M:%S"
-        times = [datetime.strptime(m["ZValue = 0"]["DateTime"], fmt) for m in mdocs]
-        _, sorted_fnams = zip(*sorted(zip(times, fnams)))
-        return list(sorted_fnams)
+        return sorted(fnams, key=os.path.getmtime)
     return sorted(fnams, key=extract_number)
 
 
@@ -90,6 +86,7 @@ def main():
     # Filter to TIFFs that share the canvas size of the first file; warn and skip others.
     with Image.open(fnams[0]) as img0:
         first_size = img0.size
+        first_dtype = np.array(img0).dtype
     compliant = [fnams[0]]
     for fnam in fnams[1:]:
         with Image.open(fnam) as img:
@@ -106,11 +103,12 @@ def main():
     outname = os.path.basename(os.path.commonprefix(fnams)) or "tilt_series"
     outputfile = os.path.join(outputdir, outname + ".mrc")
 
-    # mode 1 = int16.  Signed int16 preserves the -1 sentinel written by
-    # stitch --mark-uncovered; range loss vs uint16 is negligible for EM data.
-    with mrcfile.new_mmap(outputfile, shape, mrc_mode=1, overwrite=True) as mrc:
+    # Match the MRC mode/dtype to the input TIFFs' own dtype rather than forcing int16.
+    mrc_mode = mrcfile.utils.mode_from_dtype(first_dtype)
+    mrc_dtype = mrcfile.utils.dtype_from_mode(mrc_mode)
+    with mrcfile.new_mmap(outputfile, shape, mrc_mode=mrc_mode, overwrite=True) as mrc:
         for i, f in enumerate(tqdm(fnams, desc="Joining TIFFs into MRC")):
-            mrc.data[i] = np.array(Image.open(f), dtype=np.int16)[: shape[1], : shape[2]]
+            mrc.data[i] = np.array(Image.open(f), dtype=mrc_dtype)[: shape[1], : shape[2]]
 
     tilts = [extract_number(fnam) for fnam in fnams]
 
@@ -124,37 +122,7 @@ def main():
     with open(tilt_angles_file, "w") as f:
         f.write("\n".join(f"{tilt} {i + 1}" for i, tilt in enumerate(tilts)) + "\n")
 
-    # Always parse mdocs — needed for pixel size even when --noMdoc is set.
-    mdoc_fnams = [x.replace(".tif", ".tif.mdoc") for x in fnams]
-    mdocs = [parse_mdoc(m) for m in mdoc_fnams]
-
-    # PixelSpacing is in Angstroms. Prefer the per-section value (ZValue = 0)
-    # which reflects any per-tilt binning; fall back to the header-level value.
-    def _pixel_spacing(mdoc):
-        section = mdoc.get("ZValue = 0", {})
-        raw = section.get("PixelSpacing") or mdoc.get("PixelSpacing")
-        if raw is None:
-            raise ValueError("PixelSpacing not found in mdoc")
-        return float(raw)
-
-    psize = [_pixel_spacing(m) for m in mdocs]
-
-    if not args["noMdoc"]:
-        # Start from the header of the first mdoc (everything except per-section ZValue blocks),
-        # then overwrite file-level fields and add one ZValue section per tilt.
-        outputmdoc = {k: v for k, v in mdocs[0].items() if not re.match(r"ZValue = \d+", k)}
-        outputmdoc["ImageFile"] = outname + ".mrc"
-        outputmdoc["ImageSize"] = " ".join(str(x) for x in shape[1:])
-
-        for i, (fnam, mdoc) in enumerate(zip(fnams, mdocs)):
-            section = mdoc["ZValue = 0"].copy()
-            section["SubFramePath"] = os.path.abspath(fnam)
-            if args["dose_per_tilt"] is not None:
-                section["ExposureDose"] = args["dose_per_tilt"]
-            outputmdoc[f"ZValue = {i}"] = section
-
-        outputmdocfnam = outputfile.replace(".mrc", ".mrc.mdoc")
-        write_mdoc(outputmdoc, outputmdocfnam)
+    psize = [args["pixel_size"]] * len(fnams)
 
     # Collect per-tilt HDF5 files containing refined tile positions and index maps,
     # pad positions arrays to a common shape, and save everything into one HDF5.
@@ -181,9 +149,8 @@ def main():
         ["tilts", "Refined_positions", "index_map", "Montage_filenames", "binned_pixel_size"],
     )
 
-    mdoc_msg = f" and {outputmdocfnam}" if not args["noMdoc"] else ""
     print(
-        f"Written {len(fnams)} files to {outputfile}{mdoc_msg}, "
+        f"Written {len(fnams)} files to {outputfile}, "
         f"{outname}.rawtlt for IMOD, and {h5outname}"
     )
 
