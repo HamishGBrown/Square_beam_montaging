@@ -35,7 +35,7 @@ A single tilt's acquisition looks like this:
 
 ---
 
-# Step 3: Motion correction
+# Step 2: Motion correction
 
 Raw frames from each tile are motion-corrected using `beam_mask_motioncorr`, which auto-detects the square beam boundary to restrict motion estimation to the illuminated area, then applies the derived shifts to the full detector frame so that downstream stitching is unaffected.
 
@@ -65,7 +65,7 @@ sbatch mc2_job.sh
 
 ---
 
-# Step 4: Stitch montage tilt series
+# Step 3: Stitch montage tilt series
 
 Assemble the per-tile motion-corrected MRCs into a single montage tilt series per tilt angle, then join all tilts into one MRC stack:
 
@@ -97,7 +97,7 @@ This crops all tilt images to the smallest common size (accounting for changes i
 
 ---
 
-# Step 5: Mask and inpaint
+# Step 4: Mask and inpaint
 
 The stitched montage contains background vacuum and thick regions outside the lamella, which degrade alignment and reconstruction. `mask_and_inpaint` provides an interactive GUI to define the lamella intensity window and inpaint everything outside it.
 
@@ -120,7 +120,7 @@ sbatch Montage_stitched_inpaint_slurm.sh
 
 ---
 
-# Step 6: Reconstruction
+# Step 5: Reconstruction
 
 The inpainted tilt series `Montage_inpainted.mrc` is ready for standard tomographic reconstruction.
 
