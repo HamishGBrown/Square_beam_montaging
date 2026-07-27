@@ -22,8 +22,8 @@ runs on the login node.
 |---|---|---|
 | **v0** geometry / conventions | **DONE, verified** | `rot-1 shift-1` @ +0.9105, unanimous over 3 tilts (job 28131022) |
 | **tilt sign** | **DONE, derived, re-audited** | read off AreTomo's kernels + the `clip rotx` depth flip; matches a literal transcription at +0.96..+0.99. Citations re-read and the rotx flip re-run independently — see "Independent audit" |
-| **v1** static reference | **IMPLEMENTED, NEEDS RE-RUN — the one open action** | residuals ~1 px = 27.4 A after bounding the NCC, but the reprojection itself was broken at high tilt. Fixed, and validated only against a synthetic kernel transcription; never re-measured on real data |
-| **v2** leave-one-out recon | not started | required for correctness, not speed — see v1 caveat |
+| **v1** static reference | **DONE, re-measured on real data** | median residual 14.57 px = 399 A over 36 measurements, tile rejection halved to 36% (job 28219393). Measurement is quantised to whole pixels — see "the upsample flag is a no-op" |
+| **v2** leave-one-out recon | not started — **now the open action** | required for correctness, not speed — see v1 caveat |
 | **v3** global solve + outer loop | not started | — |
 
 Scripts: `04_AreTomo_nopatch.sh` (alignment + aligned stack) ->
@@ -32,23 +32,88 @@ Scripts: `04_AreTomo_nopatch.sh` (alignment + aligned stack) ->
 
 ## STATUS — where to pick this up
 
-Last updated 2026-07-26.
+Last updated 2026-07-28.
 
-Nothing is committed to git — the working tree holds all of this, by request.
+Committed to git as of 2026-07-28 (`878b06f`, the script and this document
+only), local commits, not pushed.
 
-**Newest first:** the tilt sign is settled (`-TILT` for a rotx'd volume, read
-off AreTomo's source), and verifying it turned up a much bigger error — the
-reprojection was rotating where AreTomo shears, leaving the reference blank away
-from the tilt axis at high tilt. Both are fixed in `reproject_volume`. v1's
-measured residuals are stale as a result. See "Tilt sign convention" below.
+**Newest first:** v1 has been re-run through the fixed reprojection
+(job 28219393) and its numbers are now real. The reprojection fixes bought
+exactly what they should have: tile rejection halved and the residuals are
+physically sized and structured. See "v1 re-run" immediately below.
 
 ### The single next action
 
-**Re-run `07_projmatch_v1.sh`.** Nothing else is blocked. The tilt-sign fix has
-been validated only against a synthetic transcription of AreTomo's kernel, never
-against the real tomogram, and every residual in this document predates it.
-Until that job runs there is no measurement of what the fix bought. Check the
-~70% tile rejection rate at the same time (see "Still to check on the re-run").
+**v2 — leave-one-out reconstruction.** Everything before it is settled and
+measured. v1's magnitudes still cannot be read as residuals because its
+reference contains the tile being aligned; v2 is what makes the numbers mean
+something. Two smaller items are worth folding in on the way, both from the
+re-run: the whole-pixel quantisation and the residual 36% tile rejection.
+
+### v1 re-run (2026-07-28, job 28219393, 4m23s) — the fixes hold up
+
+Run without `--settle-tilt-sign`, which is now only a wrong-sign control and
+whose median-|shift| verdict rewards degenerate zeros. Clean exit, no warnings.
+
+| | before (28131893, broken) | after (28219393) |
+|---|---|---|
+| tiles rejected | 39/56 = **70%** | 20/56 = **36%** |
+| measurements | 17 | 36 |
+| median \|shift\| | 1.00 px (stale) | **14.57 px = 399 A** |
+| median weight | 0.416 | 0.448 |
+
+Per check tilt: -3 deg 7.07 px (11 tiles), 0 deg 17.37 px (12), +3 deg 21.93 px
+(13). Rejections 6/17, 8/20, 6/19.
+
+**The rejection rate was mostly the broken reprojection, as suspected — but not
+entirely.** Halving it confirms the diagnosis; the remaining 36% now needs a
+different explanation, and `--max-shift 200` and mode A's Voronoi slivers are
+back in the frame. Worth re-testing once v2's reference is cleaner rather than
+loosening the bound now.
+
+**The residuals are strongly anisotropic, and that is the interesting part.**
+Shifts perpendicular to the tilt axis reach 20-36 px while the along-axis
+component is usually 0-9 px and is exactly zero for a third of measurements.
+That asymmetry is the signature the height term in the global solve is built
+for: a tile at height `z_t` displaces by `z_t sin(alpha)` perpendicular to the
+tilt axis and not at all along it. It is *suggestive only* at three check tilts
+spanning 9-15 deg of effective angle. **The test is cheap and worth doing:**
+re-run with `--n-check-tilts` large or `--check-tilt-strategy high` and confirm
+the perpendicular component scales as `sin(alpha)` while the parallel one does
+not. If it does, the height model is real geometry and not a fitted
+convenience.
+
+Note the weakest matches cluster in that same perpendicular direction — the
+six largest are all `w < 0.30` — so some of the spread is low-confidence
+measurement rather than signal. The weights in the global solve handle this.
+
+### Found in the re-run: the `--upsample` flag is a no-op
+
+Every one of the 36 reported shifts is an exact integer. `measure_tile_shifts`
+passes `upsample_factor=upsample` (default 10) to
+`skimage.registration.phase_cross_correlation`, but **skimage discards it
+whenever a mask is supplied** — verified in the installed 0.24.0, where the
+masked branch calls `_masked_phase_cross_correlation(...)` with neither
+`upsample_factor` nor `space` and returns immediately. Padfield masked NCC has
+no subpixel path in skimage.
+
+So the measurement is quantised to one recon pixel = **27.4 A** at
+`--recon-bin 4`. Against a 399 A median that is ~7%, tolerable for v1's
+report-only role, but it is a hard floor on the whole method and the plan's
+Algorithm section promises a "subpixel peak" that is not being computed. Fix
+before v3, either by fitting a parabola to the masked NCC surface around the
+integer peak, or in the torch port, where `GMnccXcf.cu` gives the full
+correlation surface and a 3-point fit is a few lines. Until then, drop the
+misleading `--upsample` flag or make it raise.
+
+### Disk quota is no longer a constraint
+
+`punim1452` is at 6479/8002 GB (80%), ~1.5 TB free, against "100%, 46 GB free"
+when the bin-2 reconstruction failed. The 78.8 GB bin-2 volume is now
+affordable, which would cut the quantisation above from 27.4 A to 13.7 A. Not
+urgent — v2 rebuilds the reference anyway — but the constraint that forced
+bin 4 is gone. Leftovers from that failure are still in `AreTomo_nopatch/`:
+1024-byte stubs `recon_nopatch_bin2.mrc`, `toberotated_proj{XY,XZ}.mrc`.
 
 ### Independent audit of the tilt-sign work (2026-07-26, later session)
 
@@ -254,11 +319,11 @@ samples with `gfVol[... + (int)fX]`, and truncation puts the effective sample at
 `fX - 0.5` in cell-centre coordinates. The two agree exactly. Do not "fix" this
 by moving to `n/2` — that would introduce the bias rather than remove it.
 
-**Consequence: v1's numbers are stale.** Job 28131893's residuals were measured
+**Consequence: v1's numbers were stale.** Job 28131893's residuals were measured
 through the broken reprojection and should be discarded, not merely distrusted.
-v1 needs a re-run before its output means anything.
+Superseded by job 28219393 — see "v1 re-run" in STATUS.
 
-### v1 status (2026-07-26) — ran, but its numbers are superseded
+### v1 status (2026-07-26) — the superseded run, kept for the record
 
 Reconstruction: `06_AreTomo_recon_bin4.sh` (job 28131468, 65 s) wrote
 `recon_nopatch_bin4.mrc`, 2.95 GB, shape (150, 2250, 2186), thin axis first so
@@ -294,14 +359,16 @@ AreTomo's source, see the tilt sign section above. The degeneracy is now
 explained: the reprojection was blank away from the tilt axis, so neither sign
 had anything to correlate against.
 
-**Still to check on the re-run:**
+**Checked on the re-run:**
 
 1. Roughly 70% of tiles were rejected (11/17, 14/20, 14/19). The prime suspect
-   is now the broken reprojection rather than `--max-shift 200` being too tight
-   or mode A's Voronoi slivers being too small. Re-measure before touching the
-   bound.
+   was the broken reprojection rather than `--max-shift 200` being too tight or
+   mode A's Voronoi slivers being too small. **Confirmed, partially:** fixing
+   the reprojection took it to 36% (6/17, 8/20, 6/19). The remainder is still
+   unexplained and the other two suspects survive.
 2. If a sign comparison is ever wanted again, score by **correlation weight over
    a common set of tiles**, not median |shift|, which rewards degenerate zeros.
+   `07_projmatch_v1.sh` no longer passes `--settle-tilt-sign` at all.
 
 **A caveat that may make this moot.** The near-zero residuals are exactly what
 the Algorithm section warns about: *"Reprojecting a volume that contains the
@@ -591,7 +658,7 @@ scipy. (The `Stitch` env used by `02_stitch.sh` has no torch.)
   *Settled (job 28131022):* `rot-1 shift-1` at +0.9105, unanimous across
   three tilts. Hard-coded as the `Convention` default. See STATUS.
 
-- **v1 — static reference. IMPLEMENTED, partially successful.**
+- **v1 — static reference. DONE, report only.**
   `--measure` reprojects `recon_nopatch_bin4.mrc` with `reproject_volume()` and
   measures per-tile shifts in mode A via `measure_tile_shifts()`, report only.
   Run by `07_projmatch_v1.sh`.
@@ -610,10 +677,11 @@ scipy. (The `Stitch` env used by `02_stitch.sh` has no torch.)
   Requires both `--recon` and `--canvas-stack`; it exits early without either.
 
   *Fixed 2026-07-26:* the tilt sign (`-TILT`) and the rotate-vs-shear error,
-  both taken from AreTomo's source and since re-audited against it. *Stale:* the
-  ~1 px residuals from job 28131893 were measured through the broken
-  reprojection — **the re-run is the one outstanding action in this whole
-  document.**
+  both taken from AreTomo's source and since re-audited against it.
+  *Re-measured 2026-07-28* (job 28219393): median residual 14.57 px = 399 A over
+  36 measurements, rejection down from 70% to 36%, residuals anisotropic in a
+  way consistent with the height model. Shifts are whole-pixel — skimage's
+  masked NCC ignores `upsample_factor`. See STATUS.
 
 - **v2 — leave-one-out reconstruction** in torch, replacing v1's static volume.
   Not an optimisation of v1 but a correctness requirement: a reference
