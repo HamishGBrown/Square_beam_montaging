@@ -22,8 +22,9 @@ runs on the login node.
 |---|---|---|
 | **v0** geometry / conventions | **DONE, verified** | `rot-1 shift-1` @ +0.9105, unanimous over 3 tilts (job 28131022) |
 | **tilt sign** | **DONE, derived, re-audited** | read off AreTomo's kernels + the `clip rotx` depth flip; matches a literal transcription at +0.96..+0.99. Citations re-read and the rotx flip re-run independently — see "Independent audit" |
-| **v1** static reference | **DONE, re-measured on real data** | median residual 14.57 px = 399 A over 36 measurements, tile rejection halved to 36% (job 28219393). Measurement is quantised to whole pixels — see "the upsample flag is a no-op" |
-| **v2** leave-one-out recon | not started — **now the open action** | required for correctness, not speed — see v1 caveat |
+| **v1** static reference | **DONE, re-measured on real data** | median residual 9.93 px = 272 A over the 20 un-clipped measurements (14.57 px over all 36), tile rejection halved to 36% (job 28219393). Two defects found in the process: whole-pixel quantisation, and no handling of ROI-clipped tiles |
+| **v2** leave-one-out recon | not started — **now the open action** | required for correctness, not speed — see v1 caveat. Fold in the ROI fraction and the stable tile identity here |
+| **tile identity across tilts** | **BROKEN, must fix before v3** | `Refined_positions` is renumbered per tilt; 19 of 20 tiles change index between tilt 0 and +3 |
 | **v3** global solve + outer loop | not started | — |
 
 Scripts: `04_AreTomo_nopatch.sh` (alignment + aligned stack) ->
@@ -47,8 +48,16 @@ physically sized and structured. See "v1 re-run" immediately below.
 **v2 — leave-one-out reconstruction.** Everything before it is settled and
 measured. v1's magnitudes still cannot be read as residuals because its
 reference contains the tile being aligned; v2 is what makes the numbers mean
-something. Two smaller items are worth folding in on the way, both from the
-re-run: the whole-pixel quantisation and the residual 36% tile rejection.
+something.
+
+Four items found in the re-run should be folded into v2 rather than patched
+into v1, in rough order of how much damage they do if left:
+
+1. **Stable tile identity across tilts.** Currently broken and fatal to v3.
+2. **ROI-clipped tiles**, which are neither detected nor down-weighted and are
+   inflating the residuals by ~2.3x.
+3. **Whole-pixel quantisation** — `--upsample` does nothing on the masked path.
+4. The residual 36% rejection, much of which is item 2.
 
 ### v1 re-run (2026-07-28, job 28219393, 4m23s) — the fixes hold up
 
@@ -66,26 +75,113 @@ Per check tilt: -3 deg 7.07 px (11 tiles), 0 deg 17.37 px (12), +3 deg 21.93 px
 (13). Rejections 6/17, 8/20, 6/19.
 
 **The rejection rate was mostly the broken reprojection, as suspected — but not
-entirely.** Halving it confirms the diagnosis; the remaining 36% now needs a
-different explanation, and `--max-shift 200` and mode A's Voronoi slivers are
-back in the frame. Worth re-testing once v2's reference is cleaner rather than
-loosening the bound now.
+entirely.** Halving it confirms the diagnosis. Much of the remaining 36% is ROI
+clipping — see the next section, which was written after this table and
+supersedes the reading of these numbers.
 
-**The residuals are strongly anisotropic, and that is the interesting part.**
-Shifts perpendicular to the tilt axis reach 20-36 px while the along-axis
-component is usually 0-9 px and is exactly zero for a third of measurements.
-That asymmetry is the signature the height term in the global solve is built
-for: a tile at height `z_t` displaces by `z_t sin(alpha)` perpendicular to the
-tilt axis and not at all along it. It is *suggestive only* at three check tilts
-spanning 9-15 deg of effective angle. **The test is cheap and worth doing:**
-re-run with `--n-check-tilts` large or `--check-tilt-strategy high` and confirm
-the perpendicular component scales as `sin(alpha)` while the parallel one does
-not. If it does, the height model is real geometry and not a fitted
+**The residuals are anisotropic.** Perpendicular to the tilt axis the median is
+7.0 px against 2.0 px along it, a 3.5x asymmetry on the 20 measurements from
+un-clipped tiles. That is the signature the height term in the global solve is
+built for: a tile at height `z_t` displaces by `z_t sin(alpha)` perpendicular to
+the tilt axis and not at all along it. It is *suggestive only* at three check
+tilts spanning 9-15 deg of effective angle. **The test is cheap and worth
+doing:** re-run with `--n-check-tilts` large or `--check-tilt-strategy high` and
+confirm the perpendicular component scales as `sin(alpha)` while the parallel
+one does not. If it does, the height model is real geometry and not a fitted
 convenience.
 
-Note the weakest matches cluster in that same perpendicular direction — the
-six largest are all `w < 0.30` — so some of the spread is low-confidence
-measurement rather than signal. The weights in the global solve handle this.
+**But treat 14.57 px as an upper bound, not the result.** Restricted to tiles
+wholly inside the ROI it is 9.93 px = 272 A; the ROI-clipped tiles median
+23.17 px and drag the headline up. The 9.93 px figure is the one to quote.
+
+### ROI clipping is not handled, and it is distorting the v1 numbers
+
+`--ROI -5500 12000 -6000 12000` in `02_stitch.sh` crops the canvas below the
+natural extent of the montage, so edge tiles lose real area off the sides. This
+was already noted under "Correlation target: two modes" as an aside about mode
+B. It is worse than an aside: **16 of the 36 v1 measurements come from tiles
+that are not wholly inside the ROI**, and they behave measurably differently.
+
+Per-tile footprints computed from `Refined_positions` against the 9000 x 8750
+canvas, for the three check tilts:
+
+| | n | median \|shift\| | median weight |
+|---|---|---|---|
+| wholly inside the ROI | 20 | **9.93 px** | 0.478 |
+| clipped by the ROI | 16 | **23.17 px** | 0.399 |
+
+Clipped tiles measure 2.3x larger shifts at lower confidence. The mechanism is
+plain: masked NCC with a truncated mask has no content on the clipped side, so
+the peak slides toward the surviving content, biasing the shift away from the
+cut edge. Five of the eight largest shifts in the whole run are clipped tiles
+with `w < 0.5`. Clipping runs to 24.9% of a tile still inside at tilt 0.
+
+The correlation with the *fraction* inside is weak (Pearson -0.22 against
+|shift|, +0.27 against weight) because the effect is closer to a threshold than
+a gradient, and because one genuine large shift — tilt 0 tile 3, 36.2 px at
+`w = 0.802`, the highest weight in the run — is a wholly-inside tile. So
+clipping is not the whole story, but it is a large part of it.
+
+It also accounts for much of the residual rejection: **six of the seven tiles
+below 50% inside the ROI produced no measurement at all**, either skipped or
+over `--max-shift`.
+
+**Does the code check for this? Not really.** `measure_tile_shifts` has two
+absolute size floors — `min_px = 5000` canvas px, then
+`n_px < min_px // recon_bin**2` or `n_px < 200` in the aligned frame. Against a
+full on-canvas tile of 5,892,480 px, 5000 px is 0.08%, so they only catch a tile
+that has essentially vanished. Three deeper problems:
+
+- **The ROI is never read.** Everything is derived from `index_map`, which is
+  *already* both ROI-cropped and Voronoi-partitioned, so a tile truncated by the
+  ROI and a tile carved down by `clip_masks_to_overlaps` are indistinguishable —
+  both are simply a smaller mask. The two need separating: the Voronoi sliver is
+  still valid data, the truncated footprint is a biased measurement.
+- **The skips are `logger.debug`,** so tiles vanish from the INFO log without
+  explanation and the counts do not reconcile — 18/20/19 tiles in, 17/20/19
+  candidates out, with nothing said about the missing one.
+- **Nothing down-weights a truncated tile.** It is measured as if whole.
+
+**What to do,** in v2 where the measurement is rebuilt anyway: compute each
+tile's full footprint from `Refined_positions` and the ROI (as above, it is
+arithmetic on a 20 x 2 array — no need to touch `index_map`), and carry the
+in-ROI fraction as a per-tile quantity. Then either fold it into the quality
+weight, or reject below a threshold — and log the reason at INFO either way.
+Mode B has the same issue and no `index_map` to hide it in.
+
+### Tile indices are not stable across tilts — this breaks the v3 global solve
+
+Found while checking the above, and more serious than the ROI itself.
+
+`Refined_positions` has a **different length at different tilts**: 18 at -3 deg,
+20 at 0 deg, 19 at +3 deg. The montage translates as it tilts, tiles fall
+outside the ROI, and the survivors are written out renumbered `0..N-1`. Matching
+tilt 0 to tilt +3 by position after removing the median montage offset
+(row -67, col +455 px; tile pitch is ~1815 px, so the match is unambiguous at
+~310 px residual):
+
+    tilt 0 index  3  4  5  6  7 ... 19
+    tilt+3 index  1  2  3  4  5 ... 17
+
+**19 of 20 tiles carry a different index at the two tilts.** Tile `t` is simply
+not the same physical tile from one tilt to the next.
+
+For v1 this is harmless — it reports per tilt, and each HDF5's indices are
+internally consistent, so writing `Refined_positions` back is also safe. For
+**v3 it is fatal**. The global solve is written over `D(i, t)` with `t` a
+physical tile: the height model fits `(a_t, z_t)` per tile across all tilts, the
+seam term uses `overlaps` from one tilt's HDF5, and the gauge constraint sums
+over `t` at fixed `i`. Every one of those silently mixes different physical
+tiles. It would not crash; it would return a plausible, wrong answer, and the
+"check fitted `z_t` varies smoothly across the montage" validation would fail
+for a reason nobody would guess.
+
+**The fix is available and cheap.** `Montage_imageshifts_9-A.txt` holds the 20
+nominal beam-shift positions (header `41 / 0.0 / 20`, then `x y z` in unbinned
+px) and is the canonical tile identity. Match each tilt's `Refined_positions` to
+it by nearest neighbour after removing the per-tilt median offset, and key
+everything on the nominal index. Do this in v2, before any cross-tilt
+aggregation exists to be wrong.
 
 ### Found in the re-run: the `--upsample` flag is a no-op
 
@@ -531,6 +627,19 @@ These are the things most likely to burn a day each.
    position among surviving sections in `SEC` order — a third distinct
    indexing.
 
+6. **Tile indices are per-tilt, not physical.** `Refined_positions` holds only
+   the tiles that survived stitching at that tilt, renumbered from zero, so its
+   length varies (18/20/19 across the three check tilts on 9-A) and tile `t` is
+   a different physical tile at different tilts. Safe within one tilt, fatal for
+   anything that aggregates across tilts. Key on the nominal beam-shift index
+   from `Montage_imageshifts_*.txt` instead. See the STATUS section.
+
+7. **The ROI truncates tiles, and `index_map` hides it.** By the time a tile
+   reaches `index_map` it has been both ROI-cropped and Voronoi-partitioned, and
+   the two are indistinguishable. A truncated footprint biases masked NCC toward
+   the surviving content. Compute the in-ROI fraction from `Refined_positions`
+   and the ROI arguments, not from the mask.
+
 5. **AreTomo volume output is (x, z, y)** and the pipeline runs `clip rotx` to
    get standard order. Use the rotx'd file and assert the axis order.
 
@@ -577,7 +686,11 @@ best. On tilt 0 of dataset 9-A, against a full on-canvas tile of
 
 Separately, the ROI crops the canvas below the natural tile extent: footprints
 span rows -1879..10027 and cols -1537..8884 against a 9000 x 8750 canvas, so
-edge tiles lose real area off the sides.
+edge tiles lose real area off the sides. **This turned out to matter far more
+than "separately" suggests** — it affects 16 of v1's 36 measurements and doubles
+their apparent residual. See "ROI clipping is not handled" in STATUS. Mode B
+does not escape it either: reloading the raw tile recovers the pixels, but they
+still have no counterpart in the reference, which is only as wide as the canvas.
 
 So mode A correlates on roughly half a tile and, for the worst tile, an eighth.
 Mode B recovers the full tile for the final measurement. Expect the largest
@@ -592,6 +705,10 @@ Rather than applying `m(i,t)` directly, solve for updates `D(i,t)` in R^2:
             + mu sum_{i,t} ||D(i,t) - (a_t + z_t sin(alpha_i))||^2  height model
     s.t.      sum_t D(i,t) = 0   for every tilt i                   gauge fix
 
+- **`t` must be a physical tile, not an HDF5 row index.** `Refined_positions`
+  renumbers per tilt, so every sum over `t` here — the gauge constraint, the
+  height model, the seam term — is over a different set at each `i` unless the
+  indices are mapped to the nominal beam-shift grid first. See gotcha 6.
 - **The gauge constraint is essential.** The mean shift per tilt is exactly
   degenerate with AreTomo's `TX/TY`. Without it the refinement fights the global
   alignment and the outer loop will not converge. Refine only the differential
@@ -695,7 +812,9 @@ scipy. (The `Stitch` env used by `02_stitch.sh` has no torch.)
 - Inject known synthetic per-tile shifts into a copy of the HDF5, re-stitch, and
   confirm recovery to sub-pixel.
 - Check fitted `z_t` against tile position — should vary smoothly across the
-  montage if it is real specimen geometry rather than fitted noise.
+  montage if it is real specimen geometry rather than fitted noise. Note this
+  check *would* have caught the tile-identity bug, but only as an unexplained
+  failure; assert the identity mapping directly as well.
 - Track seam residuals in overlap regions before/after.
 - v1 shifts should be small and structured; large random shifts mean a
   convention bug upstream in v0.
