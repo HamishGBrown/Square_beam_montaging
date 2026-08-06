@@ -34,6 +34,7 @@ OUT_DIR="${BASE}/relion/tomo"
 
 BOX=256          # extraction box, unbinned tile pixels (256 x 3.426 A = 877 A)
 DOSE_PER_TILT=0  # e-/A^2 per exposure. 0 disables dose weighting -- set it!
+STAGE=2        # 1 = overlay picks on images, 2 = write star files, 3 = write imod models
 STAGE="${STAGE:-1}"
 # ── end of edit section ───────────────────────────────────────────────────────
 
@@ -115,8 +116,10 @@ else
     # Stage 2: write the star files.
     #
     # --extra-shift comes from stage 1. --handedness flips the sign of the
-    # along-beam (defocus) axis; the log reports which sign the CTF fits prefer,
-    # but if they cannot call it, refine both ways and keep the better.
+    # along-beam (defocus) axis. The CTF fits CANNOT settle it here: the
+    # acquisition script already flattens the defocus across each montage
+    # (ChangeFocus per tile), so there is no geometric ramp in the data whose
+    # sign could be read. Refine both ways and keep the better.
     ${PY} -m processing_scripts.montage_to_relion \
         --picks          "${PICKS}" \
         --tomogram       "${TOMOGRAM}" \

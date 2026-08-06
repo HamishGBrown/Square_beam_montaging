@@ -18,11 +18,15 @@ tomogram. Two RELION-5 features make that work as-is:
   contain it. A particle sits in ~1/20 of the images per tilt and RELION
   already expects to be told this.
 
-The per-tile defocus then falls out for free: RELION derives each particle's
-defocus from its 3D position through the ``rlnTomoProjZ`` row, so
-``rlnDefocusU/V`` is written as the defocus *at the tomogram centre*, which is
-the same number for every tile of a tilt. See ``fit_defocus`` for why that is
-also the only way to get a usable number out of this dataset's CTF fits.
+Defocus needs one extra step. RELION derives each particle's defocus from its
+3D position through the ``rlnTomoProjZ`` row, adding a ramp across the tomogram
+that at 45 deg is microns deep. But this acquisition scheme *already removed*
+that ramp on the microscope -- ``MontageTiltSeries.txt`` calls ``ChangeFocus``
+with a per-tile ``tan(alpha) * y`` offset before every Record -- so every tile
+of a tilt was taken at the same defocus at its own field centre. Each image is
+therefore given ``rlnDefocusU/V = df0(tilt) - depth(tile centre)``, which
+cancels RELION's ramp back out at the tile centre and leaves it doing the right
+thing *within* a tile. See ``fit_defocus``.
 
 What it writes
 --------------
@@ -165,80 +169,96 @@ def tile_reference_depth(proj: MontageProjector, tilt: float, tile: int) -> floa
     return float(depth_px) * proj.pixel_size
 
 
+def _clipped_mean(values: Sequence[float], n_sigma: float = 3.0) -> float:
+    """Mean after dropping points more than ``n_sigma`` MAD from the median."""
+    v = np.asarray(values, dtype=float)
+    if v.size < 3:
+        return float(v.mean())
+    med = np.median(v)
+    mad = float(np.median(np.abs(v - med))) * 1.4826
+    if mad <= 0:
+        return float(v.mean())
+    keep = np.abs(v - med) <= n_sigma * mad
+    return float(v[keep].mean()) if keep.any() else float(med)
+
+
 def fit_defocus(
     proj: MontageProjector,
     fits: Dict[float, List[CtfFit]],
     tilts: Sequence[float],
     min_score: float,
     max_fit_res: float,
+    min_tiles: int = 3,
 ) -> Tuple[Dict[float, Tuple[float, float, float]], List[Sequence]]:
     """
     Collapse the per-tile CTF fits to one defocus per tilt, plus astigmatism.
 
+    The tilt geometry puts a defocus ramp across a montage -- at 45 deg the
+    tiles of one tilt span microns -- but the acquisition already takes it out.
+    ``Setup_square_montage_from_polygon.calculate_defocii`` writes a per-tile
+    ``tan(alpha) * y`` offset as the third column of the image-shift file, and
+    ``MontageTiltSeries.txt`` applies it with ``ChangeFocus`` before each
+    ``Record``. Every tile of a tilt was therefore exposed at the same defocus
+    at its own field centre, and the estimator is simply the mean over the tiles
+    whose fit is credible. No depth term.
+
+    That is not taken on faith. Regressing measured defocus on geometric depth
+    within a tilt, over the 116 good tiles of Montage_9-A, gives a slope of
+    -0.030 +- 0.110: consistent with 0, and 9 sigma from the +1 an uncompensated
+    montage would show. ``_report_depth_slope`` re-runs that check every time.
+
+    The depth term does not vanish, it moves: RELION reconstructs each
+    particle's defocus from ``rlnTomoProjZ`` relative to the tomogram centre, so
+    ``main`` writes ``df0 - depth(tile centre)`` per image to cancel that ramp
+    back out. Returned here is ``{tilt: (dfU, dfV, angle)}`` *at zero depth*.
+
     Per-tile CTFFIND on this data is mostly noise -- one tile at ~3 e-/A^2 does
-    not give enough Thon-ring signal, and the 9-A fits scatter over 6,000 to
-    96,000 A with the fit resolution pinned at its ceiling. But the *shape* of
-    the per-tile defocus field is not free: it is set by the tilt geometry,
-    which we already know exactly. So instead of one free defocus per tile we
-    fit one free defocus per tilt,
-
-        df_tile = df0(tilt) + depth(tile)
-
-    taking df0 as the median over tiles whose fit is credible, and let RELION
-    re-derive each particle's own defocus from the projection matrix. Averaging
-    the raw fits per tilt instead would be wrong -- the montage spans ~6 um, so
-    at 45 deg the true spread across one tilt is microns.
-
-    Returns ``{tilt: (defocusU, defocusV, angle)}`` plus diagnostic rows.
+    not give enough Thon-ring signal and only 18% of tiles pass the cut -- so
+    tilts with fewer than ``min_tiles`` credible fits are interpolated from
+    their neighbours instead of believed. On Montage_9-A that matters: +30 deg
+    has exactly one survivor, 1.3 um away from every other tilt's mean.
     """
-    diag: List[Sequence] = []
     per_tilt: Dict[float, Tuple[float, float, float]] = {}
     df0_by_tilt: Dict[float, float] = {}
-    scatter = {1: [], -1: []}
+    good_by_tilt: Dict[float, List[Tuple[CtfFit, float]]] = {}
+    depths: Dict[Tuple[float, int], float] = {}
+    status: Dict[Tuple[float, int], str] = {}
 
     for tilt in tilts:
         info = proj.tilts[tilt]
         group = {f.slice_index: f for f in fits.get(tilt, [])}
-        corrected, astig, angles = [], [], []
+        good: List[Tuple[CtfFit, float]] = []
         for tile in info.selected:
-            f = group.get(int(tile))
-            depth_A = tile_reference_depth(proj, tilt, int(tile))
-            good = f is not None and f.score >= min_score and f.fit_res <= max_fit_res
-            if f is not None:
-                diag.append(
-                    (f"{tilt:+.1f}", int(tile), f"{f.df1:.1f}", f"{f.df2:.1f}",
-                     f"{f.score:.4f}", f"{f.fit_res:.2f}", f"{depth_A:.1f}",
-                     f"{f.mean_defocus - depth_A:.1f}", "good" if good else "rejected")
-                )
+            t = int(tile)
+            depths[(tilt, t)] = tile_reference_depth(proj, tilt, t)
+            f = group.get(t)
+            if f is None:
+                status[(tilt, t)] = "nofit"
+            elif f.score >= min_score and f.fit_res <= max_fit_res:
+                status[(tilt, t)] = "good"
+                good.append((f, depths[(tilt, t)]))
             else:
-                diag.append(
-                    (f"{tilt:+.1f}", int(tile), "-", "-", "-", "-",
-                     f"{depth_A:.1f}", "-", "nofit")
-                )
-            if good:
-                corrected.append(f.mean_defocus - depth_A)
-                astig.append(f.df1 - f.df2)
-                angles.append(np.deg2rad(2.0 * f.azimuth))
-                # Record what the scatter would be under either handedness, so
-                # the sign of the depth term can be read off the data instead
-                # of assumed. The wrong sign doubles the gradient rather than
-                # removing it, so it shows up plainly.
-                scatter[1].append((tilt, f.mean_defocus - depth_A))
-                scatter[-1].append((tilt, f.mean_defocus + depth_A))
+                status[(tilt, t)] = "rejected"
+        good_by_tilt[tilt] = good
 
-        if corrected:
-            df0 = float(np.median(corrected))
-            a = float(np.median(astig))
-            ang = float(np.rad2deg(np.angle(np.mean(np.exp(1j * np.array(angles))))) / 2.0)
+        if len(good) >= min_tiles:
+            df0 = _clipped_mean([f.mean_defocus for f, _ in good])
+            a = float(np.median([f.df1 - f.df2 for f, _ in good]))
+            angles = np.deg2rad(2.0 * np.array([f.azimuth for f, _ in good]))
+            ang = float(np.rad2deg(np.angle(np.mean(np.exp(1j * angles)))) / 2.0)
             df0_by_tilt[tilt] = df0
             per_tilt[tilt] = (df0 + a / 2.0, df0 - a / 2.0, ang)
         else:
-            logger.warning("tilt %+6.1f: no credible CTF fit, will interpolate", tilt)
+            logger.warning(
+                "tilt %+6.1f: only %d credible CTF fits (need %d), interpolating",
+                tilt, len(good), min_tiles,
+            )
 
     if not df0_by_tilt:
         raise ValueError(
-            "Not one tile in the whole series passed --ctf-min-score / "
-            "--ctf-max-fit-res. Loosen them, or supply --defocus directly."
+            "No tilt has %d tiles passing --ctf-min-score / --ctf-max-fit-res. "
+            "Loosen them, lower --ctf-min-tiles, or supply --defocus directly."
+            % min_tiles
         )
 
     # Fill the gaps by interpolating df0 against tilt angle.
@@ -246,47 +266,79 @@ def fit_defocus(
     vals = np.array([df0_by_tilt[t] for t in known])
     for tilt in tilts:
         if tilt not in per_tilt:
-            per_tilt[tilt] = (float(np.interp(tilt, known, vals)),
-                              float(np.interp(tilt, known, vals)), 0.0)
+            df0 = float(np.interp(tilt, known, vals))
+            per_tilt[tilt] = (df0, df0, 0.0)
 
-    _report_handedness(scatter)
+    _report_depth_slope(good_by_tilt)
+    logger.info(
+        "defocus per tilt: %.0f - %.0f A (%d of %d tilts measured, rest "
+        "interpolated)",
+        min(v[0] for v in per_tilt.values()), max(v[0] for v in per_tilt.values()),
+        len(df0_by_tilt), len(tilts),
+    )
+
+    diag: List[Sequence] = []
+    for (tilt, tile), st in sorted(status.items()):
+        f = {g.slice_index: g for g, _ in good_by_tilt[tilt]}.get(tile)
+        if f is None:
+            for g in fits.get(tilt, []):
+                if g.slice_index == tile:
+                    f = g
+                    break
+        depth_A = depths[(tilt, tile)]
+        written = 0.5 * (per_tilt[tilt][0] + per_tilt[tilt][1]) - depth_A
+        diag.append((
+            f"{tilt:+.1f}", tile,
+            f"{f.df1:.1f}" if f else "-", f"{f.df2:.1f}" if f else "-",
+            f"{f.score:.4f}" if f else "-", f"{f.fit_res:.2f}" if f else "-",
+            f"{depth_A:.1f}", f"{written:.1f}", st,
+        ))
     return per_tilt, diag
 
 
-def _report_handedness(scatter: Dict[int, List[Tuple[float, float]]]) -> None:
+def _report_depth_slope(good_by_tilt: Dict[float, List[Tuple[CtfFit, float]]]) -> None:
     """
-    Say which sign of the depth term makes the per-tilt defocus estimates agree.
+    Check that the acquisition really did flatten the defocus across a montage.
 
-    This is the one thing the noisy per-tile fits *can* settle: the correct sign
-    removes the geometric defocus gradient across a tilt, the wrong one doubles
-    it. If the two numbers are within a few percent the fits are too poor to
-    call it, and the handedness has to come from a test refinement instead.
+    Pools the within-tilt deviations of measured defocus and of geometric depth
+    and regresses one on the other. A compensated montage gives slope 0; an
+    uncompensated one gives +1, and a compensation applied with the wrong sign
+    gives +2. Anything away from 0 means the per-image ``df0 - depth`` written
+    by ``main`` is subtracting a ramp that is still in the data.
+
+    Note what this check no longer does: it used to double as the handedness
+    test, because the sign of a ramp in the data reveals it. With the ramp gone
+    there is nothing left to read the handedness off, so it has to come from a
+    test refinement run both ways.
     """
-    stats = {}
-    for hand, pairs in scatter.items():
-        if len(pairs) < 4:
-            return
-        by_tilt: Dict[float, List[float]] = {}
-        for t, v in pairs:
-            by_tilt.setdefault(t, []).append(v)
-        spreads = [np.std(v) for v in by_tilt.values() if len(v) > 2]
-        stats[hand] = float(np.median(spreads)) if spreads else np.inf
-    if not stats:
+    xs, ys = [], []
+    for good in good_by_tilt.values():
+        if len(good) < 3:
+            continue
+        df = np.array([f.mean_defocus for f, _ in good])
+        dep = np.array([d for _, d in good])
+        xs.append(dep - dep.mean())
+        ys.append(df - df.mean())
+    if not xs:
+        logger.warning("too few good fits to check the defocus/depth slope")
         return
-    best = min(stats, key=stats.get)
-    ratio = max(stats.values()) / max(min(stats.values()), 1e-6)
+    x, y = np.concatenate(xs), np.concatenate(ys)
+    if len(x) < 4 or x.std() < 1.0:
+        return
+    slope = float(np.polyfit(x, y, 1)[0])
+    resid = y - slope * x
+    se = float(np.sqrt((resid ** 2).sum() / (len(x) - 2) / (x ** 2).sum()))
     logger.info(
-        "handedness check: median within-tilt defocus scatter is %.0f A at "
-        "handedness=+1 and %.0f A at -1", stats.get(1, np.nan), stats.get(-1, np.nan),
+        "defocus vs depth within a tilt: slope %+.3f +- %.3f over %d tiles "
+        "(0 = acquisition compensated it, +1 = not compensated)",
+        slope, se, len(x),
     )
-    if ratio < 1.05:
+    if abs(slope) > 0.5:
         logger.warning(
-            "  the two are within %.0f%% -- these CTF fits cannot settle the "
-            "handedness. Decide it by running a test refinement both ways.",
-            (ratio - 1) * 100,
+            "  that is far from 0 -- the montage looks UNcompensated, so "
+            "subtracting the tile depth from each image is wrong here. Check "
+            "that the acquisition script applied ChangeFocus per tile."
         )
-    else:
-        logger.info("  the data prefer handedness=%+d", best)
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +432,12 @@ def parse_commandline(argv=None):
     g.add_argument("--ctf-base", default=None, help="restrict to this base name")
     g.add_argument("--ctf-min-score", type=float, default=0.03)
     g.add_argument("--ctf-max-fit-res", type=float, default=20.0)
+    g.add_argument("--ctf-min-tiles", type=int, default=3,
+                   help="a tilt needs this many credible fits to be believed; "
+                        "below it, its defocus is interpolated from neighbours")
     g.add_argument("--defocus", type=float, default=None,
-                   help="use this defocus (A) for every tilt instead of fitting")
+                   help="use this defocus (A) at the tile centre for every "
+                        "tilt instead of fitting")
     g.add_argument("--voltage", type=float, default=300.0)
     g.add_argument("--cs", type=float, default=2.7)
     g.add_argument("--amp-contrast", type=float, default=0.07)
@@ -471,7 +527,8 @@ def main(argv=None) -> int:
     elif args.ctf_results:
         fits = parse_ctf_results(args.ctf_results, args.ctf_base)
         per_tilt, diag = fit_defocus(
-            proj, fits, tilts, args.ctf_min_score, args.ctf_max_fit_res
+            proj, fits, tilts, args.ctf_min_score, args.ctf_max_fit_res,
+            args.ctf_min_tiles,
         )
     else:
         raise SystemExit("Pass --ctf-results or --defocus.")
@@ -498,9 +555,19 @@ def main(argv=None) -> int:
 
     ts_path = os.path.join(out, "tilt_series", f"{name}.star")
     rows = []
+    mats, ref_depths = [], []
     for i, (tilt, tile) in enumerate(images):
         P = proj.projection_matrix(tilt, tile)
+        # RELION adds each particle's own ProjZ depth, measured from the
+        # *tomogram* centre, to the value written here. The microscope focused
+        # on the *tile* centre (ChangeFocus per tile in MontageTiltSeries.txt),
+        # so subtracting that tile's depth turns RELION's ramp into one that is
+        # zero at the tile centre -- which is what was actually acquired.
+        depth_A = tile_reference_depth(proj, tilt, tile)
+        mats.append(P)
+        ref_depths.append(depth_A)
         dfu, dfv, dfa = per_tilt[tilt]
+        dfu, dfv = dfu - depth_A, dfv - depth_A
         rows.append([
             _mat_str(P[0]), _mat_str(P[1]), _mat_str(P[2]), _mat_str(P[3]),
             dfu, dfv, dfa,
@@ -517,6 +584,9 @@ def main(argv=None) -> int:
             "rlnMicrographPreExposure", "rlnTomoNominalStageTiltAngle",
             "rlnMicrographName",
         ], rows)
+
+    _report_particle_defocus(proj, per_tilt, images, mats, ref_depths,
+                             picks, visible, keep)
 
     sx, sy, sz = proj.tomo_size_unbinned()
     tomo_path = os.path.join(out, "tomograms.star")
@@ -564,7 +634,8 @@ def main(argv=None) -> int:
 
     if diag:
         with open(os.path.join(out, "defocus_model.tsv"), "w") as fh:
-            fh.write("#tilt\ttile\tdf1\tdf2\tscore\tfit_res\tdepth_A\tdf0_est\tstatus\n")
+            fh.write("#tilt\ttile\tdf1\tdf2\tscore\tfit_res\tdepth_A\t"
+                     "df_written\tstatus\n")
             for row in diag:
                 fh.write("\t".join(str(x) for x in row) + "\n")
 
@@ -574,6 +645,50 @@ def main(argv=None) -> int:
         os.path.join(out, "optimisation_set.star"), args.box, args.box // 2,
     )
     return 0
+
+
+def _report_particle_defocus(
+    proj: MontageProjector,
+    per_tilt: Dict[float, Tuple[float, float, float]],
+    images: Sequence[Tuple[float, int]],
+    mats: Sequence[np.ndarray],
+    ref_depths: Sequence[float],
+    picks: np.ndarray,
+    visible: np.ndarray,
+    keep: np.ndarray,
+) -> None:
+    """
+    Reproduce RELION's per-particle defocus and check it is sane.
+
+    Worth doing because the per-image ``rlnDefocusU`` looks alarming on its own:
+    at 60 deg a tile's field centre back-projects to a mid-plane point several
+    microns outside the reconstructed box, so the written defocus can come out
+    negative. That is harmless, and this is the check that shows why -- RELION
+    adds the particle's own depth straight back, and the two differ only across
+    the width of one tile. Anything outside a couple of microns of the fitted
+    defocus means the depth term has the wrong sign or scale.
+    """
+    pos = np.asarray(picks, dtype=float) * proj.tomo_bin
+    vals = []
+    for n in keep:
+        for i in np.flatnonzero(visible[n]):
+            P = mats[i]
+            depth = float(P[2, :3] @ pos[n] + P[2, 3]) * proj.pixel_size
+            df0 = 0.5 * sum(per_tilt[images[i][0]][:2])
+            vals.append(df0 - ref_depths[i] + depth)
+    if not vals:
+        return
+    v = np.array(vals)
+    logger.info(
+        "per-particle defocus RELION will use: %.2f - %.2f um (median %.2f, "
+        "sd %.2f) over %d particle-image pairs",
+        v.min() / 1e4, v.max() / 1e4, np.median(v) / 1e4, v.std() / 1e4, v.size,
+    )
+    if v.min() < 0 or np.ptp(v) > 4e4:
+        logger.warning(
+            "  that spread is far wider than one tile can explain -- suspect "
+            "the sign of --handedness or the tile depth term."
+        )
 
 
 def _image_sources(
