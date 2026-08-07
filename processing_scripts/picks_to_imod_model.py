@@ -252,9 +252,13 @@ def parse_commandline(argv=None):
                    help="the stack the tiltseries model goes with: the stitched "
                         "montage for --frame canvas, AreTomo's aligned stack for "
                         "--frame aligned")
-    p.add_argument("--tilt", type=float, action="append", default=None,
-                   help="tilt(s) for the per-tile model; repeatable. Default: the "
-                        "section whose .aln TILT is nearest zero")
+    p.add_argument("--tilt", action="append", default=None, metavar="ANGLE",
+                   help="tilt(s) for the per-tile model; repeatable, or 'all' "
+                        "for every tilt. The default is the section whose .aln "
+                        "TILT is nearest zero -- which is precisely the tilt "
+                        "where a reprojection error perpendicular to the tilt "
+                        "axis is multiplied by sin(theta) = 0 and so cannot be "
+                        "seen. Pass the extremes as well.")
     p.add_argument("--box", type=int, default=256,
                    help="extraction box, unbinned px; sets the beam-edge margin")
     p.add_argument("--particle-diameter", type=float, default=300.0,
@@ -310,10 +314,15 @@ def main(argv=None) -> int:
 
     if args.mode in ("tiles", "both"):
         available = sorted(proj.tilts)
-        if args.tilt:
-            tilts = [min(available, key=lambda t: abs(t - x)) for x in args.tilt]
+        if args.tilt and any(str(x).strip().lower() == "all" for x in args.tilt):
+            tilts = available
+        elif args.tilt:
+            tilts = [min(available, key=lambda t: abs(t - float(x)))
+                     for x in args.tilt]
         else:
             tilts = [min(available, key=lambda t: abs(proj.tilts[t].sec.tilt))]
+        logger.info("per-tile models for tilt(s): %s",
+                    ", ".join(f"{t:+.1f}" for t in tilts))
         for tilt in tilts:
             model_tiles(
                 proj, picks, tilt,

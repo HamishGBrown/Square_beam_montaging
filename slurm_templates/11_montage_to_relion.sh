@@ -19,6 +19,7 @@
 BASE=/home/hgbrown/20240917_Montage_stitching/20260713Yeastattempt2
 
 PICKS="${BASE}/AreTomo_motioncorr/Ribosomes.txt"
+PICKS="${BASE}/AreTomo_motioncorr/Points_for_reproject_check.txt"
 TOMOGRAM="${BASE}/AreTomo_motioncorr/recon_patch53mask_bin2.mrc"
 ALN="${BASE}/AreTomo_motioncorr/Montage_9-A_inpainted.aln"
 POSITIONS_DIR="${BASE}/stitched_motioncorr"
@@ -34,8 +35,17 @@ OUT_DIR="${BASE}/relion/tomo"
 
 BOX=256          # extraction box, unbinned tile pixels (256 x 3.426 A = 877 A)
 DOSE_PER_TILT=0  # e-/A^2 per exposure. 0 disables dose weighting -- set it!
-STAGE=2        # 1 = overlay picks on images, 2 = write star files, 3 = write imod models
-STAGE="${STAGE:-1}"
+# 1 = overlay, 2 = star files, 3 = imod models, 4 = measure reprojection residual.
+# Edit the default here; `STAGE=4 sbatch ...` overrides it for one run.
+STAGE="${STAGE:-3}"
+echo "STAGE=${STAGE}"
+
+# Which tilts get a per-tile model (stage 3). Empty = the section nearest 0 deg,
+# which is the one tilt where an error perpendicular to the tilt axis is
+# multiplied by sin(theta) = 0 and therefore invisible -- so ask for the
+# extremes too. "--tilt all" writes one model per tilt.
+TILT_ARGS="--tilt -57 --tilt -24 --tilt 0 --tilt 24 --tilt 60"
+# STAGE="${STAGE:-1}"
 # ── end of edit section ───────────────────────────────────────────────────────
 
 # NOTE: the `Stitch` conda env is currently broken -- ~/.conda/envs/Stitch has
@@ -111,6 +121,27 @@ elif [ "${STAGE}" = "3" ]; then
         --tiltseries-image  "${CANVAS_STACK}" \
         --box               ${BOX} \
         --mode both \
+        ${TILT_ARGS} \
+        -o "${OVERLAY_DIR}"
+elif [ "${STAGE}" = "4" ]; then
+    # Stage 4: measure the reprojection residual and fit it.
+    #
+    # For when stage 3 shows the picks drifting perpendicular to the tilt axis.
+    # Cross-correlates a patch cut at each pick's PREDICTED position against the
+    # same pick at the reference tilt, then fits the residual against the terms
+    # that could cause it -- a constant, sin(theta) (z centre), cos(theta)-1
+    # (x centre) and dx*sin(theta) (tilt angle). The fit names the culprit
+    # instead of leaving it to be guessed.
+    #
+    # Use picks on obvious high-contrast features; ribosomes are too small and
+    # too crowded to cross-correlate one at a time.
+    ${PY} -m processing_scripts.measure_reprojection_residual \
+        --picks          "${PICKS}" \
+        --tomogram       "${TOMOGRAM}" \
+        --aln            "${ALN}" \
+        --positions-dir  "${POSITIONS_DIR}" \
+        --tile-dir       "${TILE_DIR}" \
+        --canvas-stack   "${CANVAS_STACK}" \
         -o "${OVERLAY_DIR}"
 else
     # Stage 2: write the star files.
