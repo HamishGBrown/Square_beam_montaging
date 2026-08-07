@@ -17,6 +17,8 @@ JSON params format (produced by the GUI's "Save SLURM" button)
       "input":        "/abs/path/to/input.mrc",
       "output":       "/abs/path/to/output.mrc",
       "edge_blend_px": 15,
+      "save_mask":    true,                       # optional; defaults to true.
+                                                  # --dont-save-mask overrides it.
       "mask_mrc":     "/abs/path/to/mask.mrc",   # optional; present when paint/polygon
                                                   # overlays were drawn in the GUI.
                                                   # When present, the spatial mask
@@ -34,10 +36,13 @@ import json
 import multiprocessing
 import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 import numpy.ma as ma
 import mrcfile
-from scipy.ndimage import label
+from scipy.ndimage import label, uniform_filter, zoom
 from tqdm import tqdm
 
 try:
@@ -60,11 +65,87 @@ DEFAULT_SLURM_TEMPLATE = """\
 #SBATCH --output={log_file}
 
 python {script_path} \\
-    --input  {input} \\
-    --output {output} \\
-    --params {params} \\
-    --cpus   {n_cpus}
+    --input    {input} \\
+    --output   {output} \\
+    --params   {params} \\
+    --ntotal   {n_cpus} \\
+    --npertilt {npertilt} \\
+    --bin      {bin_factor}
+
+# ---------------------------------------------------------------------------
+# Odd/even half-set inpainting, for Noise2Noise denoising (cryoCARE etc.).
+# Uncomment both blocks to also inpaint the half-sets written by
+# beam_mask_motioncorr.py.
+#
+# --mask points both halves at the same mask stack the full-dose run uses, so
+# all three stacks are masked identically.  This is essential and not optional:
+# without it the half-sets would re-derive a mask from the lo/hi thresholds in
+# the params file, which were fitted to full-dose intensities and do not
+# transfer to half-dose data.  A pixel that is real data in one half and
+# synthetic fill in the other is a signal mismatch that the denoiser treats as
+# noise and tries to average away.
+#
+# The fill itself is still fitted independently to each half's own surrounding
+# pixels, so no intensity rescaling is needed.
+#
+# The mask below is normally the one baked by the GUI at "Save SLURM Job" time,
+# so it already exists and these can run in any order.  --dont-save-mask stops
+# them writing redundant copies of it.
+# ---------------------------------------------------------------------------
+
+# python {script_path} \\
+#     --input    {input_odd} \\
+#     --output   {output_odd} \\
+#     --params   {params} \\
+#     --mask     {mask} \\
+#     --ntotal   {n_cpus} \\
+#     --npertilt {npertilt} \\
+#     --bin      {bin_factor} \\
+#     --dont-save-mask
+
+# python {script_path} \\
+#     --input    {input_even} \\
+#     --output   {output_even} \\
+#     --params   {params} \\
+#     --mask     {mask} \\
+#     --ntotal   {n_cpus} \\
+#     --npertilt {npertilt} \\
+#     --bin      {bin_factor} \\
+#     --dont-save-mask
 """
+
+
+# ---------------------------------------------------------------------------
+# Binning helpers
+# ---------------------------------------------------------------------------
+
+def _bin_good_mean(img: np.ndarray, good: np.ndarray, bin_factor: int) -> tuple:
+    """
+    Block-downsample *img* by *bin_factor*, ignoring bad pixels (weight 0) so
+    they can't leak into good samples near the mask boundary.
+
+    Returns (binned_img, binned_good).  A binned pixel is only marked good if
+    a clear majority of the input pixels in its block were good; otherwise it
+    is left for smoothn to fill in, same as at full resolution.
+    """
+    good_f = good.astype(np.float32)
+    num = uniform_filter(img.astype(np.float32) * good_f, size=bin_factor, mode="nearest")
+    den = uniform_filter(good_f, size=bin_factor, mode="nearest")
+    valid = den > 0.5
+    filled = np.zeros_like(num)
+    filled[valid] = num[valid] / den[valid]
+    return filled[::bin_factor, ::bin_factor], valid[::bin_factor, ::bin_factor]
+
+
+def _upsample_to(field: np.ndarray, shape: tuple) -> np.ndarray:
+    """Upsample *field* back to *shape* with bilinear interpolation."""
+    zh, zw = shape[0] / field.shape[0], shape[1] / field.shape[1]
+    up = zoom(field, (zh, zw), order=1)
+    up = up[:shape[0], :shape[1]]
+    if up.shape != shape:
+        up = np.pad(up, ((0, shape[0] - up.shape[0]), (0, shape[1] - up.shape[1])),
+                    mode="edge")
+    return up
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +154,8 @@ python {script_path} \\
 
 def _process_tilt(args: tuple) -> tuple:
     """
-    Load one tilt from the mmap'd MRC, mask it, inpaint with smoothn, blend
-    the boundary, and return (tilt_idx, result_float32).
+    Load one tilt from the mmap'd MRC, mask it, inpaint with smoothn, and
+    return (tilt_idx, result_float32, mask_int8).
 
     Opening the MRC inside each worker avoids serialising large arrays across
     the process boundary while still allowing concurrent reads (mmap, read-only).
@@ -82,8 +163,15 @@ def _process_tilt(args: tuple) -> tuple:
     If mask_path is provided the pre-baked spatial mask is used directly (paint/
     polygon overlays from the GUI are already baked in); otherwise the mask is
     recomputed from the lo/hi intensity thresholds.
+
+    If bin_factor > 1, smoothn is run on a downsampled copy of the tilt (bad
+    pixels excluded from the block average) and the resulting smooth field is
+    upsampled back to full resolution before being applied to the bad pixels;
+    this is much cheaper than running smoothn at full resolution and, since
+    only the already-bad pixels are ever overwritten, the mask boundary is
+    still followed at full resolution regardless of the bin factor.
     """
-    tilt_idx, input_path, lo, hi, smoothn_workers, mask_path = args
+    tilt_idx, input_path, lo, hi, smoothn_workers, mask_path, bin_factor = args
 
     # Concurrent read-only mmap access is safe on all major OS/filesystems
     with mrcfile.mmap(input_path, mode='r', permissive=True) as mrc:
@@ -111,9 +199,15 @@ def _process_tilt(args: tuple) -> tuple:
     if not bad.any():
         return tilt_idx, img.astype(np.float32), mask.astype(np.int8)
 
-    # --- inpaint with smoothn ---
-    inpainted = smoothn(ma.array(img, mask=bad), s=1e7, max_iter=500,
-                        workers=smoothn_workers)
+    # --- inpaint with smoothn, optionally at reduced resolution ---
+    if bin_factor > 1:
+        binned_img, binned_good = _bin_good_mean(img, mask, bin_factor)
+        binned_field = smoothn(ma.array(binned_img, mask=~binned_good), s=1e7,
+                               max_iter=500, workers=smoothn_workers)
+        inpainted = _upsample_to(binned_field, img.shape)
+    else:
+        inpainted = smoothn(ma.array(img, mask=bad), s=1e7, max_iter=500,
+                            workers=smoothn_workers)
 
     result = img.copy()
     result[bad] = inpainted[bad]
@@ -126,13 +220,20 @@ def _process_tilt(args: tuple) -> tuple:
 # ---------------------------------------------------------------------------
 
 def run(input_path: str, output_path: str, params: dict,
-        n_cpus: int = None, edge_blend_px: int = None,
-        smoothn_workers: int = None, save_mask: bool = False) -> None:
+        ntotal: int = None, npertilt: int = 4, edge_blend_px: int = None,
+        bin_factor: int = 2, save_mask: bool = True) -> None:
     """
     Apply per-tilt masks from *params["tilts"]* to *input_path* and write the
     inpainted stack to *output_path*.
 
-    If *save_mask* is True, also write the binary mask stack to
+    Tilts are processed concurrently: *ntotal* is the total thread budget and
+    *npertilt* is how many of those threads smoothn's DCT/IDCT get per tilt,
+    so ``ntotal // npertilt`` tilts run at once, each in its own process.
+    Lower *npertilt* trades DCT thread-parallelism (which saturates well
+    before 8-16 threads, more so once binning has shrunk the array) for more
+    concurrent tilts, which also caps peak memory per tilt.
+
+    If *save_mask* is True (the default), also write the binary mask stack to
     ``<output_stem>_mask.mrc`` (mrc_mode=0, int8).  When a pre-baked
     ``mask_mrc`` is already referenced in *params*, the same mask data is
     re-emitted per-tilt so both outputs sit alongside each other.
@@ -142,43 +243,104 @@ def run(input_path: str, output_path: str, params: dict,
     if edge_blend_px is None:
         edge_blend_px = int(params.get("edge_blend_px", 15))
     total_cpus = multiprocessing.cpu_count()
-    if n_cpus is None:
-        n_cpus = total_cpus
-    # Tilts are processed serially; all CPUs go to smoothn's DCT/IDCT threads.
-    if smoothn_workers is None:
-        smoothn_workers = n_cpus
+    if ntotal is None:
+        ntotal = total_cpus
+    npertilt = max(1, npertilt)
+    n_concurrent = max(1, ntotal // npertilt)
 
     mask_path = params.get("mask_mrc")   # None when no paint/polygon overlays were saved
 
     print(f"Input           : {input_path}")
     print(f"Output          : {output_path}")
     print(f"Tilts           : {n_tilts}")
-    print(f"smoothn workers : {smoothn_workers}  (DCT threads per tilt)")
+    print(f"Total threads   : {ntotal}")
+    print(f"Threads/tilt    : {npertilt}")
+    print(f"Concurrent tilts: {n_concurrent}")
+    print(f"Bin factor      : {bin_factor}")
     print(f"Blend px        : {edge_blend_px}")
     if mask_path:
-        print(f"Spatial mask    : {mask_path}  (paint/polygon overlays baked in)")
+        print(f"Spatial mask    : {mask_path}")
     else:
         print("Spatial mask    : none  (using lo/hi intensity thresholds)")
 
     with mrcfile.mmap(input_path, mode='r', permissive=True) as mrc:
         shape = tuple(mrc.data.shape)
+        voxel_size = mrc.voxel_size.copy()
+
+    # A supplied mask is only meaningful if it matches the stack it is applied to.
+    # Failing loudly here beats silently inpainting the wrong pixels — particularly
+    # for odd/even half-sets, which must share the full-dose run's mask exactly.
+    if mask_path:
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(
+                f"Mask stack not found: {mask_path}\n"
+                "If this is an odd/even half-set run, the full-dose run writes the "
+                "mask and must complete first."
+            )
+        with mrcfile.mmap(mask_path, mode='r', permissive=True) as mrc:
+            mask_shape = tuple(mrc.data.shape)
+        if mask_shape != shape:
+            raise ValueError(
+                f"Mask shape {mask_shape} does not match input shape {shape} "
+                f"({mask_path})"
+            )
+        # A mask older than the stack it masks usually means the stack was re-stitched
+        # after the mask was baked.  Shape alone won't catch this, so warn loudly —
+        # but don't refuse, since copies and archive restores can reset mtimes.
+        if os.path.getmtime(mask_path) < os.path.getmtime(input_path):
+            print(
+                "\n"
+                "  ****************************  WARNING  ****************************\n"
+                "  The mask stack is OLDER than the input stack:\n"
+                f"    mask  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(mask_path)))}  {mask_path}\n"
+                f"    input {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(input_path)))}  {input_path}\n"
+                "  If the input was re-stitched since the mask was made, re-bake the\n"
+                "  mask from the GUI before trusting this result.\n"
+                "  *******************************************************************\n",
+                file=sys.stderr, flush=True,
+            )
+
+    # Re-emitting a mask that was handed to us would just duplicate an existing
+    # multi-GB file, so skip it and point at the original instead.
+    if save_mask and mask_path:
+        print("Mask output     : skipped (mask was supplied, not derived)")
+        save_mask = False
 
     mask_out_path = os.path.splitext(output_path)[0] + "_mask.mrc" if save_mask else None
 
+    tasks = [
+        (i, input_path, float(tilt_params[str(i)]["lo"]), float(tilt_params[str(i)]["hi"]),
+         npertilt, mask_path, bin_factor)
+        for i in range(n_tilts)
+    ]
+
     def _write_tilts(out_mrc, mask_mrc):
-        for i in tqdm(range(n_tilts), desc="Inpainting tilts"):
-            _, result, mask = _process_tilt((i, input_path,
-                                             float(tilt_params[str(i)]["lo"]),
-                                             float(tilt_params[str(i)]["hi"]),
-                                             smoothn_workers,
-                                             mask_path))
-            out_mrc.data[i] = result
-            if mask_mrc is not None:
-                mask_mrc.data[i] = mask
+        if n_concurrent <= 1:
+            for task in tqdm(tasks, desc="Inpainting tilts"):
+                idx, result, mask = _process_tilt(task)
+                out_mrc.data[idx] = result
+                if mask_mrc is not None:
+                    mask_mrc.data[idx] = mask
+            return
+
+        with ProcessPoolExecutor(max_workers=n_concurrent) as executor:
+            futures = [executor.submit(_process_tilt, task) for task in tasks]
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc="Inpainting tilts"):
+                idx, result, mask = future.result()
+                out_mrc.data[idx] = result
+                if mask_mrc is not None:
+                    mask_mrc.data[idx] = mask
 
     with mrcfile.new_mmap(output_path, shape=shape, mrc_mode=2, overwrite=True) as out_mrc:
+        # Carry the pixel size over. Without it the output header says 0, and
+        # anything downstream that trusts the header silently uses 1 A/px --
+        # 3dmod rescales an IMOD model by the ratio and throws every point clean
+        # off the canvas, which looks like the model being empty.
+        out_mrc.voxel_size = voxel_size
         if mask_out_path:
             with mrcfile.new_mmap(mask_out_path, shape=shape, mrc_mode=0, overwrite=True) as mask_mrc:
+                mask_mrc.voxel_size = voxel_size
                 _write_tilts(out_mrc, mask_mrc)
             print(f"Mask  → {mask_out_path}")
         else:
@@ -199,19 +361,32 @@ def main() -> None:
                         help="Output MRC (default: <input>_inpainted.mrc)")
     parser.add_argument("--params", required=True,
                         help="JSON params file from the interactive GUI")
-    parser.add_argument("--cpus",   type=int, default=None,
-                        help="Tilt-level parallel workers (default: all CPUs)")
-    parser.add_argument("--smoothn-workers", type=int, default=None,
-                        dest="smoothn_workers",
-                        help="DCT threads per tilt inside smoothn "
-                             "(default: auto = total_cpus // --cpus)")
+    parser.add_argument("--ntotal", type=int, default=None, dest="ntotal",
+                        help="Total thread budget shared across concurrent tilts "
+                             "(default: all CPUs)")
+    parser.add_argument("--npertilt", type=int, default=4, dest="npertilt",
+                        help="DCT/IDCT threads per tilt inside smoothn; "
+                             "ntotal // npertilt tilts run concurrently, each in "
+                             "its own process (default: 4)")
+    parser.add_argument("--bin", type=int, default=2, dest="bin_factor",
+                        help="Downsample factor used for the smoothn fit before "
+                             "upsampling back to full resolution; 1 disables "
+                             "binning (default: 2)")
     parser.add_argument("--edge-blend", type=int, default=None,
                         dest="edge_blend_px",
                         help="Edge-blend width in pixels (overrides params file value)")
-    parser.add_argument("--save-mask", action="store_true", default=False,
-                        dest="save_mask",
-                        help="Also write the binary mask stack to "
-                             "<output>_mask.mrc (int8, mrc_mode=0)")
+    parser.add_argument("--mask", default=None, dest="mask_path",
+                        help="Pre-baked binary mask stack (int8 MRC) to use instead "
+                             "of the per-tilt lo/hi thresholds; overrides the params "
+                             "file's mask_mrc entry. Use this to force odd/even "
+                             "half-sets through exactly the same mask as the "
+                             "full-dose run, whose lo/hi thresholds do not transfer "
+                             "to half-intensity data")
+    parser.add_argument("--dont-save-mask", action="store_true", default=False,
+                        dest="dont_save_mask",
+                        help="Do not write the binary mask stack to "
+                             "<output>_mask.mrc (int8, mrc_mode=0); the mask "
+                             "is written by default")
     args = parser.parse_args()
 
     for path, label_ in [(args.input, "input"), (args.params, "params")]:
@@ -223,13 +398,21 @@ def main() -> None:
     with open(args.params) as f:
         params = json.load(f)
 
-    # The GUI "Save mask MRC" checkbox writes save_mask=true into the JSON;
-    # the --save-mask CLI flag is an override for manual invocations.
-    save_mask = args.save_mask or bool(params.get("save_mask", False))
+    # Mask saving is on by default.  The GUI's "Save mask MRC" checkbox writes
+    # save_mask into the JSON (also on by default), and --dont-save-mask is an
+    # override that turns it off regardless — used by the odd/even half-set runs,
+    # which would otherwise each rewrite the same mask stack.
+    save_mask = bool(params.get("save_mask", True)) and not args.dont_save_mask
+
+    # --mask overrides the params file, so half-set runs can point at the mask the
+    # full-dose run wrote rather than re-deriving one from thresholds that no
+    # longer apply.
+    if args.mask_path:
+        params["mask_mrc"] = os.path.abspath(args.mask_path)
 
     run(args.input, output, params,
-        n_cpus=args.cpus, edge_blend_px=args.edge_blend_px,
-        smoothn_workers=args.smoothn_workers, save_mask=save_mask)
+        ntotal=args.ntotal, npertilt=args.npertilt, edge_blend_px=args.edge_blend_px,
+        bin_factor=args.bin_factor, save_mask=save_mask)
 
 
 if __name__ == "__main__":

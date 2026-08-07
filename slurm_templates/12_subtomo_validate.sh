@@ -5,7 +5,10 @@
 #SBATCH -p sapphire
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+# relion_tomo_subtomo loads the WHOLE tilt series into memory before extracting,
+# and one image per (tilt, tile) makes that 642 x 4092 x 5760 x 4 B = 60.5 GB of
+# image data alone. 64 G was OOM-killed at 67 GB resident (job 28884970).
+#SBATCH --mem=256G
 #SBATCH --time=04:00:00
 #
 # Is the pseudo-subtomogram extraction actually pulling particles out?
@@ -92,6 +95,13 @@ EOF
     # RELION resolves rlnTomoTomogramsFile / rlnTomoTiltSeriesStarFile against
     # the CURRENT DIRECTORY, not against the star file that names them, so it
     # has to be run from the export directory. Everything else is absolute.
+    #
+    # Expect "has relion-4 definition of projection matrices; converting them
+    # now". That is RELION spotting that our matrices take a corner-origin
+    # coordinate (which projection_matrix builds deliberately) and shifting them
+    # to the RELION-5 centred convention. It should be the right conversion, but
+    # it is asserted rather than verified -- the decoy comparison below is what
+    # would catch it if it is not.
     ( cd "${SRC}" && relion_tomo_subtomo \
         --i    optimisation_set.star \
         --b    ${B} --crop ${CROP} --bin ${BIN} \
