@@ -703,18 +703,32 @@ def _image_sources(
 
     By default these are ``<slice>@<per-tilt stack>``, which costs nothing: the
     stacks that ``beam_mask_motioncorr --stack-output`` already wrote hold one
-    tile per slice in exactly the order of ``Refined_positions``. Use
-    ``--materialise`` if RELION refuses the ``N@`` form on this path -- it
-    writes the same data out flat, at the cost of ~60 GB.
+    tile per slice in exactly the order of ``Refined_positions``.
+
+    They cannot be pointed at directly, though. RELION rejects ``N@file.mrc``
+    with "stacks of images in MRC-format should have extension .mrcs; .mrc
+    extensions are reserved for 3D maps" -- it decides by extension alone, and
+    the per-tilt stacks are .mrc. The two formats are identical, so a symlink
+    per tilt satisfies it for nothing; ``--materialise`` writes the same data
+    out flat and costs ~60 GB.
     """
     if not materialise:
-        names = []
-        for tilt, tile in images:
+        linkdir = os.path.join(out, "tilt_stacks")
+        os.makedirs(linkdir, exist_ok=True)
+        links: Dict[float, str] = {}
+        for tilt in sorted({t for t, _ in images}):
             stack = proj.tilts[tilt].stack_path
             if stack is None:
                 raise ValueError(f"No tile stack found for tilt {tilt}")
-            names.append(f"{tile + 1}@{os.path.abspath(stack)}")
-        return names
+            link = os.path.join(
+                linkdir, os.path.splitext(os.path.basename(stack))[0] + ".mrcs"
+            )
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(os.path.abspath(stack), link)
+            links[tilt] = link
+        logger.info("symlinked %d tile stacks as .mrcs in %s", len(links), linkdir)
+        return [f"{tile + 1}@{links[tilt]}" for tilt, tile in images]
 
     import mrcfile
 

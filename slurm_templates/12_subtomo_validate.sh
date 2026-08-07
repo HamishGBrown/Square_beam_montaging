@@ -33,7 +33,10 @@ OUT="${BASE}/relion/validate"
 #   BOX 256 unbinned (877 A) -> --b 128 --bin 2 reads exactly 256.
 BIN=2
 B=128
-CROP=96          # 96 * 6.852 A = 658 A output box, ample for a 300 A ribosome
+# Do NOT crop tight. At 7 um the CTF delocalises signal by lambda*df*s = 69 A at
+# 20 A and 138 A at 10 A, so a 300 A ribosome needs 300 + 2*delocalisation of
+# box to keep its own signal. 128 * 6.852 = 877 A; 96 (658 A) is already marginal.
+CROP=128
 JITTER=750       # decoy displacement, A, in the specimen plane
 # ── end of edit section ───────────────────────────────────────────────────────
 
