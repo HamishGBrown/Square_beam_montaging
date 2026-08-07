@@ -29,7 +29,6 @@ dependencies = [
     "mrcfile",
     "argparse",
     "h5py>=3.11",
-    "shapely",
 ]
 
 [project.scripts]
@@ -52,3 +51,4 @@ mrc_to_gif                      = "processing_scripts.mrc_to_gif:main"
 montage_to_relion               = "processing_scripts.montage_to_relion:main"
 overlay_picks_on_montage        = "processing_scripts.overlay_picks_on_montage:main"
 picks_to_imod_model             = "processing_scripts.picks_to_imod_model:main"
+score_subtomo_sum               = "processing_scripts.score_subtomo_sum:main"
