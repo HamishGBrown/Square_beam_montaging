@@ -3,6 +3,8 @@
 import os
 import copy
 import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')  # X11-forwarding compatible backend
 from matplotlib import pyplot as plt
 from matplotlib.widgets import Slider
 import argparse
@@ -10,6 +12,15 @@ from scipy.ndimage import binary_fill_holes, binary_erosion,rotate
 from matplotlib.patches import Rectangle
 import serialem as sem 
 from matplotlib.widgets import Button
+
+# ---------------------------------------------------------------------------
+# Beam shape for this microscope/beam setup. Set once when configuring the
+# scripts for a given instrument:
+#   "square" - rectangular beam, interactive x/y overlap-factor sliders.
+#   "round"  - circular beam tiled hexagonally, interactive hexagon side
+#              length slider.
+# ---------------------------------------------------------------------------
+BEAM_SHAPE = "round"
 
 def fourier_crop(ain, shapeout):
     """
@@ -298,62 +309,15 @@ def rotation_matrix(angle_degrees):
     sin_theta = np.sin(angle_radians)
     return np.array([[cos_theta, -sin_theta], [sin_theta, cos_theta]])
 
-def main():
-    # Take record image and read from serial EM buffer
-    a = sem.R()
-    image = np.asarray(sem.bufferImage('A'))
-    
-    
-    image = fourier_interpolate(image, (int(image.shape[0]/image.shape[1]*512),512))
-    oy,ox=[10,10]
-    mask = np.where(make_mask(image, 20,3),1,0)  # Initial blur with small sigma
-    fig,axes  = plt.subplots(1,2,figsize=(12,6))
-    ax_angle = plt.axes([0.05, 0.05, 0.5, 0.03])
-    
-    maskax,rotated_mask_ax = axes
-    maskax.imshow(mask)
-    angle_slider = Slider(ax_angle, "Angle", -180, 180, valinit=0, valstep=1, valfmt='%0.0f')
 
-    # rotated_mask_ax = plt.axes([0.1, 0.25, 0.25, 0.65])
-    rotated_mask_ax.set_title("Rotated Mask")
-    rotated_mask_ax.axis("off")
-    rotated_mask_im = rotated_mask_ax.imshow(mask, cmap='gray')
 
-    def rotate_mask(mask, angle):
-        return rotate(mask, -angle, reshape=False)
 
-    def update_rotation(val):
-        angle = angle_slider.val
-        rotated_mask = rotate_mask(mask, angle)
-        rotated_mask_im.set_data(rotated_mask)
-        fig.canvas.draw_idle()
-
-    angle_slider.on_changed(update_rotation)
-    plt.show()
-    vmin = np.percentile(image, 10)
-    vmax = np.percentile(image, 90)
-    
-    angle = angle_slider.val
-
-    # Plot the original image and create space for the eroded image
-    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
-    plt.subplots_adjust(bottom=0.25)
-
+def setup_square_beam_controls(fig, ax, mask, angle):
     ax_overlapy = plt.axes([0.33, 0.1, 0.25, 0.03])
     ax_overlapx = plt.axes([0.66, 0.1, 0.25, 0.03])
     oy,ox = [10,10]
     overlapy_slider = Slider(ax_overlapy, "Y overlap", 2, 20, valinit=oy, valstep=0.1,valfmt='%0.1f')
     overlapx_slider = Slider(ax_overlapx, "X overlap", 2, 20, valinit=ox, valstep=0.1,valfmt='%0.1f')
-    
-    
-    ax[0].set_title("Original Image")
-    ax[0].axis("off")
-
-    # Placeholder for blurred image
-    
-    
-    ax[0].imshow(np.where(mask,1,0))
-    ax[2].axis("off")
 
     def makeoverlapmaps(oy,ox,mask,angle=0):
         overlapmapy = copy.deepcopy(mask).astype(int)
@@ -365,19 +329,29 @@ def main():
         overlapmapx += roll_no_periodic(mask, [0,mask.shape[1]-s//ox], angle=angle)
         return overlapmapy,overlapmapx
 
+    def make_combined_rgb(overlapmapy, overlapmapx):
+        # Red = y-neighbour overlap, green = x-neighbour overlap (each 0..2,
+        # scaled to 0..1). Yellow marks a point confirmed doubly-covered in
+        # both directions; solid red-only or green-only flags a direction
+        # with no confirmed neighbour overlap there.
+        rgb = np.zeros(overlapmapy.shape + (3,))
+        rgb[..., 0] = overlapmapy / 2.0
+        rgb[..., 1] = overlapmapx / 2.0
+        return rgb
+
     overlapmapy,overlapmapx = makeoverlapmaps(oy,ox,mask,angle=angle)
     shifty = np.asarray((mask.shape[0] - mask.shape[0]//oy,0)) @ rotation_matrix(angle).T
     shiftx = np.asarray((0,mask.shape[1] - mask.shape[1]//ox))@ rotation_matrix(angle).T
-    im1 = ax[1].imshow(overlapmapy,vmin=0,vmax=2)
+    im1 = ax[1].imshow(make_combined_rgb(overlapmapy, overlapmapx))
+    ax[1].axis("off")
     plusrecty = Rectangle(shifty[::-1],mask.shape[1],mask.shape[0],fill=False,edgecolor='red')
     minusrecty = Rectangle(-shifty[::-1],mask.shape[1],mask.shape[0],fill=False,edgecolor='red')
     ax[1].add_patch(plusrecty)
     ax[1].add_patch(minusrecty)
-    im2 = ax[2].imshow(overlapmapx,vmin=0,vmax=2)
-    plusrectx = Rectangle(shiftx[::-1],mask.shape[1],mask.shape[0],fill=False,edgecolor='red')
-    minusrectx = Rectangle(-shiftx[::-1],mask.shape[1],mask.shape[0],fill=False,edgecolor='red')
-    ax[2].add_patch(plusrectx)
-    ax[2].add_patch(minusrectx)
+    plusrectx = Rectangle(shiftx[::-1],mask.shape[1],mask.shape[0],fill=False,edgecolor='lime')
+    minusrectx = Rectangle(-shiftx[::-1],mask.shape[1],mask.shape[0],fill=False,edgecolor='lime')
+    ax[1].add_patch(plusrectx)
+    ax[1].add_patch(minusrectx)
 
     def update(val):
         oy = overlapy_slider.val
@@ -390,16 +364,147 @@ def main():
         minusrectx.set_xy(-shiftx[::-1])
         overlapmapy,overlapmapx = makeoverlapmaps(oy,ox,mask,angle=angle)
         overlapyfraction = np.sum(overlapmapy == 2) / np.prod(overlapmapy.shape)
-        im1.set_data(overlapmapy)
-        ax[1].set_title('Overlapy fraction: {0:.2f}'.format(overlapyfraction))
-        
         overlapxfraction = np.sum(overlapmapx == 2) / np.prod(overlapmapx.shape)
-        im2.set_data(overlapmapx)
-        ax[2].set_title('Overlapx fraction: {0:.2f}'.format(overlapxfraction))
+        im1.set_data(make_combined_rgb(overlapmapy, overlapmapx))
+        ax[1].set_title(
+            'Overlapy fraction (red): {0:.2f}   |   Overlapx fraction (green): {1:.2f}'.format(
+                overlapyfraction, overlapxfraction
+            )
+        )
         fig.canvas.draw_idle()
 
     overlapx_slider.on_changed(update)
     overlapy_slider.on_changed(update)
+    update(None)
+
+    # Widgets must stay externally referenced or Python's garbage collector
+    # can reap them (and their on_changed callback) with no error -- the
+    # window keeps working, the slider just goes silently dead. Return them
+    # so the caller can keep them alive at least until plt.show() returns.
+    return overlapy_slider, overlapx_slider
+
+
+def setup_round_beam_controls(fig, ax, mask, angle, binning=1.0):
+    """
+    Interactive hexagon-side-length control for a round beam tiled on a
+    hexagonal (triangular-lattice) grid. The hexagon side length equals the
+    centre-to-centre spacing of neighbouring beam positions (a regular
+    hexagon's side length equals its circumradius), so the six neighbour
+    directions are the same base shift vector rotated by 0/60/.../300
+    degrees (plus the calibrated beam angle) about the beam centre.
+
+    Parameters
+    ----------
+    binning : float, optional
+        Ratio of the raw (unbinned) record image width to the downsampled
+        preview `mask` width (512 px). The slider itself operates in preview
+        pixels -- the geometry in make_hex_overlap_map needs that -- but the
+        reported side length is converted to unbinned pixels, since that is
+        the unit SetupPolygonMontage.txt expects.
+    """
+    max_side = min(mask.shape)
+    hexside_init = min(max(2, min(mask.shape) / 2), max_side)
+
+    ax_hexside = plt.axes([0.375, 0.1, 0.35, 0.03])
+    hexside_slider = Slider(
+        ax_hexside, "Hexagon side length (display px)", 2, max_side,
+        valinit=hexside_init, valstep=1, valfmt='%0.0f'
+    )
+
+    def make_hex_overlap_map(side_length, angle=0):
+        overlap_map = mask.astype(int).copy()
+        for i in range(6):
+            overlap_map = overlap_map + roll_no_periodic(mask, [side_length, 0], angle=angle + i * 60)
+        return overlap_map
+
+    overlap_map = make_hex_overlap_map(hexside_init, angle=angle)
+    im1 = ax[1].imshow(overlap_map, vmin=0, vmax=3)
+    ax[1].axis("off")
+
+    def update(val):
+        side_length = hexside_slider.val
+        overlap_map = make_hex_overlap_map(side_length, angle=angle)
+        overlap_fraction = np.sum(overlap_map >= 2) / np.prod(overlap_map.shape)
+        im1.set_data(overlap_map)
+        ax[1].set_title(
+            'Hex overlap fraction: {0:.2f}  |  side length = {1:.0f} px (display) '
+            '= {2:.0f} px (unbinned)'.format(overlap_fraction, side_length, side_length * binning)
+        )
+        fig.canvas.draw_idle()
+
+    hexside_slider.on_changed(update)
+    update(hexside_init)
+
+    # See the matching comment in setup_square_beam_controls: without an
+    # external reference, the slider (and its on_changed callback) can be
+    # silently garbage-collected before it's ever interacted with.
+    return (hexside_slider,)
+
+
+def main():
+    # Take record image and read from serial EM buffer
+    a = sem.R()
+    image = np.asarray(sem.bufferImage('A'))
+
+    # Preview is downsampled to a fixed 512 px width to keep the sliders
+    # responsive; record it so reported pixel values can be converted back
+    # to unbinned (raw record image) pixels.
+    binning = image.shape[1] / 512
+
+    image = fourier_interpolate(image, (int(image.shape[0]/image.shape[1]*512),512))
+    oy,ox=[10,10]
+    mask = np.where(make_mask(image, 20,3),1,0)  # Initial blur with small sigma
+
+    # For rectangular beams, work out rotation of rectangle with respect to camera
+    if BEAM_SHAPE=='square':
+        fig,axes  = plt.subplots(1,2,figsize=(12,6))
+        ax_angle = plt.axes([0.05, 0.05, 0.5, 0.03])
+
+        maskax,rotated_mask_ax = axes
+        maskax.imshow(mask)
+        angle_slider = Slider(ax_angle, "Angle", -180, 180, valinit=0, valstep=1, valfmt='%0.0f')
+       
+        rotated_mask_ax.set_title("Rotated Mask")
+        rotated_mask_ax.axis("off")
+        rotated_mask_im = rotated_mask_ax.imshow(mask, cmap='gray')
+
+        def rotate_mask(mask, angle):
+            return rotate(mask, -angle, reshape=False)
+
+        def update_rotation(val):
+            angle = angle_slider.val
+            rotated_mask = rotate_mask(mask, angle)
+            rotated_mask_im.set_data(rotated_mask)
+            fig.canvas.draw_idle()
+
+        angle_slider.on_changed(update_rotation)
+        plt.show()
+        vmin = np.percentile(image, 10)
+        vmax = np.percentile(image, 90)
+
+        angle = angle_slider.val
+    else:
+        #For round beam the angle not relevant, set to zero
+        angle = 0.0
+   
+
+    # Plot the original image and create space for the eroded image
+    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+    plt.subplots_adjust(bottom=0.25)
+
+    ax[0].set_title("Original Image")
+    ax[0].axis("off")
+    ax[0].imshow(np.where(mask,1,0))
+    ax[2].axis("off")
+
+    if BEAM_SHAPE == "round":
+        widgets = setup_round_beam_controls(fig, ax, mask, angle, binning=binning)
+    else:
+        widgets = setup_square_beam_controls(fig, ax, mask, angle)
+
+    # Keep a live reference to the slider(s) for as long as the window is
+    # open -- see the comment in each setup_*_beam_controls function.
+    fig._widgets = widgets
 
     # Show the interactive plot
     plt.show()

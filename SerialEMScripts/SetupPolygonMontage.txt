@@ -3,11 +3,99 @@
 
 import numpy as np
 import os
-import shapely
 import re
 import matplotlib.pyplot as plt
 import serialem as sem
-from shapely.geometry import Polygon, box
+
+
+# ---------------------------------------------------------------------------
+# Beam shape for this microscope/beam setup. Edit this to match the beam
+# actually installed, then set `overlap` further down to match:
+#   "square" - rectangular beam, tiled on a rectangular grid. `overlap` is
+#              [overlapy, overlapx], the two reciprocal-style factors this
+#              file has always used (spacing fraction = 1 - 1/overlap).
+#   "round"  - circular beam, tiled on a hexagonal (triangular-lattice) grid.
+#              `overlap` is a single number: the hexagon side length in
+#              unbinned camera pixels, i.e. the centre-to-centre spacing
+#              between beam positions, exactly as reported by
+#              DetermineOverlapFraction.txt's round-beam control ("side
+#              length = ... px (unbinned)").
+# Determine the value(s) for whichever shape is selected using
+# DetermineOverlapFraction.txt (same BEAM_SHAPE toggle there) and copy the
+# result into `overlap` in the __main__ block below.
+# ---------------------------------------------------------------------------
+BEAM_SHAPE = "square"
+
+
+def polygon_area(points):
+    """
+    Area of a closed simple polygon via the shoelace formula.
+
+    Parameters:
+    - points: An (N, 2) array of polygon vertices (ring not repeated).
+
+    Returns:
+    - The (unsigned) area, so the vertex winding direction does not matter.
+    """
+    x, y = np.asarray(points, dtype=float).T
+    return 0.5 * np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def clip_polygon_to_box(points, xmin, ymin, xmax, ymax):
+    """
+    Clip a polygon against an axis-aligned rectangle (Sutherland-Hodgman).
+
+    The clip region is convex so the algorithm is exact. For a concave subject
+    polygon the output can contain zero-width connecting edges running along the
+    rectangle boundary, but those contribute no area to the shoelace formula, so
+    the area of the result is still correct.
+
+    Parameters:
+    - points: An (N, 2) array of polygon vertices (ring not repeated).
+    - xmin, ymin, xmax, ymax: The bounds of the clipping rectangle.
+
+    Returns:
+    - An (M, 2) array of clipped vertices, empty if there is no overlap.
+    """
+    poly = np.asarray(points, dtype=float)
+
+    # Clip in turn against each of the four edges. keep_greater says which side
+    # of the clip line is inside the rectangle.
+    for axis, bound, keep_greater in (
+        (0, xmin, True),
+        (0, xmax, False),
+        (1, ymin, True),
+        (1, ymax, False),
+    ):
+        if len(poly) == 0:
+            return np.empty((0, 2))
+
+        # Signed distance to the clip line, positive on the inside
+        d = (poly[:, axis] - bound) * (1.0 if keep_greater else -1.0)
+
+        out = []
+        for p, q, dp, dq in zip(poly, np.roll(poly, -1, axis=0), d, np.roll(d, -1)):
+            # Keep vertices that are inside
+            if dp >= 0:
+                out.append(p)
+            # Edge crosses the clip line, so add the crossing point
+            if (dp > 0) != (dq > 0):
+                out.append(p + (q - p) * (dp / (dp - dq)))
+        poly = np.asarray(out) if out else np.empty((0, 2))
+
+    return poly
+
+
+def rect_polygon_overlap_area(polygon_points, xmin, ymin, xmax, ymax):
+    """
+    Area of intersection of a simple polygon with an axis-aligned rectangle.
+
+    Replaces shapely's Polygon(...).intersection(box(...)).area using numpy only.
+    """
+    clipped = clip_polygon_to_box(polygon_points, xmin, ymin, xmax, ymax)
+    if len(clipped) < 3:
+        return 0.0
+    return polygon_area(clipped)
 
 
 def rectangles_with_overlap(
@@ -26,9 +114,6 @@ def rectangles_with_overlap(
     Returns:
     - A list of bottom-left corner points of rectangles that have a fractional overlap greater than the criterion.
     """
-    # Create the polygon using the input points
-    polygon = Polygon(polygon_points)
-
     # List to hold rectangles that satisfy the overlap criterion
     overlapping_rectangles = []
     from matplotlib.patches import Rectangle
@@ -37,17 +122,15 @@ def rectangles_with_overlap(
     #ax.plot(*np.asarray(polygon_points).T,'k--')
     # Loop through each rectangle
     for rect_point in rect_points:
-        # Create the rectangle (as a box) using the bottom-left corner point and the given dimensions
-        rect = box(
+        # Calculate the intersection area between the polygon and the rectangle
+        # given by the bottom-left corner point and the given dimensions
+        overlap_area = rect_polygon_overlap_area(
+            polygon_points,
             rect_point[0],
             rect_point[1],
             rect_point[0] + rect_width,
             rect_point[1] + rect_height,
         )
-
-        # Calculate the intersection area between the polygon and the rectangle
-        intersection = polygon.intersection(rect)
-        overlap_area = intersection.area
 
         # Calculate the area of the rectangle
         rect_area = rect_width * rect_height
@@ -131,7 +214,23 @@ def extract_points(file_path, item_index):
     return points_array
 
 
-def plot_points_in_serial_EM_navigator(imageshifts, M, nx, ny, x, y):
+def regular_polygon_points(radius, n_sides=28):
+    """
+    Corner points (relative to a center at the origin, closed loop) of a
+    regular polygon approximating a circle of the given radius.
+
+    SerialEM's navigator scripting has no native circle item -- only
+    AddStagePointsAsPolygon, which draws a closed polygon from a point list
+    -- so a many-sided regular polygon is the standard way to draw a
+    round-beam footprint there; at typical navigator zoom levels it's
+    visually indistinguishable from a true circle.
+    """
+    theta = np.linspace(0, 2 * np.pi, n_sides, endpoint=False)
+    theta = np.append(theta, theta[0])  # repeat first point to close the loop
+    return radius * np.cos(theta), radius * np.sin(theta)
+
+
+def plot_points_in_serial_EM_navigator(imageshifts, M, nx, ny, x, y, beam_shape="square"):
     import serialem as sem
     # Get a unique group number to add squares to
     gid = int(sem.GetUniqueNavID())
@@ -142,9 +241,19 @@ def plot_points_in_serial_EM_navigator(imageshifts, M, nx, ny, x, y):
         xx = imshift[0]
         yy = imshift[1]
 
-        # Generate corners in pixel coordinates
-        cornersx = [xx + nx / 2 * (1 - 2 * ((i % 4) // 2)) for i in range(5)]
-        cornersy = [yy + ny / 2 * (1 - 2 * ((i + 1) % 4 // 2)) for i in range(5)]
+        if beam_shape == "round":
+            # Largest circle inscribed in the nx x ny record footprint --
+            # the same footprint already used elsewhere as the round beam's
+            # effective per-tile area (see the overlap-filtering comment in
+            # main_serialem/main_sandbox).
+            relcornersx, relcornersy = regular_polygon_points(min(nx, ny) / 2)
+        else:
+            # Generate corners in pixel coordinates
+            relcornersx = np.asarray([nx / 2 * (1 - 2 * ((i % 4) // 2)) for i in range(5)])
+            relcornersy = np.asarray([ny / 2 * (1 - 2 * ((i + 1) % 4 // 2)) for i in range(5)])
+
+        cornersx = xx + relcornersx
+        cornersy = yy + relcornersy
 
         # Use matrix to convert to specimen coordinates
         cornersx, cornersy = M @ np.stack((cornersx, cornersy), axis=0)
@@ -225,7 +334,37 @@ def dose_symmetric_tilts(maxtilt, step, nreflect):
     return tilts
 
 
-def generate_montage_shifts(overlap_factor, tiles, detector_pixels, shift=[0.0, 0.0]):
+def overlap_factor_to_sep(overlap_factor, detector_pixels, beam_shape="square"):
+    """
+    Convert the user-facing overlap parameter into fractional row/column
+    tile-to-tile spacing (each as a fraction of one tile's y/x extent).
+
+    For beam_shape="square", overlap_factor is [overlapy, overlapx], the
+    reciprocal-style factors this file has always used: spacing fraction =
+    1 - 1/overlap_factor.
+
+    For beam_shape="round", overlap_factor is a single number: the hexagon
+    side length in unbinned camera pixels (as reported by
+    DetermineOverlapFraction.txt's round-beam control) -- the centre-to-centre
+    tile spacing directly, rather than a reciprocal factor. Row (y) spacing
+    is compressed by sqrt(3)/2 for triangular-lattice circle packing; the
+    half-column row offset generate_montage_shifts already applies gives the
+    required lattice offset in x.
+    """
+    if beam_shape == "round":
+        hex_side_px = float(overlap_factor)
+        return np.asarray([
+            hex_side_px / detector_pixels[1] * np.sqrt(3) / 2,
+            hex_side_px / detector_pixels[0],
+        ])
+
+    o = 1 / np.asarray(overlap_factor)
+    return 1 - o
+
+
+def generate_montage_shifts(
+    overlap_factor, tiles, detector_pixels, shift=[0.0, 0.0], beam_shape="square"
+):
     """
     Generates a list of montage shift coordinates to cover a large area using a grid
     of overlapping detector tiles. The generated coordinates represent shifts in pixel
@@ -234,9 +373,11 @@ def generate_montage_shifts(overlap_factor, tiles, detector_pixels, shift=[0.0, 
 
     Parameters
     ----------
-    overlap_factor : list or tuple of float
-        A list or tuple of two values representing the fractional overlap in the x and y
-        directions between adjacent tiles. Values should be between 0 and 1.
+    overlap_factor : list/tuple of float, or a single float
+        For beam_shape="square": [overlapy, overlapx], the fractional overlap
+        factors between adjacent tiles (see overlap_factor_to_sep). For
+        beam_shape="round": a single number, the hexagon side length in
+        unbinned camera pixels.
     tiles : tuple of int
         The number of tiles in the x (width) and y (height) directions (n, m).
     detector_pixels : list or tuple of int
@@ -244,6 +385,13 @@ def generate_montage_shifts(overlap_factor, tiles, detector_pixels, shift=[0.0, 
     shift : list or tuple of float, optional
         An optional initial shift to apply to the montage coordinates in the x and y
         directions. Default is [0.0, 0.0].
+    beam_shape : str, optional
+        "square" (default) for a rectangular beam, or "round" for a circular
+        beam. Both patterns already offset alternate rows by half the column
+        spacing (see Notes); "round" additionally compresses the row-to-row
+        spacing by sqrt(3)/2, turning that brick offset into the tighter
+        triangular-lattice packing that covers a plane with circles using
+        the least overlap. See BEAM_SHAPE below for how this is selected.
 
     Returns
     -------
@@ -257,6 +405,9 @@ def generate_montage_shifts(overlap_factor, tiles, detector_pixels, shift=[0.0, 
     - The function calculates the montage shifts such that the center of the grid is
       positioned at (0, 0), with each tile shifted by an amount determined by the overlap
       factor.
+    - Alternate rows are offset by half the column spacing (a brick pattern) regardless
+      of beam_shape; for beam_shape="round" this is exactly the triangular-lattice
+      offset once the row spacing is also compressed below.
     - The x coordinates reverse direction on each row (serpentine or zigzag pattern) to
       minimize the magnitude of successive shifts.
     - The y coordinates are calculated to ensure coverage based on the overlap and tile
@@ -279,11 +430,12 @@ def generate_montage_shifts(overlap_factor, tiles, detector_pixels, shift=[0.0, 
     # Get number of tiles in x and y direction
     n, m = tiles
 
-    # reciprocal of overlap factor, the overlap fraction
-    o = 1 / np.asarray(overlap_factor)
+    # Fractional seperation of individual images (see overlap_factor_to_sep
+    # for how this differs between beam_shape="square" and "round")
+    sep = overlap_factor_to_sep(overlap_factor, detector_pixels, beam_shape=beam_shape)
 
-    # Fractional seperation of individual images
-    sep = 1 - o
+    # Equivalent fractional overlap, used below to size the tail of each row/column
+    o = 1 - sep
 
     # Generate a list of fractional y coordinates for the montage centers
     # centered on 0. (shift+0.5)%1.0)+0.5 ensures that we always start within
@@ -378,10 +530,8 @@ def plot_tilts_and_image_shifts(polygonpoints,tilts,imageshifts,M,ny,nx):
         # for j, (x, y) in enumerate(imshift):    
     plt.show()
 
-def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=0):
+def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=0,beam_shape="square"):
     import serialem as sem
-
-    overlapy,overlapx = [float(x) for x in overlap]
 
     # Get coordinates from polygon and label from last acquired item
     # this script is intended by run after acquisition using "Acquire at items"
@@ -445,7 +595,11 @@ def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotatio
     ) / 2
 
     ntilts = len(tilts)
-    o = [overlapy, overlapx]
+
+    # Fractional row/column tile spacing, used below to give each tilt a
+    # different sub-tile phase so the same ground isn't dosed on every tilt
+    # (see overlap_factor_to_sep for the square vs. round difference).
+    sep = overlap_factor_to_sep(overlap, [nx, ny], beam_shape=beam_shape)
 
     imageshifts = []
     for itilts in range(ntilts):
@@ -453,10 +607,11 @@ def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotatio
         # Generate montage shifts for this tilt, shift by overlap
         # output is in pixels
         imagexy = generate_montage_shifts(
-            o,
+            overlap,
             [extent[0] / nx, extent[1] / ny],
             [nx, ny],
-            shift=[(itilts / o[0]) % 1.0, (itilts / o[1]) % 1.0],
+            shift=[(itilts * (1 - sep[0])) % 1.0, (itilts * (1 - sep[1])) % 1.0],
+            beam_shape=beam_shape,
         )
 
         # Shift image shifts by 1/2 a Record field of view
@@ -473,7 +628,12 @@ def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotatio
         transformed_poly_points = (Minv @ polygonpoints.T).T
         # dilated_poly_points[:,1] = (transformed_poly_points[:,1] - vy)*np.cos(np.deg2rad(tilts[itilts])) + vy
 
-        # Remove images with insufficient overlap with the polygon
+        # Remove images with insufficient overlap with the polygon. For
+        # beam_shape="round" this treats each tile's footprint as the nx x ny
+        # record rectangle rather than the true circular beam outline -- an
+        # approximation, but nx x ny is already the useful (inscribed-square)
+        # data extracted per tile downstream, so it is the right footprint
+        # to test against.
         imagexy = (
             rectangles_with_overlap(
                 transformed_poly_points, imagexy + origin, nx, ny, polyoverlapfrac
@@ -483,7 +643,7 @@ def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotatio
 
         imageshifts.append(imagexy)
 
-    ids, gid = plot_points_in_serial_EM_navigator(imageshifts[0], M, nx, ny, vx, vy)
+    ids, gid = plot_points_in_serial_EM_navigator(imageshifts[0], M, nx, ny, vx, vy, beam_shape=beam_shape)
 
     # Calculate defocii to compensate for distance from tilt axis
     zs = calculate_defocii(imageshifts,tilts,M)
@@ -509,9 +669,7 @@ def rotation_matrix(angle_degrees):
     sin_theta = np.sin(angle_radians)
     return np.array([[cos_theta, -sin_theta], [sin_theta, cos_theta]])
 
-def main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,polygonpoints=None,nx=4092,ny=4092,p=0.65,rotation=0):
-
-    overlapy,overlapx = [float(x) for x in overlap]
+def main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,polygonpoints=None,nx=4092,ny=4092,p=0.65,rotation=0,beam_shape="square"):
 
     # Get coordinates from polygon and label from last acquired item
     # this script is intended by run after acquisition using "Acquire at items"
@@ -564,7 +722,11 @@ def main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,polygonp
 
         
     ntilts = len(tilts)
-    o = [overlapy, overlapx]
+
+    # Fractional row/column tile spacing, used below to give each tilt a
+    # different sub-tile phase so the same ground isn't dosed on every tilt
+    # (see overlap_factor_to_sep for the square vs. round difference).
+    sep = overlap_factor_to_sep(overlap, [nx, ny], beam_shape=beam_shape)
 
     imageshifts = []
     for itilts in range(ntilts):
@@ -572,10 +734,11 @@ def main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,polygonp
         # Generate montage shifts for this tilt, shift by overlap
         # output is in pixels
         imagexy = generate_montage_shifts(
-            o,
+            overlap,
             [extent[0] / nx, extent[1] / ny],
             [nx, ny],
-            shift=[(itilts / o[0]) % 1.0, (itilts / o[1]) % 1.0],
+            shift=[(itilts * (1 - sep[0])) % 1.0, (itilts * (1 - sep[1])) % 1.0],
+            beam_shape=beam_shape,
         )
 
         # Shift image shifts by 1/2 a Record field of view
@@ -630,10 +793,20 @@ if __name__ == "__main__":
     maxtilt = 60
     ntiltgroup = 3
     rotation = 5
-    overlap= [4.6,7.6]
+
+    # overlap: [overlapy, overlapx] reciprocal-style factors for
+    # BEAM_SHAPE="square", or a single hexagon side length in unbinned
+    # camera pixels for BEAM_SHAPE="round" -- see the BEAM_SHAPE comment
+    # near the top of this file. Determine the value(s) with
+    # DetermineOverlapFraction.txt (matching BEAM_SHAPE there) and set below.
+    if BEAM_SHAPE == "round":
+        overlap = 200
+    else:
+        overlap = [4.6,7.6]
+
     outdir = sem.ReportDirectory()
     polyoverlapfrac = 0.2
     
-    main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=rotation)
-    #main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=rotation)
+    main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=rotation,beam_shape=BEAM_SHAPE)
+    #main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=rotation,beam_shape=BEAM_SHAPE)
     
