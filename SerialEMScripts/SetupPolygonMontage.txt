@@ -4,27 +4,24 @@
 import numpy as np
 import os
 import re
+import json
 import matplotlib.pyplot as plt
 import serialem as sem
 
 
 # ---------------------------------------------------------------------------
-# Beam shape for this microscope/beam setup. Edit this to match the beam
-# actually installed, then set `overlap` further down to match:
+# beam_shape/rotation/overlap are no longer hand-copied here -- they are
+# loaded at the bottom of this file from BeamGeometry.json, which
+# DetermineOverlapFraction.txt writes next to ReferenceBeam.mrc after its
+# sliders are closed (see load_beam_geometry and the __main__ block).
 #   "square" - rectangular beam, tiled on a rectangular grid. `overlap` is
 #              [overlapy, overlapx], the two reciprocal-style factors this
 #              file has always used (spacing fraction = 1 - 1/overlap).
 #   "round"  - circular beam, tiled on a hexagonal (triangular-lattice) grid.
 #              `overlap` is a single number: the hexagon side length in
 #              unbinned camera pixels, i.e. the centre-to-centre spacing
-#              between beam positions, exactly as reported by
-#              DetermineOverlapFraction.txt's round-beam control ("side
-#              length = ... px (unbinned)").
-# Determine the value(s) for whichever shape is selected using
-# DetermineOverlapFraction.txt (same BEAM_SHAPE toggle there) and copy the
-# result into `overlap` in the __main__ block below.
+#              between beam positions.
 # ---------------------------------------------------------------------------
-BEAM_SHAPE = "square"
 
 
 def polygon_area(points):
@@ -214,6 +211,27 @@ def extract_points(file_path, item_index):
     return points_array
 
 
+def load_beam_geometry(path):
+    """
+    Load beam_shape/rotation_deg/overlap from the BeamGeometry.json written
+    by DetermineOverlapFraction.txt, so those values don't have to be
+    hand-copied out of that script's slider titles into this one.
+
+    Returns
+    -------
+    (beam_shape, rotation_deg, overlap) : tuple
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            "No BeamGeometry.json found at {0}. Run DetermineOverlapFraction.txt "
+            "in this directory first -- it writes this file once its sliders "
+            "are closed.".format(path)
+        )
+    with open(path) as f:
+        geometry = json.load(f)
+    return geometry["beam_shape"], geometry["rotation_deg"], geometry["overlap"]
+
+
 def regular_polygon_points(radius, n_sides=28):
     """
     Corner points (relative to a center at the origin, closed loop) of a
@@ -391,7 +409,8 @@ def generate_montage_shifts(
         spacing (see Notes); "round" additionally compresses the row-to-row
         spacing by sqrt(3)/2, turning that brick offset into the tighter
         triangular-lattice packing that covers a plane with circles using
-        the least overlap. See BEAM_SHAPE below for how this is selected.
+        the least overlap. See load_beam_geometry and the __main__ block
+        below for how this is selected.
 
     Returns
     -------
@@ -476,6 +495,54 @@ def generate_montage_shifts(
     return np.asarray(coords) * np.asarray(detector_pixels)
 
 
+def estimate_montage_time(
+    imageshifts, record_time, delaytime=0.5, measured_overhead=1.7, newtilt_overhead=60.0
+):
+    """
+    ESTIMATE ONLY of total montage acquisition time, via
+
+        T = sum_tilts n_tilt * (Rtime + delaytime + measured_overhead) + newtilt_overhead
+
+    where n_tilt is the number of Record acquisitions at that tilt (taken
+    from len(imageshifts[i])).
+
+    Parameters
+    ----------
+    imageshifts : list of ndarray
+        Per-tilt image shift arrays, as built in main_serialem/main_sandbox;
+        n_tilt for each tilt is len(imageshifts[i]).
+    record_time : float
+        The Record preset exposure time in seconds (e.g.
+        sem.ReportExposure('R')[0]).
+    delaytime : float, optional
+        Extra per-shot delay set by the user elsewhere. Default 0.5 s.
+    measured_overhead : float, optional
+        Fixed per-shot overhead measured on this microscope; will vary
+        microscope to microscope. Default 1.7 s.
+    newtilt_overhead : float, optional
+        Overhead per tilt for going to a new tilt angle, tracking/aligning
+        and autofocusing. Default 60 s.
+
+    Returns
+    -------
+    total_seconds : float
+        The estimated total acquisition time in seconds.
+    """
+    total_seconds = 0.0
+    for ishifts in imageshifts:
+        n_tilt = len(ishifts)
+        total_seconds += n_tilt * (record_time + delaytime + measured_overhead) + newtilt_overhead
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(
+        "ESTIMATE ONLY (actual run time will vary): predicted montage "
+        "acquisition time is approximately {0:d}h {1:02d}m {2:02d}s "
+        "({3:.0f} s total)".format(int(hours), int(minutes), int(seconds), total_seconds)
+    )
+    return total_seconds
+
+
 def write_tilts_and_image_shifts_to_file(filename, tilts, imageshifts, zs):
 
     f = open(filename, "w", encoding="utf-8")
@@ -530,7 +597,7 @@ def plot_tilts_and_image_shifts(polygonpoints,tilts,imageshifts,M,ny,nx):
         # for j, (x, y) in enumerate(imshift):    
     plt.show()
 
-def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=0,beam_shape="square"):
+def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=0,beam_shape="square",delaytime=0.5):
     import serialem as sem
 
     # Get coordinates from polygon and label from last acquired item
@@ -644,6 +711,11 @@ def main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotatio
         imageshifts.append(imagexy)
 
     ids, gid = plot_points_in_serial_EM_navigator(imageshifts[0], M, nx, ny, vx, vy, beam_shape=beam_shape)
+
+    # Estimate total acquisition time (see estimate_montage_time docstring
+    # for the formula and caveats -- this is an estimate only)
+    record_time = sem.ReportExposure("R")[0]
+    estimate_montage_time(imageshifts, record_time, delaytime=delaytime)
 
     # Calculate defocii to compensate for distance from tilt axis
     zs = calculate_defocii(imageshifts,tilts,M)
@@ -762,16 +834,7 @@ def main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,polygonp
             - origin + fov/2
         )
 
-        # fig,ax = plt.subplots()
-        # ax.plot(*np.asarray(dilated_transformed_points).T,'k--')
-        # points = np.asarray(imagexy+origin)
-        # for imxy in points:
-        #     ax.plot(*(imxy+corners).T,'r-')
-        #     ax.plot(*(imxy+beamcorners).T,'b-')
-        # ax.set_aspect('equal')
-        # # ax.plot(*.T,'ro')
-        # plt.show()
-        # import sys;sys.exit()
+       
         imageshifts.append(imagexy)
     plot_tilts_and_image_shifts(polygonpoints,tilts,imageshifts,M,ny,nx)
 
@@ -792,21 +855,16 @@ if __name__ == "__main__":
     step = 3
     maxtilt = 60
     ntiltgroup = 3
-    rotation = 5
-
-    # overlap: [overlapy, overlapx] reciprocal-style factors for
-    # BEAM_SHAPE="square", or a single hexagon side length in unbinned
-    # camera pixels for BEAM_SHAPE="round" -- see the BEAM_SHAPE comment
-    # near the top of this file. Determine the value(s) with
-    # DetermineOverlapFraction.txt (matching BEAM_SHAPE there) and set below.
-    if BEAM_SHAPE == "round":
-        overlap = 200
-    else:
-        overlap = [4.6,7.6]
 
     outdir = sem.ReportDirectory()
     polyoverlapfrac = 0.2
-    
-    main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=rotation,beam_shape=BEAM_SHAPE)
+    delaytime = 0.5  # extra per-shot delay set elsewhere; keep in sync with that script
+
+    # beam_shape, rotation and overlap come from DetermineOverlapFraction.txt's
+    # BeamGeometry.json, written next to ReferenceBeam.mrc in this same
+    # directory -- see load_beam_geometry.
+    BEAM_SHAPE, rotation, overlap = load_beam_geometry(os.path.join(outdir, "BeamGeometry.json"))
+
+    main_serialem(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=rotation,beam_shape=BEAM_SHAPE,delaytime=delaytime)
     #main_sandbox(step,maxtilt,ntiltgroup,overlap,outdir,polyoverlapfrac,rotation=rotation,beam_shape=BEAM_SHAPE)
     

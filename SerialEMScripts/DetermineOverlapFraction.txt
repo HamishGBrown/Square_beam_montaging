@@ -2,13 +2,14 @@
 #ScriptName	DetermineOverlapFraction
 import os
 import copy
+import json
 import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')  # X11-forwarding compatible backend
 from matplotlib import pyplot as plt
 from matplotlib.widgets import Slider
 import argparse
-from scipy.ndimage import binary_fill_holes, binary_erosion,rotate
+from collections import deque
 from matplotlib.patches import Rectangle
 import serialem as sem 
 from matplotlib.widgets import Button
@@ -200,6 +201,96 @@ def circular_mask(size, radius=None, center=None):
 
     return dist_from_center <= radius
 
+
+def binary_erosion_fft(mask, structure):
+    """
+    Erode a binary mask by a flat structuring element, using the script's
+    own FFT-based `convolve()` instead of scipy.ndimage.binary_erosion.
+
+    A pixel survives erosion iff every element of `structure` centered on
+    it falls on foreground -- equivalent to: convolve the mask with the
+    structuring element and keep pixels where the convolved value equals
+    the structuring element's full weight.
+
+    `convolve()` performs a *circular* convolution and expects its second
+    argument already in the zero-centered, wraparound layout (peak at index
+    (0,0), like `Gaussian()` produces) rather than spatially centered in the
+    middle of the array (like `circular_mask()` produces). `structure` is
+    re-centered with `np.roll` to that layout before convolving. The mask is
+    also zero-padded by half the structuring element's size on each side
+    first, so real mask content near the border doesn't wrap around the
+    image edges and get treated as if it were foreground there -- matching
+    scipy's default `border_value=0`.
+    """
+    sy, sx = structure.shape
+    pad_y, pad_x = sy // 2 + 1, sx // 2 + 1
+    padded = np.pad(mask.astype(float), ((pad_y, pad_y), (pad_x, pad_x)), mode="constant")
+
+    kernel = np.zeros_like(padded)
+    kernel[:sy, :sx] = structure.astype(float)
+    kernel = np.roll(kernel, (-(sy // 2), -(sx // 2)), axis=(0, 1))
+
+    conv = convolve(padded, kernel)
+    conv = conv[pad_y:pad_y + mask.shape[0], pad_x:pad_x + mask.shape[1]]
+    return conv >= structure.sum() - 0.5
+
+
+def binary_fill_holes_bfs(mask):
+    """
+    Fill enclosed holes in a binary mask without scipy.ndimage.binary_fill_holes.
+
+    Flood-fills the background (the inverse of `mask`) starting from the
+    image border using 4-connectivity; any background pixel *not* reached
+    is an enclosed hole and gets set to foreground.
+    """
+    h, w = mask.shape
+    reachable = np.zeros_like(mask, dtype=bool)
+    q = deque()
+
+    def visit(y, x):
+        if not mask[y, x] and not reachable[y, x]:
+            reachable[y, x] = True
+            q.append((y, x))
+
+    for x in range(w):
+        visit(0, x)
+        visit(h - 1, x)
+    for y in range(h):
+        visit(y, 0)
+        visit(y, w - 1)
+
+    while q:
+        y, x = q.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < h and 0 <= nx < w:
+                visit(ny, nx)
+
+    return mask | ~reachable
+
+
+def rotate_nearest(mask, angle_degrees):
+    """
+    Nearest-neighbor rotation about the array center, for the square-beam
+    angle-preview plot only -- replaces scipy.ndimage.rotate(reshape=False).
+    Nearest-neighbor (vs scipy's default cubic spline) is fine since the
+    input is already binary and this only feeds a preview image.
+    """
+    h, w = mask.shape
+    cy, cx = h / 2, w / 2
+    theta = np.deg2rad(angle_degrees)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    yy, xx = np.mgrid[0:h, 0:w]
+    yy_c, xx_c = yy - cy, xx - cx
+    src_y = cos_t * yy_c + sin_t * xx_c + cy
+    src_x = -sin_t * yy_c + cos_t * xx_c + cx
+    src_y = np.round(src_y).astype(int)
+    src_x = np.round(src_x).astype(int)
+    valid = (src_y >= 0) & (src_y < h) & (src_x >= 0) & (src_x < w)
+    out = np.zeros_like(mask)
+    out[valid] = mask[src_y[valid], src_x[valid]]
+    return out
+
+
 def make_mask(im, shrinkn=20, smoothing_kernel=3):
     """
     Generate a binary mask from an image by applying a Gaussian filter, filling holes,
@@ -226,13 +317,13 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3):
     mask = smoothed_im > 0.4 * np.median(im)
 
     # Step 3: Fill any holes in the initial mask
-    mask = binary_fill_holes(mask)
+    mask = binary_fill_holes_bfs(mask)
 
     # Step 4: Create a circular structuring element to use for binary erosion
     struct_elem = circular_mask([shrinkn * 2, shrinkn * 2], radius=shrinkn / 2)
 
     # Step 5: Apply binary erosion to shrink the mask
-    mask = binary_erosion(mask, structure=struct_elem)
+    mask = binary_erosion_fft(mask, structure=struct_elem)
 
     return mask
 
@@ -442,8 +533,14 @@ def setup_round_beam_controls(fig, ax, mask, angle, binning=1.0):
 
 
 def main():
-    # Take record image and read from serial EM buffer
+    # Take record image, save it as reference and read from serial EM buffer
     a = sem.R()
+
+    sem.OpenNewFile('ReferenceBeam.mrc')
+    sem.Save('A')
+    sem.CloseFile()
+    print('ReferenceBeam.mrc saved in ' + sem.ReportDirectory() + ', for use in stitching')
+
     image = np.asarray(sem.bufferImage('A'))
 
     # Preview is downsampled to a fixed 512 px width to keep the sliders
@@ -469,7 +566,7 @@ def main():
         rotated_mask_im = rotated_mask_ax.imshow(mask, cmap='gray')
 
         def rotate_mask(mask, angle):
-            return rotate(mask, -angle, reshape=False)
+            return rotate_nearest(mask, -angle)
 
         def update_rotation(val):
             angle = angle_slider.val
@@ -510,6 +607,25 @@ def main():
     plt.show()
     wdir = sem.ReportDirectory()
     fig.savefig(os.path.join(wdir,'overlap.pdf'))
+
+    # Final slider value(s), read after the window is closed. overlap here
+    # matches the "overlap" argument SetupPolygonMontage.txt expects: [oy,ox]
+    # for a square beam, or a single hexagon side length in *unbinned* camera
+    # pixels (hence * binning) for a round beam -- see setup_round_beam_controls.
+    if BEAM_SHAPE == "round":
+        (hexside_slider,) = widgets
+        overlap = hexside_slider.val * binning
+    else:
+        overlapy_slider, overlapx_slider = widgets
+        overlap = [overlapy_slider.val, overlapx_slider.val]
+
+    geometry_path = os.path.join(wdir, 'BeamGeometry.json')
+    with open(geometry_path, 'w') as f:
+        json.dump(
+            {"beam_shape": BEAM_SHAPE, "rotation_deg": angle, "overlap": overlap},
+            f, indent=2,
+        )
+    print('Wrote beam geometry to ' + geometry_path + ' for SetupPolygonMontage.txt to read')
 
 if __name__=='__main__':
     main()
