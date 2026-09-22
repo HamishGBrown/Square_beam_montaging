@@ -1,10 +1,15 @@
-Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with square and rectangular beams. Draws substantial inspiration from https://github.com/apeck12/montage
+# StitchTomo
+
+![StitchTomo logo](StitchTomo_logo.svg)
+
+
+Code for setting up, executing (in SerialEM) and pre-processing cryo-TEM montages with round, square and rectangular beams. Draws substantial inspiration from https://github.com/apeck12/montage
 
 # Install
 
 ```
-git clone https://github.com/HamishGBrown/Square_beam_montaging.git
-cd Square_beam_montaging
+git clone https://github.com/HamishGBrown/StitchTomo.git
+cd StitchTomo
 pip install -e .
 ```
 
@@ -31,7 +36,7 @@ Full details are in `Montage tomography SOP.docx`. In brief:
 
 A single tilt's acquisition looks like this:
 
-![image](https://github.com/HamishGBrown/Square_beam_montaging/blob/main/SingleMontage.gif)
+![image](https://github.com/HamishGBrown/StitchTomo/blob/main/SingleMontage.gif)
 
 ---
 
