@@ -2,9 +2,9 @@
 <!-- Created with Inkscape (http://www.inkscape.org/) -->
 
 <svg
-   width="97.047974mm"
-   height="121.70978mm"
-   viewBox="0 0 97.047974 121.70978"
+   width="95.25mm"
+   height="139.94812mm"
+   viewBox="0 0 95.25 139.94812"
    version="1.1"
    id="svg1"
    xml:space="preserve"
@@ -25,9 +25,9 @@
      inkscape:deskcolor="#d1d1d1"
      inkscape:document-units="mm"
      inkscape:lockguides="true"
-     inkscape:zoom="0.74653479"
-     inkscape:cx="592.73862"
-     inkscape:cy="336.2201"
+     inkscape:zoom="0.32"
+     inkscape:cx="939.0625"
+     inkscape:cy="665.625"
      inkscape:window-width="1920"
      inkscape:window-height="1043"
      inkscape:window-x="0"
@@ -333,7 +333,7 @@
      inkscape:label="Layer 1"
      inkscape:groupmode="layer"
      id="layer1"
-     transform="translate(-58.509811,16.583521)"><rect
+     transform="translate(-60.307785,17.325459)"><rect
        x="60.307785"
        y="99.834587"
        width="95.25"
@@ -430,7 +430,7 @@
        class="fill-dark outline"
        id="path4-1"
        style="stroke-width:1;stroke-dasharray:none" /><polygon
-       points="255,110 250,120 245,110 "
+       points="250,120 245,110 255,110 "
        class="fill-accent"
        id="polygon4"
        transform="matrix(0.26458333,0,0,0.26458333,23.291784,-22.433516)" /><path
@@ -623,15 +623,17 @@
          ry="0.22150955"
          transform="matrix(0.96592583,-0.25881905,-0.25881905,-0.96592583,0,0)" /></g><text
        xml:space="preserve"
-       style="font-size:16.9333px;writing-mode:lr-tb;direction:ltr;fill:#2c3e50;fill-opacity:1;stroke:none;stroke-width:0.878001;stroke-linecap:butt;stroke-dasharray:3.512, 1.756;stroke-dashoffset:0;stroke-opacity:1"
-       x="60.458199"
+       style="font-family:sans-serif;font-size:16.9333px;writing-mode:lr-tb;direction:ltr;fill:#2c3e50;fill-opacity:1;stroke:none;stroke-width:0.878001;stroke-linecap:butt;stroke-dasharray:3.512, 1.756;stroke-dashoffset:0;stroke-opacity:1"
+       x="107.932785"
        y="122.38289"
+       text-anchor="middle"
        id="text69"><tspan
          sodipodi:role="line"
          id="tspan69"
-         style="font-size:16.9333px;fill:#2c3e50;fill-opacity:1;stroke-width:0.878"
-         x="60.458199"
-         y="122.38289">StitchTomo</tspan></text><rect
+         style="font-family:sans-serif;font-size:16.9333px;fill:#2c3e50;fill-opacity:1;stroke-width:0.878"
+         x="107.932785"
+         y="122.38289"
+         text-anchor="middle">StitchTomo</tspan></text><rect
        x="127.83401"
        y="23.543623"
        width="3.1232996"
@@ -646,7 +648,7 @@
        rx="1.0410998"
        class="accent"
        id="rect5"
-       style="stroke-width:0.520549;fill:#00d400" /><line
+       style="fill:#00d400;stroke-width:0.520549" /><line
        x1="122.10798"
        y1="28.228569"
        x2="136.68338"
@@ -677,13 +679,13 @@
        sodipodi:nodetypes="csc"
        style="fill:none;fill-opacity:1;stroke:#00d400;stroke-width:0.7;stroke-dasharray:1.4, 0.933333;stroke-dashoffset:0;stroke-opacity:1" /><text
        xml:space="preserve"
-       style="font-size:3.52777px;writing-mode:lr-tb;direction:ltr;opacity:1;fill:#2c3e50;fill-opacity:1;stroke:none;stroke-width:0.878001;stroke-linecap:butt;stroke-dasharray:3.512, 1.756;stroke-dashoffset:0;stroke-opacity:1"
+       style="font-family:sans-serif;font-size:3.52777px;writing-mode:lr-tb;direction:ltr;opacity:1;fill:#2c3e50;fill-opacity:1;stroke:none;stroke-width:0.878001;stroke-linecap:butt;stroke-dasharray:3.512, 1.756;stroke-dashoffset:0;stroke-opacity:1"
        x="123.09185"
        y="39.898624"
        id="text70"><tspan
          sodipodi:role="line"
          id="tspan70"
-         style="stroke-width:0.878"
+         style="font-family:sans-serif;stroke-width:0.878"
          x="123.09185"
          y="39.898624">e<tspan
    style="font-size:65%;baseline-shift:super"
