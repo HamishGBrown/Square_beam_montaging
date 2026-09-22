@@ -8,8 +8,10 @@ The idea
 RELION assumes one tilt image per tilt. A montage has ~20, one per tile, and a
 given particle appears in exactly one of them. Rather than stitch anything or
 reimplement the pseudo-subtomogram maths (Zivanov et al. 2022, eqs 8-10), we
-declare **one RELION "tilt image" per (tilt, tile)** -- ~650 images per
-tomogram. Two RELION-5 features make that work as-is:
+declare **one RELION "tilt image" per (tilt, tile)** -- up to ~650 per
+tomogram, though only the ones a kept particle actually lands in are written
+(see the pruning step in ``main``). Two RELION-5 features make that work
+as-is:
 
 * ``rlnTomoProjX/Y/Z/W`` is a general 4x4 affine from tomogram coordinates to
   image coordinates, so a tile's offset within the montage is just part of the
@@ -59,7 +61,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .montage_projection import MontageProjector, TileHit, load_picks
+from .montage_projection import (
+    TileHit, add_geometry_args, build_projector, load_picks)
 
 logger = logging.getLogger(__name__)
 
@@ -127,15 +130,18 @@ def parse_ctf_results(path: str, base: Optional[str] = None) -> Dict[float, List
     fits: Dict[float, List[CtfFit]] = {}
     with open(path) as fh:
         for line in fh:
+            # Ignore comments
             if line.startswith("#") or not line.strip():
                 continue
             parts = line.split()
+            # lines not containing 7 items are skipped
             if len(parts) < 7:
                 continue
             m = _CTF_STEM_RE.match(parts[0])
             if m is None or (base is not None and m.group("base") != base):
                 continue
             tilt = float(m.group("tilt"))
+            # Read items df1, df2 (defocii in x and y), azimuth, score and fit resolution into object
             fits.setdefault(tilt, []).append(
                 CtfFit(
                     tilt=tilt, slice_index=int(m.group("idx")),
@@ -202,10 +208,13 @@ def fit_defocus(
     at its own field centre, and the estimator is simply the mean over the tiles
     whose fit is credible. No depth term.
 
-    That is not taken on faith. Regressing measured defocus on geometric depth
-    within a tilt, over the 116 good tiles of Montage_9-A, gives a slope of
-    -0.030 +- 0.110: consistent with 0, and 9 sigma from the +1 an uncompensated
-    montage would show. ``_report_depth_slope`` re-runs that check every time.
+    That was checked rather than assumed: regressing measured defocus on
+    geometric depth within a tilt, over the 116 good tiles of Montage_9-A, gave
+    a slope of -0.030 +- 0.110, consistent with 0 and 9 sigma from the +1 an
+    uncompensated montage would show. It is not re-checked per export -- a
+    montage acquired without the ``ChangeFocus`` compensation is obvious by eye
+    and unusable anyway. ``defocus_model.tsv`` carries ``depth_A`` beside each
+    tile's fit, so the regression can be repeated on any export that wants it.
 
     The depth term does not vanish, it moves: RELION reconstructs each
     particle's defocus from ``rlnTomoProjZ`` relative to the tomogram centre, so
@@ -220,31 +229,34 @@ def fit_defocus(
     """
     per_tilt: Dict[float, Tuple[float, float, float]] = {}
     df0_by_tilt: Dict[float, float] = {}
-    good_by_tilt: Dict[float, List[Tuple[CtfFit, float]]] = {}
+    good_by_tilt: Dict[float, List[CtfFit]] = {}
     depths: Dict[Tuple[float, int], float] = {}
     status: Dict[Tuple[float, int], str] = {}
 
     for tilt in tilts:
         info = proj.tilts[tilt]
         group = {f.slice_index: f for f in fits.get(tilt, [])}
-        good: List[Tuple[CtfFit, float]] = []
+        good: List[CtfFit] = []
         for tile in info.selected:
             t = int(tile)
+            # Not used by the fit -- the acquisition already flattened the
+            # ramp -- but written to defocus_model.tsv, and recomputed in main
+            # to cancel the one RELION adds back.
             depths[(tilt, t)] = tile_reference_depth(proj, tilt, t)
             f = group.get(t)
             if f is None:
                 status[(tilt, t)] = "nofit"
             elif f.score >= min_score and f.fit_res <= max_fit_res:
                 status[(tilt, t)] = "good"
-                good.append((f, depths[(tilt, t)]))
+                good.append(f)
             else:
                 status[(tilt, t)] = "rejected"
         good_by_tilt[tilt] = good
 
         if len(good) >= min_tiles:
-            df0 = _clipped_mean([f.mean_defocus for f, _ in good])
-            a = float(np.median([f.df1 - f.df2 for f, _ in good]))
-            angles = np.deg2rad(2.0 * np.array([f.azimuth for f, _ in good]))
+            df0 = _clipped_mean([f.mean_defocus for f in good])
+            a = float(np.median([f.df1 - f.df2 for f in good]))
+            angles = np.deg2rad(2.0 * np.array([f.azimuth for f in good]))
             ang = float(np.rad2deg(np.angle(np.mean(np.exp(1j * angles)))) / 2.0)
             df0_by_tilt[tilt] = df0
             per_tilt[tilt] = (df0 + a / 2.0, df0 - a / 2.0, ang)
@@ -269,7 +281,6 @@ def fit_defocus(
             df0 = float(np.interp(tilt, known, vals))
             per_tilt[tilt] = (df0, df0, 0.0)
 
-    _report_depth_slope(good_by_tilt)
     logger.info(
         "defocus per tilt: %.0f - %.0f A (%d of %d tilts measured, rest "
         "interpolated)",
@@ -279,7 +290,7 @@ def fit_defocus(
 
     diag: List[Sequence] = []
     for (tilt, tile), st in sorted(status.items()):
-        f = {g.slice_index: g for g, _ in good_by_tilt[tilt]}.get(tile)
+        f = {g.slice_index: g for g in good_by_tilt[tilt]}.get(tile)
         if f is None:
             for g in fits.get(tilt, []):
                 if g.slice_index == tile:
@@ -294,51 +305,6 @@ def fit_defocus(
             f"{depth_A:.1f}", f"{written:.1f}", st,
         ))
     return per_tilt, diag
-
-
-def _report_depth_slope(good_by_tilt: Dict[float, List[Tuple[CtfFit, float]]]) -> None:
-    """
-    Check that the acquisition really did flatten the defocus across a montage.
-
-    Pools the within-tilt deviations of measured defocus and of geometric depth
-    and regresses one on the other. A compensated montage gives slope 0; an
-    uncompensated one gives +1, and a compensation applied with the wrong sign
-    gives +2. Anything away from 0 means the per-image ``df0 - depth`` written
-    by ``main`` is subtracting a ramp that is still in the data.
-
-    Note what this check no longer does: it used to double as the handedness
-    test, because the sign of a ramp in the data reveals it. With the ramp gone
-    there is nothing left to read the handedness off, so it has to come from a
-    test refinement run both ways.
-    """
-    xs, ys = [], []
-    for good in good_by_tilt.values():
-        if len(good) < 3:
-            continue
-        df = np.array([f.mean_defocus for f, _ in good])
-        dep = np.array([d for _, d in good])
-        xs.append(dep - dep.mean())
-        ys.append(df - df.mean())
-    if not xs:
-        logger.warning("too few good fits to check the defocus/depth slope")
-        return
-    x, y = np.concatenate(xs), np.concatenate(ys)
-    if len(x) < 4 or x.std() < 1.0:
-        return
-    slope = float(np.polyfit(x, y, 1)[0])
-    resid = y - slope * x
-    se = float(np.sqrt((resid ** 2).sum() / (len(x) - 2) / (x ** 2).sum()))
-    logger.info(
-        "defocus vs depth within a tilt: slope %+.3f +- %.3f over %d tiles "
-        "(0 = acquisition compensated it, +1 = not compensated)",
-        slope, se, len(x),
-    )
-    if abs(slope) > 0.5:
-        logger.warning(
-            "  that is far from 0 -- the montage looks UNcompensated, so "
-            "subtracting the tile depth from each image is wrong here. Check "
-            "that the acquisition script applied ChangeFocus per tile."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -404,19 +370,8 @@ def parse_commandline(argv=None):
     p.add_argument("-o", "--out", required=True, help="output directory")
     p.add_argument("--tomo-name", default=None, help="rlnTomoName (default: from --tomogram)")
 
-    g = p.add_argument_group("montage geometry (must match 02_stitch.sh)")
-    g.add_argument("--roi", nargs=4, type=float, default=[-5500, 12000, -6000, 12000])
-    g.add_argument("--pixel-size", type=float, default=3.426, help="unbinned tile A/px")
-    g.add_argument("--binning", type=int, default=2, help="stitch.py --binning")
-    g.add_argument("--out-bin", type=int, default=2, help="AreTomo -OutBin")
-    g.add_argument("--rotate", default="auto",
-                   help="stitch.py --rotate; 'auto' measures it from index_map")
-    g.add_argument("--extra-shift", nargs=2, type=float, default=[0.0, 0.0],
-                   metavar=("ROW", "COL"),
-                   help="canvas-pixel offset, to absorb the sub-pixel centring "
-                        "difference between AreTomo's output size and the canvas")
-    g.add_argument("--handedness", type=int, choices=[1, -1], default=1)
-    g.add_argument("--exclude-sections", type=int, nargs="*", default=[],
+    add_geometry_args(p)
+    p.add_argument("--exclude-sections", type=int, nargs="*", default=[],
                    help="SEC indices to drop (e.g. sections with junk shifts)")
 
     g = p.add_argument_group("particles")
@@ -464,18 +419,15 @@ def main(argv=None) -> int:
     )
     import mrcfile
 
+    # Get tomogram shape from header
     with mrcfile.open(args.tomogram, header_only=True, permissive=True) as m:
         recon_shape = (int(m.header.nz), int(m.header.ny), int(m.header.nx))
     logger.info("reconstruction %s = (nz, ny, nx)", recon_shape)
 
-    rotate = args.rotate if args.rotate == "auto" else int(args.rotate)
-    proj = MontageProjector(
-        aln_path=args.aln, positions_dir=args.positions_dir, recon_shape=recon_shape,
-        roi=args.roi, pixel_size=args.pixel_size, binning=args.binning,
-        out_bin=args.out_bin, rotate=rotate, tile_dir=args.tile_dir,
-        extra_shift=args.extra_shift, handedness=args.handedness,
-        exclude_sections=args.exclude_sections,
-    )
+    # Build projector (projects particle coordinates from tomogram to tilt series)
+    # from manifest 
+    proj = build_projector(args, recon_shape,
+                           exclude_sections=args.exclude_sections)
 
     picks = load_picks(args.picks)
     logger.info("%d picks from %s", len(picks), args.picks)
@@ -519,6 +471,26 @@ def main(argv=None) -> int:
             "thin dataset -- run overlay_picks_on_montage before going further."
         )
         return 1
+
+    # ---- prune to images at least one kept particle actually uses -------
+    #
+    # `images` above is every selected tile of every tilt, regardless of
+    # whether a particle lands in it -- on Montage_9-A that is 641 rows for
+    # 290 kept particles, of which only 148 are ever visible to one of them.
+    # relion_tomo_subtomo loads every image its tilt series star references
+    # before extracting a single particle (slurm_templates/
+    # 12_subtomo_validate.sh's own memory note is written on exactly that
+    # row count), so writing the unused rows costs real memory downstream for
+    # nothing. `keep` only, not all picks: a dropped particle's visibility
+    # should not keep an otherwise-unused image alive.
+    used = np.flatnonzero(visible[keep].any(axis=0))
+    n_images_full = len(images)
+    images = [images[i] for i in used]
+    visible = visible[:, used]
+    logger.info(
+        "%d/%d tilt images are visible to a kept particle; pruning the rest "
+        "from the export", len(images), n_images_full,
+    )
 
     # ---- CTF ------------------------------------------------------------
     if args.defocus is not None:
@@ -600,8 +572,8 @@ def main(argv=None) -> int:
             "rlnTomoSizeX", "rlnTomoSizeY", "rlnTomoSizeZ",
             "rlnTomoReconstructedTomogram",
         ], [[
-            name, args.voltage, args.cs, args.amp_contrast, args.pixel_size,
-            args.handedness, "optics1", args.pixel_size,
+            name, args.voltage, args.cs, args.amp_contrast, proj.pixel_size,
+            args.handedness, "optics1", proj.pixel_size,
             os.path.relpath(ts_path, out), float(proj.tomo_bin),
             sx, sy, sz, os.path.abspath(args.tomogram),
         ]])
@@ -620,7 +592,7 @@ def main(argv=None) -> int:
         write_block(fh, "optics", [
             "rlnOpticsGroup", "rlnOpticsGroupName", "rlnSphericalAberration",
             "rlnVoltage", "rlnAmplitudeContrast", "rlnTomoTiltSeriesPixelSize",
-        ], [[1, "optics1", args.cs, args.voltage, args.amp_contrast, args.pixel_size]])
+        ], [[1, "optics1", args.cs, args.voltage, args.amp_contrast, proj.pixel_size]])
         write_block(fh, "particles", [
             "rlnTomoName", "rlnCenteredCoordinateXAngst", "rlnCenteredCoordinateYAngst",
             "rlnCenteredCoordinateZAngst", "rlnTomoParticleName", "rlnOpticsGroup",

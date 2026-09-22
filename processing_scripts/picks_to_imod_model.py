@@ -49,7 +49,8 @@ from typing import List, Optional, Sequence, Tuple
 import mrcfile
 import numpy as np
 
-from .montage_projection import MontageProjector, load_picks
+from .montage_projection import (
+    add_geometry_args, build_projector, load_picks)
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +128,10 @@ def model_tiltseries(proj, picks, frame, image, out_mod, symbol_size, margin):
     from object 1 and appears in object 2 at low tilt is worth a look.
     """
     if frame == "aligned":
-        surviving = sorted(s.sec for s in proj.aln.sections)
-        z_of = {t: surviving.index(proj.tilts[t].sec.sec) for t in proj.tilts}
+        z_of = {t: proj.aligned_slice_index(t) for t in proj.tilts}
         project = proj.tomo_to_aligned
     else:
-        z_of = {t: proj.all_tilts.index(t) for t in proj.tilts}
+        z_of = {t: proj.canvas_slice_index(t) for t in proj.tilts}
         project = proj.tomo_to_canvas
 
     with mrcfile.open(image, header_only=True, permissive=True) as m:
@@ -264,14 +264,7 @@ def parse_commandline(argv=None):
     p.add_argument("--particle-diameter", type=float, default=300.0,
                    help="A; sets the displayed circle radius")
 
-    g = p.add_argument_group("montage geometry (must match 02_stitch.sh)")
-    g.add_argument("--roi", nargs=4, type=float, default=[-5500, 12000, -6000, 12000])
-    g.add_argument("--pixel-size", type=float, default=3.426)
-    g.add_argument("--binning", type=int, default=2)
-    g.add_argument("--out-bin", type=int, default=2)
-    g.add_argument("--rotate", default="auto")
-    g.add_argument("--extra-shift", nargs=2, type=float, default=[0.0, 0.0])
-    g.add_argument("--handedness", type=int, choices=[1, -1], default=1)
+    add_geometry_args(p)
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args(argv)
 
@@ -287,13 +280,7 @@ def main(argv=None) -> int:
     with mrcfile.open(args.tomogram, header_only=True, permissive=True) as m:
         recon_shape = (int(m.header.nz), int(m.header.ny), int(m.header.nx))
 
-    rotate = args.rotate if args.rotate == "auto" else int(args.rotate)
-    proj = MontageProjector(
-        aln_path=args.aln, positions_dir=args.positions_dir, recon_shape=recon_shape,
-        roi=args.roi, pixel_size=args.pixel_size, binning=args.binning,
-        out_bin=args.out_bin, rotate=rotate, tile_dir=args.tile_dir,
-        extra_shift=args.extra_shift, handedness=args.handedness,
-    )
+    proj = build_projector(args, recon_shape)
     picks = load_picks(args.picks)
     logger.info("%d picks", len(picks))
     margin = args.box / 2.0

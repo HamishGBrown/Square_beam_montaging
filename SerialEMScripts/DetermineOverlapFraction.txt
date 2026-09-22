@@ -20,6 +20,11 @@ from matplotlib.widgets import Button
 #   "square" - rectangular beam, interactive x/y overlap-factor sliders.
 #   "round"  - circular beam tiled hexagonally, interactive hexagon side
 #              length slider.
+#
+# This script uses matplotlib for its interactive sliders. If you'd rather
+# not install matplotlib on this PC (e.g. it has no internet access to pip
+# install with), use DetermineOverlapFraction_Tkinter.txt instead -- same
+# geometry and BeamGeometry.json output, built on stdlib tkinter only.
 # ---------------------------------------------------------------------------
 BEAM_SHAPE = "round"
 

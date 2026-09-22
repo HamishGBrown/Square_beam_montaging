@@ -27,7 +27,6 @@ dependencies = [
     "Pillow",
     "matplotlib",
     "mrcfile",
-    "argparse",
     "h5py>=3.11",
 ]
 
@@ -39,16 +38,19 @@ determine_overlap_fraction      = "processing_scripts.Determine_overlap_fraction
 make_gainref                    = "processing_scripts.make_gainref:main"
 refine_montage_from_aretomo     = "processing_scripts.Refine_montage_from_aretomo:main"
 refine_montage_from_imod        = "processing_scripts.Refine_montage_from_imod_fiducials:main"
-crop_to_smallest_common_size    = "processing_scripts.Crop_to_smallest_common_size:main"
 generate_image_shifts           = "processing_scripts.Generate_Image_shifts_for_Montage:main"
 join_to_mrc                     = "processing_scripts.JointoMRC:main"
 masked_motioncorr               = "processing_scripts.masked_motioncorr:main"
 mask_and_inpaint                = "processing_scripts.mask_and_inpaint:main"
 inpaint_apply                   = "processing_scripts.inpaint_apply:main"
 beam_mask_motioncorr            = "processing_scripts.beam_mask_motioncorr:main"
-choose_mask_params              = "processing_scripts.Choose_mask_params:main"
+montage_provenance              = "processing_scripts.sidecar:main"
+montage_backfill                = "processing_scripts.backfill_sidecars:main"
+montage_aretomo_record          = "processing_scripts.aretomo_record:main"
 mrc_to_gif                      = "processing_scripts.mrc_to_gif:main"
 montage_to_relion               = "processing_scripts.montage_to_relion:main"
 overlay_picks_on_montage        = "processing_scripts.overlay_picks_on_montage:main"
 picks_to_imod_model             = "processing_scripts.picks_to_imod_model:main"
 score_subtomo_sum               = "processing_scripts.score_subtomo_sum:main"
+roi_editor                      = "processing_scripts.roi_editor:main"
+resize_reference_beam           = "processing_scripts.resize_reference_beam:main"

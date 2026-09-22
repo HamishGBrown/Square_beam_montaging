@@ -16,43 +16,97 @@ Workflow
 
 import argparse
 import json
+import logging
+import math
 import os
 import sys
 
 import numpy as np
-import numpy.ma as ma
 import mrcfile
 import matplotlib.pyplot as plt
 import matplotlib.widgets as mwidgets
+from matplotlib.font_manager import FontProperties
 from matplotlib.path import Path as MplPath
-from scipy.ndimage import label, distance_transform_edt, zoom
+from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+from scipy.ndimage import label, zoom
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
-from .smoothn import smoothn
-from .inpaint_apply import DEFAULT_SLURM_TEMPLATE
+from .smoothn import smoothn          # still used to smooth the µ/σ curves
+from .Utilities import fourier_interpolate
+from . import sidecar
+from .sidecar import fingerprint
+from .inpaint_apply import (
+    DEFAULT_SLURM_TEMPLATE,
+    SMOOTHN_S,
+    SMOOTHN_MAX_ITER,
+    inpaint_masked_tilt,
+    series_base_for_input,
+)
+
+logger = logging.getLogger(__name__)
+
+#: Name of this step in its sidecars. Applying the mask is a separate step
+#: ("inpaint_apply"), usually a separate process on a cluster.
+SIDECAR_STEP = "inpaint_mask"
 
 
 # ---------------------------------------------------------------------------
 # Binning
 # ---------------------------------------------------------------------------
 
-def bin_tilt_series(mmap_data, max_px: int = 1024):
+def bin_tilt_series(mmap_data, max_px: int = 1024, method: str = "zoom"):
     n, ny, nx = mmap_data.shape
     longest = max(ny, nx)
     if longest <= max_px:
         return np.stack([mmap_data[i].astype(np.float32) for i in range(n)]), 1.0
     factor = max_px / longest
+    ny_out, nx_out = int(round(ny * factor)), int(round(nx * factor))
     print(
-        f"Binning preview:  {ny}×{nx}  →  "
-        f"{int(round(ny * factor))}×{int(round(nx * factor))}  "
-        f"(factor {factor:.3f})"
+        f"Binning preview:  {ny}×{nx}  →  {ny_out}×{nx_out}  "
+        f"(factor {factor:.3f}, {method})"
     )
-    binned = np.stack([
-        zoom(mmap_data[i].astype(np.float32), (factor, factor), order=1)
-        for i in tqdm(range(n), desc="Binning preview")
-    ])
+    if method == "fourier":
+        # Real Fourier-space decimation (crop high frequencies, then inverse
+        # transform) rather than bilinear resampling — free of the aliasing
+        # a plain zoom lets through, at the cost of ringing near sharp edges
+        # (beam boundary, hot pixels).
+        binned = np.stack([
+            fourier_interpolate(mmap_data[i].astype(np.float32), (ny_out, nx_out))
+            for i in tqdm(range(n), desc="Fourier-binning preview")
+        ]).astype(np.float32)
+    else:
+        binned = np.stack([
+            zoom(mmap_data[i].astype(np.float32), (factor, factor), order=1)
+            for i in tqdm(range(n), desc="Binning preview")
+        ])
     return binned, factor
+
+
+def nice_scalebar_length(pixel_size_A: float, image_width_px: int) -> tuple:
+    """
+    Pick a round-number scalebar length near 18% of the image width.
+
+    Returns (length_px, label), rounding to a 1/2/5 step in whichever of
+    Å/nm/µm keeps the displayed number closest to human-friendly.
+    """
+    pixel_size_nm = pixel_size_A / 10.0
+    target_nm = 0.18 * image_width_px * pixel_size_nm
+    exponent = math.floor(math.log10(target_nm))
+    nice_nm = target_nm
+    for mult in (1, 2, 5, 10):
+        candidate = mult * 10 ** exponent
+        if candidate >= target_nm:
+            nice_nm = candidate
+            break
+    if nice_nm >= 1000:
+        label = f"{nice_nm / 1000:g} µm"
+    elif nice_nm >= 1:
+        label = f"{nice_nm:g} nm"
+    else:
+        label = f"{nice_nm * 10:g} Å"
+    length_px = nice_nm / pixel_size_nm
+    return length_px, label
 
 
 # ---------------------------------------------------------------------------
@@ -139,29 +193,21 @@ def compute_mask_from_range(image: np.ndarray, lo: float,
 # ---------------------------------------------------------------------------
 
 def inpaint_tilt(image: np.ndarray, mask: np.ndarray,
-                 edge_blend_px: int = 15,
-                 smoothn_s: float = None) -> np.ndarray:
+                 bin_factor: int = 2, workers: int = 1) -> np.ndarray:
     """
-    Inpaint pixels where *mask* is False, then blend a soft transition along
-    the mask boundary.  mask: True = good pixel, False = inpaint.
+    Inpaint pixels where *mask* is False.  mask: True = good pixel, False =
+    inpaint.
+
+    A thin wrapper on :func:`inpaint_masked_tilt`, which is what the SLURM
+    runner uses, so what this window writes is what the cluster job writes.
+    It used to be a separate implementation: smoothn's s chosen per tilt by
+    GCV instead of the fixed 1e7, no binning, and a 15 px feather that
+    replaced a rim of real data just inside the mask with the smooth field.
+    None of that reached the cluster output, so the preview was a picture of
+    a result nobody ever kept.
     """
-    bad = ~mask
-    if not bad.any():
-        return image.copy()
-
-    img = image.astype(float)
-    inpainted = smoothn(ma.array(img, mask=bad), s=smoothn_s, max_iter=500)
-
-    result = img.copy()
-    result[bad] = inpainted[bad]
-
-    dist_inside = distance_transform_edt(mask).astype(float)
-    blend = (dist_inside > 0) & (dist_inside < edge_blend_px)
-    if blend.any():
-        alpha = np.clip(dist_inside[blend] / edge_blend_px, 0.0, 1.0)
-        result[blend] = alpha * img[blend] + (1.0 - alpha) * inpainted[blend]
-
-    return result
+    return inpaint_masked_tilt(image.astype(float), mask,
+                               bin_factor=bin_factor, workers=workers)
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +217,12 @@ def inpaint_tilt(image: np.ndarray, mask: np.ndarray,
 class PeakMaskEditor:
     def __init__(self, mrc_mmap, input_path: str,
                  output_path: str = None, max_px: int = 1024,
+                 preview_binning: str = "zoom",
                  n_sigma_default: float = 3.0,
                  slurm_template: str = None, slurm_cpus: int = 8,
-                 slurm_mem: int = 32, slurm_time: str = "02:00:00"):
+                 slurm_npertilt: int = 4, slurm_bin: int = 2,
+                 slurm_mem: int = 32, slurm_time: str = "02:00:00",
+                 load_mask_path: str = None, write_sidecars: bool = True):
         self._mrc = mrc_mmap
         self._mmap_data = mrc_mmap.data
         if self._mmap_data.ndim == 2:
@@ -181,19 +230,39 @@ class PeakMaskEditor:
         elif self._mmap_data.ndim != 3:
             raise ValueError(f"Expected 2D or 3D MRC data, got shape {self._mmap_data.shape}")
         self._full_shape = self._mmap_data.shape  # (n, h, w) — no data loaded yet
-        self.data, self.bin_factor = bin_tilt_series(self._mmap_data, max_px)
+        # Copied, not referenced: the caller's mmap is closed when its `with`
+        # block exits, and every MRC this class writes has to carry the input's
+        # pixel size. A header saying 0 is read as 1 A/px downstream, which
+        # rescales IMOD models by the ratio and throws every point off canvas.
+        self._voxel_size = mrc_mmap.voxel_size.copy()
+        self.data, self.bin_factor = bin_tilt_series(
+            self._mmap_data, max_px, method=preview_binning
+        )
         self.n_tilts   = self.data.shape[0]
         self.input_path  = input_path
         self.output_path = output_path or (
             os.path.splitext(input_path)[0] + "_inpainted.mrc"
         )
         self.current_tilt  = self.n_tilts // 2
-        self.n_sigma       = n_sigma_default
+        self.n_sigma_lo    = n_sigma_default
+        self.n_sigma_hi    = n_sigma_default
         self.overlay_visible = True
         self.slurm_template = slurm_template
-        self.slurm_cpus     = slurm_cpus
+        self.slurm_cpus     = slurm_cpus       # ntotal: total thread budget for the job
+        self.slurm_npertilt = slurm_npertilt   # DCT threads per tilt; ntotal // npertilt run concurrently
+        self.slurm_bin      = slurm_bin        # smoothn fit resolution downsample factor
         self.slurm_mem      = slurm_mem
         self.slurm_time     = slurm_time
+
+        # Sidecars go beside whatever this window writes, so unlike the
+        # manifest there is nothing to locate up front and nothing to bake
+        # into the params file for the cluster run to inherit — inpaint_apply
+        # writes its own sidecar beside its own output.
+        #
+        # The failure this inverts is the silent one: the mask's provenance is
+        # only in this window, in someone's head, and losing it silently is the
+        # thing this exists to prevent. It is on unless explicitly disabled.
+        self.write_sidecars = write_sidecars
 
         # --- Gaussian fit state ---
         self.fitted_mu    = np.full(self.n_tilts, np.nan)
@@ -222,7 +291,7 @@ class PeakMaskEditor:
         # --- Polygon drawing state ---
         self._poly_mode       = False
         self._poly_verts: list = []   # (x, y) in data coords
-        self._poly_commit_dir = "add" # "add" or "remove" — toggled by 'r' key
+        self._poly_commit_dir = "remove" # "add" or "remove" — toggled by 'r' key
 
         # --- Sentinel detection (stitch --mark-uncovered writes -1 for no-tile regions) ---
         self._has_uncovered = bool((self.data < 0).any())
@@ -237,6 +306,35 @@ class PeakMaskEditor:
         valid_px = self.data[self.data >= 0] if self._has_uncovered else self.data.ravel()
         self._global_min = -1.0 if self._has_uncovered else float(np.percentile(valid_px, 0.1))
         self._global_max = float(np.percentile(valid_px, 99.9))
+
+        # --- Existing mask, loaded from a previous session ---
+        # Kept mmap'd (full resolution) for generate/save; a binned copy is
+        # precomputed for interactive display.  Acts as the base mask that
+        # paint/polygon edits and the top-CC filter layer on top of, in place
+        # of the "everything kept" default, whenever no Gaussian/manual
+        # intensity threshold is active for a tilt.
+        self._mask_mrc = None
+        self.loaded_mask_preview = None
+        if load_mask_path:
+            self._mask_mrc = mrcfile.mmap(load_mask_path, mode="r", permissive=True)
+            mask_data = self._mask_mrc.data
+            if mask_data.ndim == 2:
+                mask_data = mask_data[np.newaxis]
+            if mask_data.shape != self._full_shape:
+                self._mask_mrc.close()
+                self._mask_mrc = None
+                raise ValueError(
+                    f"--load-mask shape {mask_data.shape} does not match "
+                    f"input shape {self._full_shape}"
+                )
+            print(f"Loaded existing mask: {load_mask_path}  {mask_data.shape}")
+            h_bin, w_bin = self.data.shape[1], self.data.shape[2]
+            _, h_full, w_full = self._full_shape
+            self.loaded_mask_preview = np.stack([
+                zoom(mask_data[i].astype(np.float32), (h_bin / h_full, w_bin / w_full),
+                     order=0) > 0.5
+                for i in range(self.n_tilts)
+            ])
 
         self._build_ui()
         self._refresh()
@@ -298,7 +396,8 @@ class PeakMaskEditor:
         if tilt_idx in self.manual_overrides:
             lo, hi = self.manual_overrides[tilt_idx]
             half   = (hi - lo) / 2.0
-            sigma  = half / max(self.n_sigma, 1e-6)
+            avg_n_sigma = (self.n_sigma_lo + self.n_sigma_hi) / 2.0
+            sigma  = half / max(avg_n_sigma, 1e-6)
             return lo, hi, lo + half, sigma
 
         if not self._peak_selected:
@@ -311,7 +410,58 @@ class PeakMaskEditor:
             mu    = float(self.fitted_mu[tilt_idx])
             sigma = float(self.fitted_sigma[tilt_idx])
 
-        return max(mu - self.n_sigma * sigma,0), mu + self.n_sigma * sigma, mu, sigma
+        return max(mu - self.n_sigma_lo * sigma, 0), mu + self.n_sigma_hi * sigma, mu, sigma
+
+    # ------------------------------------------------------------------
+    # Mask helper — single source of truth for the auto/loaded base mask
+    # ------------------------------------------------------------------
+
+    def _base_mask(self, tilt_idx: int, img: np.ndarray) -> tuple:
+        """
+        Return (mask, has_threshold) — the Gaussian/manual intensity-threshold
+        mask for this tilt, or everything-kept if no threshold is active.
+
+        This is intentionally independent of any mask loaded via --load-mask:
+        the loaded mask is combined in afterwards with logical_and (see
+        _loaded_mask_at / _effective_mask_full), so it always constrains the
+        final mask rather than being overridden by threshold/paint/polygon edits.
+        """
+        lo, hi, _, _ = self._get_lo_hi(tilt_idx)
+        if lo is not None:
+            return compute_mask_from_range(img, lo, hi), True
+        return np.ones(img.shape, dtype=bool), False
+
+    def _loaded_mask_at(self, tilt_idx: int, full_res: bool):
+        """Return the --load-mask mask for this tilt at preview or full resolution, or None."""
+        if full_res:
+            return self._mask_mrc.data[tilt_idx].astype(bool) if self._mask_mrc is not None else None
+        return self.loaded_mask_preview[tilt_idx] if self.loaded_mask_preview is not None else None
+
+    def _effective_mask_full(self, tilt_idx: int, img_full: np.ndarray) -> np.ndarray:
+        """
+        Full-resolution mask for one tilt: threshold mask, then top-CC (so it
+        only prunes the intensity-based selection, not manual edits), then
+        paint/polygon overlay, then intersected (logical_and) with the loaded
+        mask if any, so the loaded mask is always a constraint, never
+        something later edits can override.
+        """
+        mask, _ = self._base_mask(tilt_idx, img_full)
+        if self._keep_top_cc and mask.any():
+            mask = largest_connected_component(mask)
+        h_bin, w_bin   = self.data.shape[1], self.data.shape[2]
+        h_full, w_full = img_full.shape
+        p_add = self._paint_add.get(tilt_idx)
+        p_rem = self._paint_remove.get(tilt_idx)
+        if p_add is not None:
+            mask = mask | (zoom(p_add.astype(np.float32),
+                                 (h_full / h_bin, w_full / w_bin), order=0) > 0.5)
+        if p_rem is not None:
+            mask = mask & ~(zoom(p_rem.astype(np.float32),
+                                  (h_full / h_bin, w_full / w_bin), order=0) > 0.5)
+        loaded = self._loaded_mask_at(tilt_idx, full_res=True)
+        if loaded is not None:
+            mask = np.logical_and(mask, loaded)
+        return mask
 
     # ------------------------------------------------------------------
     # UI construction
@@ -333,9 +483,16 @@ class PeakMaskEditor:
         )
 
         # ---- image and histogram panels ----
-        self.ax_img  = self.fig.add_axes([0.04, 0.28, 0.50, 0.65])
-        self.ax_hist = self.fig.add_axes([0.57, 0.28, 0.40, 0.65])
-        self.ax_mu   = self.fig.add_axes([0.57, 0.16, 0.40, 0.09])
+        # ax_hist and ax_mu need a wider vertical gap than a bare y-delta
+        # suggests: ax_hist's xlabel sits below it and ax_mu's title sits
+        # above it, both competing for the same strip of figure space.
+        # The img/hist horizontal gap is widened too: with add_axes (as
+        # opposed to subplots), tick labels and the y-axis label are drawn
+        # outside the given rectangle, so ax_hist's own "Pixel count" label
+        # and y-tick numbers need clearance from ax_img's right edge.
+        self.ax_img  = self.fig.add_axes([0.04, 0.38, 0.48, 0.55])
+        self.ax_hist = self.fig.add_axes([0.60, 0.38, 0.37, 0.55])
+        self.ax_mu   = self.fig.add_axes([0.60, 0.19, 0.37, 0.07])
 
         # ---- sliders ----
         ax_tilt   = self.fig.add_axes([0.04, 0.21, 0.42, 0.03])
@@ -355,15 +512,20 @@ class PeakMaskEditor:
         ax_btn_gen     = self.fig.add_axes([0.57, 0.02, 0.17, 0.08])
 
         # ---- brush slider + reset/save controls (right column, between mu-plot and buttons) ----
-        ax_brush            = self.fig.add_axes([0.57, 0.11, 0.40, 0.03])
+        ax_brush            = self.fig.add_axes([0.60, 0.11, 0.37, 0.03])
         ax_btn_reset_paint  = self.fig.add_axes([0.76, 0.06, 0.21, 0.04])
         ax_chk_save_mask    = self.fig.add_axes([0.76, 0.02, 0.21, 0.04])
 
         # Tilt slider
+        # Labels are set via ax.set_title(loc="left") rather than the Slider's
+        # own `label=` argument: matplotlib draws that label to the *left* of
+        # the axes, which clips off the figure for sliders anchored near the
+        # left edge (x0=0.04).
         self.sl_tilt = mwidgets.Slider(
-            ax_tilt, "Tilt index", 0, max(self.n_tilts - 1, 1),
+            ax_tilt, "", 0, max(self.n_tilts - 1, 1),
             valinit=self.current_tilt, valstep=1, color="steelblue",
         )
+        ax_tilt.set_title("Tilt index", loc="left", fontsize=9, pad=2)
         self.sl_tilt.on_changed(self._on_tilt)
 
         self.btn_prev = mwidgets.Button(ax_prev, "◄", color="lightgray", hovercolor="silver")
@@ -371,40 +533,43 @@ class PeakMaskEditor:
         self.btn_prev.on_clicked(lambda _: self._step_tilt(-1))
         self.btn_next.on_clicked(lambda _: self._step_tilt(+1))
 
-        # N-sigma slider (Gaussian mode)
-        self.sl_nsigma = mwidgets.Slider(
-            ax_nsigma, "N sigma", 0.5, 6.0,
-            valinit=self.n_sigma, color="mediumpurple",
+        # N-sigma range slider (Gaussian mode) — lower/upper multipliers, applied
+        # to every tilt without a manual override
+        self.sl_nsigma = mwidgets.RangeSlider(
+            ax_nsigma, "", 0.5, 6.0,
+            valinit=[self.n_sigma_lo, self.n_sigma_hi], color="mediumpurple",
         )
+        ax_nsigma.set_title("N sigma", loc="left", fontsize=9, pad=2)
         self.sl_nsigma.on_changed(self._on_nsigma)
 
         # Manual range slider — lower bound starts at 0 when sentinel pixels present
         _manual_lo_init = max(0.0, self._global_min) if self._has_uncovered else self._global_min
         self.sl_manual = mwidgets.RangeSlider(
-            ax_manual, "Manual range",
+            ax_manual, "",
             self._global_min, self._global_max,
             valinit=[_manual_lo_init, self._global_max],
         )
+        ax_manual.set_title("Manual range", loc="left", fontsize=9, pad=2)
         self.sl_manual.on_changed(self._on_manual_range)
         ax_manual.set_alpha(0.3)  # visually dim until manual mode is active
 
         # Smooth µ button
         self.btn_smooth = mwidgets.Button(
-            ax_btn_smooth, "Smooth µ: OFF",
+            ax_btn_smooth, "Smooth µ:\nOFF",
             color="lightcyan", hovercolor="cyan",
         )
         self.btn_smooth.on_clicked(self._on_toggle_smooth)
 
         # Manual mode button
         self.btn_manual = mwidgets.Button(
-            ax_btn_manual, "Manual: OFF",
+            ax_btn_manual, "Manual:\nOFF",
             color="lightyellow", hovercolor="yellow",
         )
         self.btn_manual.on_clicked(self._on_toggle_manual)
 
         # Overlay toggle
         self.btn_overlay = mwidgets.Button(
-            ax_btn_overlay, "Overlay: ON",
+            ax_btn_overlay, "Overlay:\nON",
             color="lavender", hovercolor="mediumpurple",
         )
         self.btn_overlay.on_clicked(self._on_toggle_overlay)
@@ -425,14 +590,14 @@ class PeakMaskEditor:
 
         # Paint mode button
         self.btn_paint = mwidgets.Button(
-            ax_btn_paint, "Paint: OFF",
+            ax_btn_paint, "Paint:\nOFF",
             color="lightgray", hovercolor="silver",
         )
         self.btn_paint.on_clicked(self._on_toggle_paint)
 
         # Polygon mode button
         self.btn_polygon = mwidgets.Button(
-            ax_btn_polygon, "Poly: OFF",
+            ax_btn_polygon, self._poly_btn_label(),
             color="lightgray", hovercolor="silver",
         )
         self.btn_polygon.on_clicked(self._on_toggle_polygon)
@@ -446,10 +611,11 @@ class PeakMaskEditor:
 
         # Brush radius slider
         self.sl_brush = mwidgets.Slider(
-            ax_brush, "Brush (px)", 1, 80,
+            ax_brush, "", 1, 80,
             valinit=self._brush_size, valstep=1, valfmt="%0.0f",
             color="sandybrown",
         )
+        ax_brush.set_title("Brush (px)", loc="left", fontsize=9, pad=2)
         self.sl_brush.on_changed(self._on_brush_changed)
 
         # Reset paint button
@@ -461,7 +627,7 @@ class PeakMaskEditor:
 
         # Save mask checkbox
         self.chk_save_mask = mwidgets.CheckButtons(
-            ax_chk_save_mask, ["Save mask MRC"], [False]
+            ax_chk_save_mask, ["Save mask MRC"], [True]
         )
 
         # ---- image display ----
@@ -476,6 +642,21 @@ class PeakMaskEditor:
             origin="lower", aspect="auto", interpolation="nearest",
         )
         self.ax_img.axis("off")
+
+        # Scalebar — display pixel size accounts for the preview binning
+        # (bin_tilt_series shrinks the array by self.bin_factor, so each
+        # displayed pixel covers 1/bin_factor full-res pixels).
+        pixel_size_A = float(self._voxel_size.x)
+        if pixel_size_A > 0:
+            display_pixel_size_A = pixel_size_A / self.bin_factor
+            length_px, label = nice_scalebar_length(
+                display_pixel_size_A, img0.shape[1]
+            )
+            self.ax_img.add_artist(AnchoredSizeBar(
+                self.ax_img.transData, length_px, label, loc="lower right",
+                pad=0.6, color="yellow", frameon=False, size_vertical=max(img0.shape[0] / 200, 1),
+                fontproperties=FontProperties(size=10),
+            ))
 
         self.ax_hist.set_title("Click on the peak to select it", fontsize=9)
         self.ax_mu.set_title("µ across tilts", fontsize=8)
@@ -508,26 +689,35 @@ class PeakMaskEditor:
         img = self.data[self.current_tilt]
         lo, hi, mu, sigma = self._get_lo_hi(self.current_tilt)
 
-        active = lo is not None
-        auto_mask = compute_mask_from_range(img, lo, hi) if active else \
-                    np.ones(img.shape, dtype=bool)
+        has_threshold = lo is not None
+        ti = self.current_tilt
+        auto_mask, _ = self._base_mask(ti, img)
+        loaded = self._loaded_mask_at(ti, full_res=False)
 
         # Apply paint overlay on top of the auto-computed mask
-        ti = self.current_tilt
         p_add = self._paint_add.get(ti)
         p_rem = self._paint_remove.get(ti)
+        active = has_threshold or loaded is not None or p_add is not None or p_rem is not None
         mask = auto_mask.copy()
+        if self._keep_top_cc and mask.any():
+            mask = largest_connected_component(mask)
         if p_add is not None:
             mask |= p_add
         if p_rem is not None:
             mask &= ~p_rem
-        if self._keep_top_cc and mask.any():
-            mask = largest_connected_component(mask)
+        # The loaded mask is a hard constraint: intersect (never override) so that
+        # no threshold/paint/polygon edit can re-include pixels it excludes.
+        if loaded is not None:
+            mask = np.logical_and(mask, loaded)
         bad = ~mask
 
         # -- image + overlay --
-        # Exclude sentinel pixels from contrast scaling so -1 doesn't crush the range
-        valid_for_clim = img[(mask) & (img >= 0)]
+        # Contrast is stretched over the threshold/loaded-mask selection only, not
+        # the paint/polygon overlay, so manually adding back outlier pixels
+        # (fiducials, hot pixels, etc.) doesn't blow out the display range on every
+        # edit.  Also exclude sentinel pixels so -1 doesn't crush the range.
+        clim_mask = np.logical_and(auto_mask, loaded) if loaded is not None else auto_mask
+        valid_for_clim = img[clim_mask & (img >= 0)]
         if valid_for_clim.size == 0:
             valid_for_clim = img[img >= 0] if (img >= 0).any() else img.ravel()
         self._im.set_data(img)
@@ -536,15 +726,18 @@ class PeakMaskEditor:
 
         rgba = np.zeros((*img.shape, 4), dtype=np.float32)
         if self.overlay_visible and active:
-            # Auto-masked-out pixels (not overridden by paint-add): red
-            auto_bad_only = bad & ~(p_add if p_add is not None else np.zeros(img.shape, bool))
+            # Pixels painted "add" but still excluded (blocked by the loaded-mask
+            # constraint) count as bad, not rescued, so they show red like any
+            # other excluded pixel rather than a misleading cyan.
+            rescued = (p_add & mask) if p_add is not None else np.zeros(img.shape, bool)
+            auto_bad_only = bad & ~rescued
             rgba[auto_bad_only] = [1.0, 0.2, 0.2, 0.5]
             # Paint-remove strokes: orange
             if p_rem is not None:
                 rgba[p_rem] = [1.0, 0.5, 0.0, 0.75]
-            # Paint-add strokes: cyan
+            # Paint-add strokes that actually took effect: cyan
             if p_add is not None:
-                rgba[p_add] = [0.0, 0.8, 1.0, 0.45]
+                rgba[p_add & mask] = [0.0, 0.8, 1.0, 0.45]
         self._overlay_im.set_data(rgba)
         self._overlay_im.set_extent(
             [-0.5, img.shape[1] - 0.5, -0.5, img.shape[0] - 0.5]
@@ -552,14 +745,21 @@ class PeakMaskEditor:
 
         n_bad = int(bad.sum())
         pct   = 100.0 * n_bad / bad.size
-        if active:
+        if has_threshold:
             mode_tag = (
                 "manual override" if self.current_tilt in self.manual_overrides
                 else ("smooth µ" if self.use_smooth else "Gaussian")
             )
+            if loaded is not None:
+                mode_tag += " ∩ loaded mask"
             title = (
                 f"Tilt {self.current_tilt + 1}/{self.n_tilts}  [{mode_tag}]  "
                 f"µ={mu:.1f}  σ={sigma:.1f}  "
+                f"inpaint: {n_bad} px ({pct:.1f} %)"
+            )
+        elif active:
+            title = (
+                f"Tilt {self.current_tilt + 1}/{self.n_tilts}  [loaded mask]  "
                 f"inpaint: {n_bad} px ({pct:.1f} %)"
             )
         else:
@@ -590,7 +790,7 @@ class PeakMaskEditor:
             )
         bin_centers = 0.5 * (bins[:-1] + bins[1:])
 
-        if active:
+        if has_threshold:
             for patch, left, right in zip(patches, bins[:-1], bins[1:]):
                 if right <= lo or left >= hi:
                     patch.set_facecolor("firebrick")
@@ -622,6 +822,11 @@ class PeakMaskEditor:
             self.ax_hist.legend(fontsize=7, loc="upper right")
             self.ax_hist.set_title(
                 "Histogram  (red = inpainted,  green = Gaussian fit)", fontsize=9
+            )
+        elif active:
+            self.ax_hist.set_title(
+                "Histogram  (loaded mask active — click a peak to also "
+                "apply an intensity threshold)", fontsize=9
             )
         else:
             self.ax_hist.set_title("Click on the peak you want to keep",
@@ -701,7 +906,7 @@ class PeakMaskEditor:
         self._refresh()
 
     def _on_nsigma(self, val):
-        self.n_sigma = float(val)
+        self.n_sigma_lo, self.n_sigma_hi = float(val[0]), float(val[1])
         self._refresh()
 
     def _on_manual_range(self, val):
@@ -721,7 +926,7 @@ class PeakMaskEditor:
             print(f"  smooth µ range: {self.smooth_mu.min():.1f} – "
                   f"{self.smooth_mu.max():.1f}")
         self.btn_smooth.label.set_text(
-            "Smooth µ: ON" if self.use_smooth else "Smooth µ: OFF"
+            "Smooth µ:\nON" if self.use_smooth else "Smooth µ:\nOFF"
         )
         self.btn_smooth.ax.set_facecolor(
             "cyan" if self.use_smooth else "lightcyan"
@@ -735,7 +940,7 @@ class PeakMaskEditor:
             # starts from a sensible position rather than the global extremes
             self._update_slider_for_tilt(self.current_tilt)
         self.btn_manual.label.set_text(
-            "Manual: ON" if self.manual_mode else "Manual: OFF"
+            "Manual:\nON" if self.manual_mode else "Manual:\nOFF"
         )
         self.btn_manual.ax.set_facecolor(
             "yellow" if self.manual_mode else "lightyellow"
@@ -746,7 +951,7 @@ class PeakMaskEditor:
     def _on_toggle_overlay(self, _event):
         self.overlay_visible = not self.overlay_visible
         self.btn_overlay.label.set_text(
-            "Overlay: ON" if self.overlay_visible else "Overlay: OFF"
+            "Overlay:\nON" if self.overlay_visible else "Overlay:\nOFF"
         )
         self._refresh()
 
@@ -871,7 +1076,7 @@ class PeakMaskEditor:
     # ------------------------------------------------------------------
 
     def _poly_btn_label(self):
-        return f"Poly: {'ON' if self._poly_mode else 'OFF'} [{self._poly_commit_dir.upper()}]"
+        return f"Poly: {'ON' if self._poly_mode else 'OFF'}\n[{self._poly_commit_dir.upper()}]"
 
     def _on_toggle_polygon(self, _event):
         self._poly_mode = not self._poly_mode
@@ -879,7 +1084,7 @@ class PeakMaskEditor:
             # Deactivate paint mode so they don't interfere
             if self._paint_mode:
                 self._paint_mode = False
-                self.btn_paint.label.set_text("Paint: OFF")
+                self.btn_paint.label.set_text("Paint:\nOFF")
                 self.btn_paint.ax.set_facecolor("lightgray")
                 self._brush_cursor.set_visible(False)
             self.btn_polygon.ax.set_facecolor("lightcyan")
@@ -904,12 +1109,12 @@ class PeakMaskEditor:
             if self._poly_mode:
                 self._poly_mode = False
                 self._clear_polygon_drawing()
-                self.btn_polygon.label.set_text("Poly: OFF")
+                self.btn_polygon.label.set_text("Poly:\nOFF")
                 self.btn_polygon.ax.set_facecolor("lightgray")
-            self.btn_paint.label.set_text("Paint: ON")
+            self.btn_paint.label.set_text("Paint:\nON")
             self.btn_paint.ax.set_facecolor("lightgreen")
         else:
-            self.btn_paint.label.set_text("Paint: OFF")
+            self.btn_paint.label.set_text("Paint:\nOFF")
             self.btn_paint.ax.set_facecolor("lightgray")
             self._brush_cursor.set_visible(False)
         self.fig.canvas.draw_idle()
@@ -1076,16 +1281,22 @@ class PeakMaskEditor:
     # ------------------------------------------------------------------
 
     def _on_generate(self, _event):
-        if not self._peak_selected and not self.manual_mode:
-            print("Please click on the histogram to select the peak first.")
+        has_paint = bool(self._paint_add or self._paint_remove)
+        if (not self._peak_selected and not self.manual_mode
+                and self.loaded_mask_preview is None and not has_paint):
+            print("Please click on the histogram to select the peak first "
+                  "(or load a mask with --load-mask, or paint/draw a polygon mask).")
             return
 
         print("\nGenerating output …")
         print(f"  Mode         : "
               f"{'manual' if self.manual_mode else ('smooth µ' if self.use_smooth else 'Gaussian')}")
         print(f"  Output path  : {self.output_path}")
+        # The same fit resolution and smoothing strength the SLURM job uses,
+        # so this output and the cluster's are the same computation.
+        print(f"  Bin factor   : {self.slurm_bin}  (--slurm-bin)")
+        print(f"  smoothn s    : {SMOOTHN_S:g}")
 
-        h_bin,  w_bin  = self.data.shape[1],     self.data.shape[2]
         _, h_full, w_full = self._full_shape
         save_mask = bool(self.chk_save_mask.get_status()[0])
         ti = self.current_tilt
@@ -1098,30 +1309,22 @@ class PeakMaskEditor:
                              mrc_mode=0, overwrite=True)
             if save_mask else None
         )
+        if mask_mrc is not None:
+            mask_mrc.voxel_size = self._voxel_size
 
+        filled_fraction = {}
         try:
             with mrcfile.new_mmap(self.output_path,
                                   shape=(self.n_tilts, h_full, w_full),
                                   mrc_mode=2, overwrite=True) as out_mrc:
+                out_mrc.voxel_size = self._voxel_size
                 for i in tqdm(range(self.n_tilts), desc="Inpainting tilts"):
                     img = self._mmap_data[i].astype(float)
-                    lo, hi, _, _ = self._get_lo_hi(i)
-                    mask = compute_mask_from_range(img, lo, hi)
+                    mask = self._effective_mask_full(i, img)
 
-                    p_add = self._paint_add.get(i)
-                    p_rem = self._paint_remove.get(i)
-                    if p_add is not None:
-                        mask |= zoom(p_add.astype(np.float32),
-                                     (h_full / h_bin, w_full / w_bin), order=0) > 0.5
-                    if p_rem is not None:
-                        mask &= ~(zoom(p_rem.astype(np.float32),
-                                       (h_full / h_bin, w_full / w_bin), order=0) > 0.5)
-                    if self._keep_top_cc and mask.any():
-                        mask = largest_connected_component(mask)
-
-                    result = inpaint_tilt(img, mask).astype(np.float32) if (~mask).any() \
-                             else img.astype(np.float32)
+                    result = inpaint_tilt(img, mask, bin_factor=self.slurm_bin)
                     out_mrc.data[i] = result
+                    filled_fraction[i] = float(1.0 - mask.mean())
                     if mask_mrc is not None:
                         mask_mrc.data[i] = mask.astype(np.int8)
                     if i == ti:
@@ -1135,12 +1338,20 @@ class PeakMaskEditor:
         if save_mask:
             print(f"Mask  → {mask_path}")
 
+        outputs = [fingerprint(self.output_path)]
+        if save_mask:
+            outputs.append({"role": "mask", **fingerprint(mask_path)})
+        self._record_mask_step(outputs)
+        self._record_gui_inpaint(self.output_path,
+                                 mask_path if save_mask else None,
+                                 filled_fraction)
+
         self._show_comparison(comparison_orig, comparison_proc)
 
     def _show_comparison(self, orig: np.ndarray, proc: np.ndarray):
         ti   = self.current_tilt
         lo, hi, mu, sigma = self._get_lo_hi(ti)
-        mask = compute_mask_from_range(orig, lo, hi)
+        mask = self._effective_mask_full(ti, orig)
         bad  = ~mask
 
         valid = orig[mask] if mask.any() else orig.ravel()
@@ -1156,7 +1367,8 @@ class PeakMaskEditor:
         rgba[bad] = [1.0, 0.2, 0.2, 0.5]
         axes[1].imshow(orig, cmap="gray", origin="lower", vmin=vlo, vmax=vhi)
         axes[1].imshow(rgba, origin="lower")
-        axes[1].set_title(f"Mask  (lo={lo:.1f}, hi={hi:.1f})")
+        mask_title = f"Mask  (lo={lo:.1f}, hi={hi:.1f})" if lo is not None else "Mask  (loaded/paint)"
+        axes[1].set_title(mask_title)
         axes[1].axis("off")
 
         axes[2].imshow(proc, cmap="gray", origin="lower", vmin=vlo, vmax=vhi)
@@ -1174,8 +1386,10 @@ class PeakMaskEditor:
     def _save_params_json(self) -> str:
         """Serialise per-tilt thresholds (and paint overlays) to JSON + optional mask MRC."""
         has_paint = bool(self._paint_add or self._paint_remove)
-        if not self._peak_selected and not self.manual_overrides and not has_paint:
-            print("No peak selected, no manual overrides, and no paint overlays — nothing to save.")
+        has_loaded_mask = self.loaded_mask_preview is not None
+        if not self._peak_selected and not self.manual_overrides and not has_paint and not has_loaded_mask:
+            print("No peak selected, no manual overrides, no loaded mask, and no paint "
+                  "overlays — nothing to save.")
             return None
 
         stem = os.path.splitext(self.input_path)[0]
@@ -1188,38 +1402,32 @@ class PeakMaskEditor:
                 lo, hi = self._global_min, self._global_max
             tilts[str(i)] = {"lo": float(lo), "hi": float(hi)}
 
+        save_mask = bool(self.chk_save_mask.get_status()[0])
+
         payload = {
             "input":         os.path.abspath(self.input_path),
             "output":        os.path.abspath(self.output_path),
-            "edge_blend_px": 15,
-            "save_mask":     bool(self.chk_save_mask.get_status()[0]),
+            "save_mask":     save_mask,
             "tilts":         tilts,
         }
-
-        # If paint/polygon overlays exist, or Top CC is on, bake the final spatial
-        # masks into a companion MRC so that inpaint_apply.py uses them exactly.
-        if has_paint or self._keep_top_cc:
-            h_bin, w_bin      = self.data.shape[1],    self.data.shape[2]
+        # Bake the final spatial masks into a companion MRC so inpaint_apply.py uses
+        # them exactly.  Required when paint/polygon overlays, a loaded mask or Top CC
+        # mean the mask can't be reproduced from the lo/hi thresholds alone — and also
+        # whenever "Save mask MRC" is ticked, because odd/even half-sets need this file:
+        # the thresholds were fitted to full-dose intensities and do not transfer to
+        # half-dose data, so the halves cannot re-derive the mask for themselves.
+        if save_mask or has_paint or has_loaded_mask or self._keep_top_cc:
             _, h_full, w_full = self._full_shape
             mask_mrc_path  = stem + "_inpaint_mask.mrc"
             with mrcfile.new_mmap(mask_mrc_path,
                                   shape=(self.n_tilts, h_full, w_full),
                                   mrc_mode=0, overwrite=True) as mrc:
+                # inpaint_apply.py checks this mask against the stack it masks;
+                # a 0 pixel size here is one more way that comparison misleads.
+                mrc.voxel_size = self._voxel_size
                 for i in tqdm(range(self.n_tilts), desc="Baking masks"):
-                    lo, hi, _, _ = self._get_lo_hi(i)
                     img = self._mmap_data[i].astype(float)
-                    m   = compute_mask_from_range(img, lo, hi) if lo is not None \
-                          else np.ones((h_full, w_full), dtype=bool)
-                    p_add = self._paint_add.get(i)
-                    p_rem = self._paint_remove.get(i)
-                    if p_add is not None:
-                        m |= zoom(p_add.astype(np.float32),
-                                  (h_full / h_bin, w_full / w_bin), order=0) > 0.5
-                    if p_rem is not None:
-                        m &= ~(zoom(p_rem.astype(np.float32),
-                                    (h_full / h_bin, w_full / w_bin), order=0) > 0.5)
-                    if self._keep_top_cc and m.any():
-                        m = largest_connected_component(m)
+                    m = self._effective_mask_full(i, img)
                     mrc.data[i] = m.astype(np.int8)
             payload["mask_mrc"] = os.path.abspath(mask_mrc_path)
             print(f"Mask MRC  → {mask_mrc_path}")
@@ -1227,7 +1435,164 @@ class PeakMaskEditor:
         with open(params_path, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"Params JSON → {params_path}")
+
+        outputs = [{"role": "params", **fingerprint(params_path)}]
+        if "mask_mrc" in payload:
+            outputs.append({"role": "mask", **fingerprint(payload["mask_mrc"])})
+        self._record_mask_step(outputs)
         return params_path
+
+    # ------------------------------------------------------------------
+    # Provenance sidecars
+    # ------------------------------------------------------------------
+    #
+    # This window is the mask's provenance and nothing else records it: the
+    # thresholds live in a JSON beside the data, and whether a mask came from
+    # a Gaussian fit, a hand-drawn polygon or a previous session's file is
+    # visible only to whoever was sitting here at the time.
+
+    def _mask_provenance(self) -> dict:
+        """How the mask was arrived at — the part that cannot be re-derived."""
+        return {
+            "peak_fit": bool(self._peak_selected),
+            "smooth_mu": bool(self.use_smooth),
+            "manual_mode": bool(self.manual_mode),
+            "n_manual_overrides": len(self.manual_overrides),
+            "painted_tilts": sorted(
+                set(self._paint_add) | set(self._paint_remove)),
+            "loaded_mask": (
+                os.path.abspath(self._mask_mrc._iostream.name)
+                if self._mask_mrc is not None else None),
+            "keep_top_cc": bool(self._keep_top_cc),
+            "uncovered_sentinel": bool(self._has_uncovered),
+            # True when the mask can be rebuilt from the lo/hi thresholds
+            # alone. False means the baked mask MRC is the only record of it —
+            # and that the odd/even half-sets must be given that file, since
+            # they cannot re-derive it from their own intensities.
+            "reproducible_from_thresholds": not (
+                bool(self._paint_add) or bool(self._paint_remove)
+                or self._mask_mrc is not None or self._keep_top_cc),
+        }
+
+    def _threshold_source(self, tilt_index: int, lo) -> str:
+        if lo is None:
+            return "global"
+        if tilt_index in self.manual_overrides:
+            return "manual"
+        return "smooth_fit" if self.use_smooth else "fit"
+
+    def _record_mask_step(self, outputs: list) -> None:
+        """Write the mask design's sidecar beside its primary artifact.
+
+        ``outputs`` is fingerprint dicts, most significant first: the mask MRC
+        when one was baked, else the params JSON. The sidecar sits beside that
+        first entry, because that is the file inpaint_apply is pointed at, and
+        the rest are named in ``effective`` as companions.
+
+        Guarded: a sidecar that cannot be written must not cost someone the
+        mask they just spent twenty minutes drawing.
+        """
+        if not self.write_sidecars or not outputs:
+            return
+        try:
+            provenance = self._mask_provenance()
+            effective = {
+                "input": os.path.abspath(self.input_path),
+                "n_tilts": int(self.n_tilts),
+                "stack_shape": [int(v) for v in self._full_shape],
+                "pixel_size_A": float(self._voxel_size.x),
+                "preview_bin_factor": int(self.bin_factor),
+                "global_min": float(self._global_min),
+                "global_max": float(self._global_max),
+                "n_sigma_lo": float(self.n_sigma_lo),
+                "n_sigma_hi": float(self.n_sigma_hi),
+                # A mask changes no geometry, so the canvas frame stitching
+                # declared still describes these pixels.
+                "frame": "canvas",
+                "geometry_unchanged": True,
+                **provenance,
+            }
+            tilts = []
+            for i in range(self.n_tilts):
+                lo, hi, mu, sigma = self._get_lo_hi(i)
+                source = self._threshold_source(i, lo)
+                if lo is None:
+                    lo, hi = self._global_min, self._global_max
+                tilts.append({
+                    "tilt_index": i,
+                    "lo": float(lo),
+                    "hi": float(hi),
+                    "threshold_source": source,
+                    "fitted_mu": float(mu) if mu is not None else float("nan"),
+                    "fitted_sigma": (float(sigma) if sigma is not None
+                                     else float("nan")),
+                })
+            effective["tilts"] = tilts
+            effective["auto_resolved"] = ([] if self.manual_mode
+                                          else ["lo", "hi"])
+            effective["companion_outputs"] = [o["path"] for o in outputs[1:]]
+            path = sidecar.write(
+                outputs[0]["path"],
+                SIDECAR_STEP,
+                effective,
+                inputs=[fingerprint(self.input_path, role="stitched_stack")],
+                requested={"n_sigma": float(self.n_sigma_lo)},
+            )
+            print(f"Sidecar  → {path}  [inpaint_mask]")
+        except Exception as exc:            # noqa: BLE001 - never lose the mask
+            logger.warning("Could not write the sidecar (%s); "
+                           "the mask and params files are unaffected.", exc)
+
+    def _record_gui_inpaint(self, output_path: str, mask_out_path: str,
+                            filled_fraction: dict) -> None:
+        """Record the "Generate Output" button as an apply step in its own right.
+
+        Pressing it does the whole job locally — mask *and* fill — so it is
+        recorded as both steps rather than pretending the stack it wrote came
+        from the cluster.
+        """
+        if not self.write_sidecars:
+            return
+        try:
+            tilts = []
+            for i in range(self.n_tilts):
+                lo, hi, _, _ = self._get_lo_hi(i)
+                if lo is None:
+                    lo, hi = self._global_min, self._global_max
+                tilts.append({
+                    "tilt_index": i,
+                    "lo": float(lo),
+                    "hi": float(hi),
+                    "mask_source": "gui_interactive",
+                    "filled_fraction": float(
+                        filled_fraction.get(i, float("nan"))),
+                })
+            sidecar.write(
+                output_path,
+                "inpaint_apply",
+                {
+                    "variant": "full",
+                    "input": os.path.abspath(self.input_path),
+                    "output": os.path.abspath(output_path),
+                    "mask_output": (os.path.abspath(mask_out_path)
+                                    if mask_out_path else None),
+                    "mask_source": "gui_interactive",
+                    "smoothn_s": float(SMOOTHN_S),
+                    "smoothn_max_iter": int(SMOOTHN_MAX_ITER),
+                    "bin_factor": int(self.slurm_bin),
+                    "n_tilts": int(self.n_tilts),
+                    "pixel_size_A": float(self._voxel_size.x),
+                    "frame": "canvas",
+                    "geometry_unchanged": True,
+                    "ran_in": "mask_and_inpaint GUI, not on the cluster",
+                    "tilts": tilts,
+                },
+                inputs=[fingerprint(self.input_path, role="stitched_stack")],
+                requested={"bin_factor": int(self.slurm_bin)},
+            )
+        except Exception as exc:            # noqa: BLE001
+            logger.warning("Could not record the inpainting (%s); "
+                           "the output stack is unaffected.", exc)
 
     def _write_slurm_script(self, params_path: str) -> str:
         """Write a SLURM batch script that calls inpaint_apply. Returns file path."""
@@ -1243,10 +1608,26 @@ class PeakMaskEditor:
         else:
             template = DEFAULT_SLURM_TEMPLATE
 
+        # Half-set paths matching beam_mask_motioncorr.py's odd/even sums, used by
+        # the commented-out Noise2Noise blocks in the default template.
+        in_stem, in_ext = os.path.splitext(os.path.abspath(self.input_path))
+
+        # Prefer the mask just baked alongside the params file: it already exists, so
+        # the half-set jobs can run in any order.  Only when nothing was baked do we
+        # fall back to the mask the full-dose run itself emits, which does impose an
+        # ordering constraint.
+        with open(params_path) as f:
+            saved_payload = json.load(f)
+        mask_path = saved_payload.get("mask_mrc") or (
+            os.path.splitext(os.path.abspath(self.output_path))[0] + "_mask.mrc"
+        )
+
         job_name = os.path.basename(stem)[:32]
         content  = template.format(
             job_name   = job_name,
             n_cpus     = self.slurm_cpus,
+            npertilt   = self.slurm_npertilt,
+            bin_factor = self.slurm_bin,
             mem_gb     = self.slurm_mem,
             time       = self.slurm_time,
             log_file   = stem + "_inpaint_%j.log",
@@ -1254,6 +1635,11 @@ class PeakMaskEditor:
             input      = os.path.abspath(self.input_path),
             output     = os.path.abspath(self.output_path),
             params     = os.path.abspath(params_path),
+            input_odd  = f"{in_stem}_odd{in_ext}",
+            output_odd = f"{in_stem}_odd_inpainted{in_ext}",
+            input_even = f"{in_stem}_even{in_ext}",
+            output_even= f"{in_stem}_even_inpainted{in_ext}",
+            mask       = mask_path,
         )
         with open(script_path, "w") as f:
             f.write(content)
@@ -1268,6 +1654,8 @@ class PeakMaskEditor:
 
     def show(self):
         plt.show()
+        if self._mask_mrc is not None:
+            self._mask_mrc.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1297,8 +1685,18 @@ def main():
         type=int, default=1024, dest="max_pixels",
     )
     parser.add_argument(
+        "--preview-binning",
+        choices=["zoom", "fourier"], default="zoom", dest="preview_binning",
+        help="Method used to downsample tilts to --max-pixels for display: "
+             "'zoom' is bilinear resampling (default, fast, some aliasing); "
+             "'fourier' crops in Fourier space before inverse-transforming, "
+             "which avoids aliasing at the cost of some ringing near sharp "
+             "edges. Preview only — does not affect the full-resolution mask.",
+    )
+    parser.add_argument(
         "-n", "--n-sigma",
-        help="Initial N-sigma threshold (default: 3.0).",
+        help="Initial N-sigma threshold, applied to both the lower and upper "
+             "bound (default: 3.0).",
         type=float, default=3.0, dest="n_sigma",
     )
     parser.add_argument(
@@ -1308,7 +1706,17 @@ def main():
     )
     parser.add_argument(
         "--slurm-cpus", type=int, default=8, dest="slurm_cpus",
-        help="CPUs per SLURM task (default: 8).",
+        help="Total thread budget (ntotal) for the SLURM task; "
+             "ntotal // --slurm-npertilt tilts run concurrently (default: 8).",
+    )
+    parser.add_argument(
+        "--slurm-npertilt", type=int, default=4, dest="slurm_npertilt",
+        help="DCT threads per tilt (npertilt) inside smoothn (default: 4).",
+    )
+    parser.add_argument(
+        "--slurm-bin", type=int, default=2, dest="slurm_bin",
+        help="Downsample factor for the smoothn fit before upsampling back to "
+             "full resolution; 1 disables binning (default: 2).",
     )
     parser.add_argument(
         "--slurm-mem", type=int, default=32, dest="slurm_mem",
@@ -1318,10 +1726,30 @@ def main():
         "--slurm-time", default="02:00:00", dest="slurm_time",
         help="Wall-clock time limit for SLURM job (default: 02:00:00).",
     )
+    parser.add_argument(
+        "--load-mask",
+        help="Path to an existing mask MRC (e.g. a previous session's "
+             "*_mask.mrc / *_inpaint_mask.mrc) to load as the starting mask. "
+             "Paint/polygon edits and Top CC are applied on top of it.",
+        default=None, dest="load_mask",
+    )
+    parser.add_argument(
+        "--no-sidecar", action="store_false", default=True, dest="sidecar",
+        help="Do not write a provenance sidecar for the mask. Sidecars are ON "
+             "by default and record how the mask was arrived at (fit, manual, "
+             "painted, loaded), the per-tilt thresholds, and whether it can be "
+             "reproduced from those thresholds alone — which is what decides "
+             "whether the odd/even half-sets must be handed the baked mask "
+             "file. The sidecar sits beside the mask MRC when one is baked, "
+             "else beside the params JSON.",
+    )
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
 
     if not os.path.exists(args.input):
         sys.exit(f"Error: file not found: {args.input}")
+    if args.load_mask and not os.path.exists(args.load_mask):
+        sys.exit(f"Error: mask file not found: {args.load_mask}")
 
     print(f"Opening {args.input} as memory-map …")
     with mrcfile.mmap(args.input, mode="r", permissive=True) as mrc:
@@ -1337,11 +1765,16 @@ def main():
         )
         editor = PeakMaskEditor(
             mrc, args.input, args.output,
-            max_px=args.max_pixels, n_sigma_default=args.n_sigma,
+            max_px=args.max_pixels, preview_binning=args.preview_binning,
+            n_sigma_default=args.n_sigma,
             slurm_template=args.slurm_template,
             slurm_cpus=args.slurm_cpus,
+            slurm_npertilt=args.slurm_npertilt,
+            slurm_bin=args.slurm_bin,
             slurm_mem=args.slurm_mem,
             slurm_time=args.slurm_time,
+            load_mask_path=args.load_mask,
+            write_sidecars=args.sidecar,
         )
         editor.show()
 

@@ -2,6 +2,8 @@
 Join a tilt-series of stitched montage TIFFs into a single MRC stack for IMOD/AreTomo,
 writing companion files: .rawtlt, tiltAngles.txt, and an HDF5 file containing the
 refined tile positions and index maps from each tilt.
+
+Deprecated, because the new stitch.py workflow now writes a single MRC and .rawtlt directly.
 """
 
 import argparse
@@ -104,7 +106,18 @@ def main():
     outputfile = os.path.join(outputdir, outname + ".mrc")
 
     # Match the MRC mode/dtype to the input TIFFs' own dtype rather than forcing int16.
-    mrc_mode = mrcfile.utils.mode_from_dtype(first_dtype)
+    try:
+        mrc_mode = mrcfile.utils.mode_from_dtype(first_dtype)
+    except ValueError:
+        if first_dtype == np.dtype(np.int32):
+            # PIL has no native signed 8/16-bit TIFF mode: stitch.py's int16
+            # (or int8) canvases get silently widened to int32 on write.
+            # Narrow back down to int16, the only signed MRC-representable
+            # type such data can actually have come from.
+            first_dtype = np.dtype(np.int16)
+            mrc_mode = mrcfile.utils.mode_from_dtype(first_dtype)
+        else:
+            raise
     mrc_dtype = mrcfile.utils.dtype_from_mode(mrc_mode)
     with mrcfile.new_mmap(outputfile, shape, mrc_mode=mrc_mode, overwrite=True) as mrc:
         for i, f in enumerate(tqdm(fnams, desc="Joining TIFFs into MRC")):

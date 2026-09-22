@@ -2,7 +2,7 @@
 """
 Project 3D tomogram coordinates back onto individual montage tiles.
 
-A square-beam montage tomogram is reconstructed from a *stitched* tilt series,
+A square-beam montage tomogram is reconstructed from a stitched tilt series,
 so a 3D pick has no direct relationship to the raw data: the pixel it came from
 lives somewhere in one of ~20 tiles making up one tilt, and which tile that is
 changes from tilt to tilt. This module inverts the whole chain, taking a point
@@ -11,20 +11,37 @@ per-tilt tile stacks written by ``beam_mask_motioncorr --stack-output``.
 
 The chain, in order, and where each link came from
 --------------------------------------------------
-1. **tomogram -> aligned frame.** Inverting the shear in
+1. **tomogram -> aligned frame.** Inverting the rotation in
    ``refine_montage_projmatch.reproject_volume``::
 
-       col_al = cx + (X - cx) cos(theta) - (Z - cz) sin(theta)
+       col_al = cx + (X - cx) cos(theta) - s (Z - cz) sin(theta)
        row_al = Y
 
-   ``theta`` is the ``.aln`` TILT column *as written*, which already includes
-   AreTomo's ``-TiltCor`` offset, and the sign of the Z term already carries
-   the depth-axis flip that ``clip rotx`` applies. Neither is a free parameter;
-   see reproject_volume's own derivation for the AreTomo source citations.
+   ``theta`` is from the AreTomo ``.aln`` TILT column as written, which already 
+   includes AreTomo's ``-TiltCor`` offset.
+
+   ``s`` is ``z_sign``, the direction of the volume's depth axis, and defaults
+   TO -1, i.e. the formula above with the sign flipped, this assumes standard
+   AreTomo reconstruction followed by a clip rotx (-90 degrees about x axis) 
+   rotation. 
+
+   ``cx`` and ``cz`` are the volume centre, ``(n-1)/2`` -- which is a claim
+   about where AreTomo put the reconstruction, not a measurement of it. This
+   link is the one that can be tested on its own, because AreTomo writes the
+   aligned stack it reconstructed from: ``measure_reprojection_residual
+   --frame aligned`` measures the residual there, with links 2-4 out of the
+   loop, and its fit names which of ``cz``, ``cx``, ``theta`` is off. The
+   answer goes back in through ``z_centre_offset`` / ``x_centre_offset`` /
+   ``theta_offset_deg``.
 
 2. **aligned -> canvas.** The inverse of
    ``refine_montage_projmatch.alignment_matrix``, whose sign convention
-   (``rot-1 shift-1``) was settled against AreTomo's own aligned stack.
+   (``rot-1 shift-1``) was settled against AreTomo's own aligned stack, plus
+   the **local (patch) shift** when the volume was reconstructed with
+   ``-Patch``. The patch field is not a refinement of the rigid alignment but a
+   term inside it -- AreTomo adds it between the rotation and the translation
+   -- and omitting it left a 191 A position-dependent error. See
+   ``docs/reprojection_geometry.md`` for the derivation and the full equation.
 
 3. **canvas -> tile.** ``MontageGeometry`` places tile *t* from its position in
    microns. A point may fall inside several overlapping tiles; ``index_map``
@@ -41,11 +58,16 @@ The chain, in order, and where each link came from
 
 Two traps worth stating explicitly, because both are silent
 -----------------------------------------------------------
-* ``stitch.py --rotate`` is **not** recorded in the HDF5. Dataset 9-A was
-  stitched with ``--rotate 90`` even though the current ``02_stitch.sh`` has
-  that flag commented out and stitch.py defaults to 0. Getting it wrong
+* ``stitch.py --rotate`` is **not** recorded in the HDF5, and getting it wrong
   displaces every tile by (2880-2046)/2 = 417 canvas pixels. ``rotate="auto"``
-  measures it from ``index_map`` instead of trusting an argument.
+  measures it from ``index_map`` rather than trusting an argument, but a tile
+  footprint is unchanged by 180 degrees, so auto can only narrow it to k or
+  k+2. Prefer :meth:`MontageProjector.from_sidecars`, which reads the argument
+  stitch was actually given (``transforms: raw_tile -> canvas, rot90_k``) and
+  settles it outright. Note that ``rot90_k`` is stitch's *own* rotation, which
+  is not the same as the total from the detector frame: when motion correction
+  has already rotated the tiles, stitch applies 0 and the sidecars record both
+  numbers separately.
 * ``index_map`` labels index the *selected* tiles. When ``tile_selection`` has
   any False entry (it does, on more than half the tilts of 9-A) label != row of
   ``Refined_positions`` and everything downstream lands on the wrong tile.
@@ -64,15 +86,22 @@ import numpy as np
 from .refine_montage_projmatch import (
     AlnFile,
     Convention,
+    LocalAlignment,
     MontageGeometry,
     SectionAlignment,
     alignment_matrix,
+    alignment_shift_rc,
     find_position_files,
     map_sections_to_tilts,
     parse_aln,
 )
+from .Utilities import roll_no_periodic
 
 logger = logging.getLogger(__name__)
+
+#: Cap on the fixed-point iterations that invert the local shift field. The
+#: contraction is strong (|dL| << 1), so this is a safety net, not a budget.
+_LOCAL_INVERSE_ITERS = 20
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +138,14 @@ class TiltInfo:
         """
         Per-tile square-beam footprints, ``(n_selected, *tile_shape)`` bool.
 
-        stitch.py stores these packed along the last axis
-        (``np.packbits(..., axis=-1)`` at stitch.py:662) in tile-local canvas
-        coordinates -- i.e. binned and already rotated -- and in *selected* tile
-        order, like ``beam_shifts`` and unlike ``Refined_positions``.
+        stitch.py stores a single eroded beam-reference mask
+        (``beam_reference_mask``) plus each tile's ``(dy, dx)`` alignment
+        shift (``beam_shifts``), both in tile-local canvas coordinates --
+        i.e. binned and already rotated -- and ``beam_shifts`` in *selected*
+        tile order, like ``Refined_positions`` restricted to the selection.
+        A tile's actual mask is never stored; it is reconstructed here by
+        rolling the reference mask into place, exactly as stitch.py does
+        per tile during the run.
 
         This matters for extraction, not just for tidiness. The illuminated
         square is smaller than the detector frame and sits off-centre in it, so
@@ -123,11 +156,16 @@ class TiltInfo:
         """
         if self._beam_masks is None:
             with h5py.File(self.h5path, "r") as h:
-                if "beam_masks" not in h:
+                if "beam_reference_mask" not in h or "beam_shifts" not in h:
                     return None
-                packed = h["beam_masks"][:]
-                width = int(h["beam_masks_width"][()])
-            self._beam_masks = np.unpackbits(packed, axis=-1)[..., :width].astype(bool)
+                ref_mask = h["beam_reference_mask"][:].astype(bool)
+                shifts = h["beam_shifts"][:]
+            self._beam_masks = np.stack(
+                [
+                    roll_no_periodic(ref_mask, (-int(dy), -int(dx)), axis=(0, 1))
+                    for dy, dx in shifts
+                ]
+            )
         return self._beam_masks
 
     def drop_index_map(self) -> None:
@@ -183,7 +221,13 @@ class MontageProjector:
         extra_shift: Sequence[float] = (0.0, 0.0),
         handedness: int = 1,
         exclude_sections: Sequence[int] = (),
+        use_local: bool = True,
+        z_centre_offset: float = 0.0,
+        x_centre_offset: float = 0.0,
+        theta_offset_deg: float = 0.0,
+        z_sign: int = -1,
     ):
+        # Read AreTomo's .aln file
         self.aln = parse_aln(aln_path)
         self.recon_shape = tuple(int(x) for x in recon_shape)
         self.out_bin = int(out_bin)
@@ -192,6 +236,68 @@ class MontageProjector:
         self.conv = conv
         self.extra_shift = np.asarray(extra_shift, dtype=float)
         self.handedness = int(handedness)
+
+        # The three free parameters of link 1, all zero by default because the
+        # defaults are *derivations*, not guesses: cz = (nz-1)/2 assumes AreTomo
+        # centred the slab on the specimen mid-plane, cx = (nx-1)/2 assumes it
+        # centred the volume on the aligned image, and theta is the .aln TILT
+        # column. Each is a thing that could be false, and each leaves its own
+        # signature in the reprojection residual (see
+        # measure_reprojection_residual's fit); these knobs exist so a fitted
+        # coefficient can be applied and the measurement repeated, rather than
+        # the derivation being argued about. NOT for tuning until the residual
+        # looks small -- an offset here is a claim about the reconstruction.
+        self.z_centre_offset = float(z_centre_offset)
+        self.x_centre_offset = float(x_centre_offset)
+        self.theta_offset_deg = float(theta_offset_deg)
+
+        # Which way the volume's Z axis runs, relative to the orientation
+        # tomo_to_aligned's formula (below) is written for -- the textbook
+        # reading of AreTomo's own kernels, no correction folded in. -1 is
+        # that orientation, and -1 is also what every volume this pipeline has
+        # made so far actually needs: AreTomo without -FlipVol, then `clip
+        # rotx`, measured on 9-A. +1 is the other way round -- both flips
+        # applied, or neither -- and unusual enough to warn about.
+        #
+        # This is a property of the FILE, not a fitted correction, so unlike
+        # the three offsets above it comes from the sidecar. Getting it wrong
+        # costs 2*dz*sin(theta) of position, which is ZERO at the 0 deg section
+        # -- the one an IMOD model is easiest to check on -- and grows to the
+        # full 2*dz at the extremes. Check it at +-60 deg or not at all.
+        if int(z_sign) not in (1, -1):
+            raise ValueError(f"z_sign must be +1 or -1, got {z_sign}")
+        self.z_sign = int(z_sign)
+        if self.z_sign == 1:
+            logger.warning(
+                "z_sign=+1: the volume's depth axis is being taken as running "
+                "opposite to every volume this pipeline has reconstructed so "
+                "far (clip rotx, no -FlipVol). Check flip_vol/clip_rotx.")
+        if any((self.z_centre_offset, self.x_centre_offset, self.theta_offset_deg)):
+            logger.warning(
+                "tomogram -> aligned frame is being shifted from its derived "
+                "values: z centre %+.2f, x centre %+.2f recon voxels, theta "
+                "%+.4f deg.", self.z_centre_offset, self.x_centre_offset,
+                self.theta_offset_deg,
+            )
+
+        # The patch field, if the reconstruction was made with one. Applying it
+        # is the default because the picks come out of a volume that already
+        # has it baked in; `use_local=False` exists to reproduce the old,
+        # global-only behaviour for comparison, not as a normal setting.
+        self.local: Optional[LocalAlignment] = self.aln.local if use_local else None
+        if self.aln.has_local and self.local is None:
+            logger.warning(
+                "%s has a local (patch) alignment but use_local=False: picks "
+                "will be reprojected with the global alignment only. Expect a "
+                "position-dependent error the size of the patch field.",
+                os.path.basename(aln_path),
+            )
+        elif self.local is None and not self.aln.has_local:
+            logger.info(
+                "No local alignment in the .aln; the reconstruction had better "
+                "have been made without -Patch, or reprojection will be off by "
+                "the patch field.",
+            )
 
         # The tomogram is `binning * out_bin` coarser than a raw tile pixel.
         # Derive it from the binning factors, never from the ratio of recorded
@@ -254,6 +360,173 @@ class MontageProjector:
             "canvas %s, tile on canvas %s, rotate %d, tomogram binning %d",
             self.geom.canvas_shape, self.geom.tile_shape, self.rotate, self.tomo_bin,
         )
+
+    # -- construction from the provenance sidecars ---------------------------
+
+    @classmethod
+    @classmethod
+    def from_sidecars(
+        cls,
+        tomogram_path: str,
+        aln_path: str,
+        positions_dir: str,
+        recon_shape: Sequence[int],
+        *,
+        canvas_path: Optional[str] = None,
+        **overrides,
+    ) -> "MontageProjector":
+        """
+        Build a projector by walking the tomogram's provenance chain.
+
+        Every geometric constant this class takes -- the ROI, the tile pixel
+        size, the stitch binning, the rotation, AreTomo's OutBin -- was chosen
+        by an earlier step and then had to be *restated* on the command line
+        here, correctly, from memory. That is where the 417-pixel rotation trap
+        in this module's docstring came from, and no amount of care at the call
+        site can fix it: the arguments are a second copy of facts that already
+        exist. This reads the originals.
+
+        Anchored at ``tomogram_path``, not at a shared file for the series.
+        That is the substantive change from the manifest version and it closes
+        the hazard the submission scripts had to warn about in prose: "TOMOGRAM
+        AND ALN MUST BE THE SAME RUN". The AreTomo sidecar sits beside *this*
+        volume and names the exact stack and alignment that made it, so a
+        ``-Patch 5 3`` volume can no longer be silently paired with a
+        ``-Patch 10 6`` run's geometry -- the chain simply leads somewhere else.
+
+        ``rotate`` is the value that matters most. Detecting it from
+        ``index_map`` works but cannot separate k from k+2 -- a tile footprint
+        is unchanged by 180 degrees -- so it flips a coin on an error that maps
+        every particle to the opposite corner of its tile. The stitch sidecar
+        records the argument stitch was actually given, which settles it.
+
+        Explicit keyword arguments still win, so a value can be overridden for
+        a test without editing a sidecar. Anything the chain does not have
+        falls back to the constructor's default, with a warning naming it.
+        """
+        try:
+            from . import sidecar
+        except ImportError:
+            import sidecar
+
+        aretomo = _sidecar_effective(sidecar, tomogram_path, "aretomo")
+        # The canvas the tomogram came from: named by the AreTomo sidecar's
+        # own input, so there is nothing to pass and nothing to get wrong.
+        # inpaint_apply sits between the two on some series and changes no
+        # geometry, so the walk skips through it to the stitch record.
+        # The chain wins over the caller's canvas. `--canvas-stack` is the
+        # stack the *tools* display, which on an inpainted series is not the
+        # stack AreTomo was given; preferring it would walk to the wrong
+        # stitch record, or to none. It is only a fallback for a tomogram
+        # whose own sidecar is missing.
+        stitch: Dict[str, object] = {}
+        canvas = (aretomo.get("input") if aretomo else None) or canvas_path
+        if canvas:
+            stitch = _sidecar_effective(sidecar, canvas, "stitch")
+            if not stitch:
+                inpaint = _sidecar_effective(sidecar, canvas, "inpaint_apply")
+                if inpaint.get("input"):
+                    stitch = _sidecar_effective(
+                        sidecar, inpaint["input"], "stitch")
+
+        kwargs: Dict[str, object] = {}
+        missing = []
+
+        def take(name, value, label):
+            if value is None:
+                missing.append(label)
+            else:
+                kwargs[name] = value
+
+        take("roi", stitch.get("roi_px"), "stitch roi_px")
+        take("pixel_size", stitch.get("pixel_size_A"), "stitch pixel_size_A")
+        take("binning", stitch.get("binning"), "stitch binning")
+        take("out_bin", aretomo.get("outbin"), "aretomo outbin")
+        # The rotation stitch applied to the tiles it was handed. NOT
+        # `rotate_deg_from_raw_frames`, which is the total from the detector
+        # frame and already includes whatever motion correction did -- the tile
+        # stacks this projector reads are motion correction's output, so the
+        # only rotation still to undo is stitch's own.
+        rot90_k = stitch.get("rot90_k")
+        if rot90_k is None and stitch.get("rotate_deg") is not None:
+            rot90_k = (int(stitch["rotate_deg"]) // 90) % 4
+        take("rotate", None if rot90_k is None else int(rot90_k) * 90,
+             "stitch rotate")
+
+        # Which way the volume's depth axis runs. Recorded by aretomo_record
+        # from -FlipVol and whether `clip rotx` was applied, because it is a
+        # fact about how the file was made and nothing downstream can see it:
+        # a reversed depth axis reprojects perfectly at 0 deg and is wrong by
+        # 2*dz*sin(theta) everywhere else.
+        z_sign = aretomo.get("z_sign")
+        if z_sign is None and "clip_rotx" in aretomo:
+            from .aretomo_record import depth_axis_sign
+
+            z_sign = depth_axis_sign({"flip_vol": aretomo.get("flip_vol")},
+                                     bool(aretomo.get("clip_rotx")))
+            logger.info(
+                "Sidecar predates z_sign; derived %+d from flip_vol=%s, "
+                "clip_rotx=%s.", z_sign, aretomo.get("flip_vol"),
+                aretomo.get("clip_rotx"))
+        take("z_sign", z_sign, "aretomo z_sign")
+
+        if missing:
+            logger.warning(
+                "The provenance chain from %s is missing %s; falling back to "
+                "the built-in default(s) for those. Check them against the "
+                "submission scripts, and consider `montage_backfill` if this "
+                "series predates sidecars.",
+                os.path.basename(tomogram_path), ", ".join(missing),
+            )
+        kwargs.update(overrides)
+        logger.info(
+            "Geometry from sidecars: roi=%s pixel_size=%s binning=%s "
+            "out_bin=%s rotate=%s z_sign=%s",
+            kwargs.get("roi"), kwargs.get("pixel_size"), kwargs.get("binning"),
+            kwargs.get("out_bin"), kwargs.get("rotate"), kwargs.get("z_sign"),
+        )
+
+        # A -Patch tomogram whose local field AreTomo did not actually apply is
+        # reconstructed in the global-only frame, so applying it here would
+        # introduce the very error this is meant to remove. The record knows
+        # which; see aretomo_record.local_applied.
+        if "use_local" not in overrides:
+            applied = aretomo.get("local_alignment_applied")
+            if applied is False and aretomo.get("has_local_alignment"):
+                logger.warning(
+                    "The sidecar says this reconstruction was made with "
+                    "-AlnFile, so AreTomo did not apply the patch field to it. "
+                    "Reprojecting WITHOUT the local correction to match.")
+                kwargs["use_local"] = False
+
+        proj = cls(aln_path=aln_path, positions_dir=positions_dir,
+                   recon_shape=recon_shape, **kwargs)
+        proj._check_against_sidecars(aretomo, stitch)
+        return proj
+
+    def _check_against_sidecars(self, aretomo: dict, stitch: dict) -> None:
+        """Cross-check the reconstructed canvas against what was recorded."""
+        shape = stitch.get("canvas_shape_px")
+        if shape and tuple(int(x) for x in shape) != tuple(self.canvas_shape):
+            logger.error(
+                "Canvas shape disagrees with the stitch sidecar: %s here, %s "
+                "recorded by stitch.", self.canvas_shape, tuple(shape),
+            )
+        recorded = stitch.get("canvas_pixel_size_A")
+        if recorded and abs(recorded - self.geom.canvas_pixel_size) > 1e-3:
+            logger.error(
+                "Canvas pixel size disagrees with the stitch sidecar: %.4f A "
+                "here, %.4f A recorded.", self.geom.canvas_pixel_size, recorded,
+            )
+        raw_size = aretomo.get("raw_size")
+        if raw_size and tuple(raw_size[:2]) != tuple(self.canvas_shape[::-1]):
+            logger.error(
+                "The .aln's RawSize %s is not this canvas %s — the alignment "
+                "may belong to a different stitch.",
+                tuple(raw_size[:2]), tuple(self.canvas_shape[::-1]),
+            )
+
+
 
     # -- rotation detection -------------------------------------------------
 
@@ -322,11 +595,52 @@ class MontageProjector:
             )
         return best
 
+    # -- which slice of which stack -----------------------------------------
+
+    def canvas_slice_index(self, tilt: float) -> int:
+        """
+        z index of ``tilt`` in the stitched canvas stack.
+
+        The canvas stack holds *every* tilt in ascending order, dark frames
+        included -- the same set the .aln indexes with SEC.
+        """
+        return self.all_tilts.index(tilt)
+
+    def aligned_slice_index(self, tilt: float) -> int:
+        """
+        z index of ``tilt`` in AreTomo's aligned tilt series.
+
+        That stack holds only the sections AreTomo *kept*, so its z index is the
+        rank of the section among the surviving ones and not SEC, and not the
+        canvas index either. Confusing the two silently shifts every comparison
+        by one slice past the first dark frame.
+        """
+        surviving = sorted(s.sec for s in self.aln.sections)
+        return surviving.index(self.tilts[tilt].sec.sec)
+
     # -- the chain ----------------------------------------------------------
 
     def theta(self, tilt: float) -> float:
-        """Reprojection angle in radians: the .aln TILT column as written."""
-        return np.deg2rad(self.tilts[tilt].sec.tilt)
+        """
+        Reprojection angle in radians: the .aln TILT column as written, plus
+        ``theta_offset_deg`` (normally zero -- see :meth:`tomo_to_aligned`).
+        """
+        return np.deg2rad(self.tilts[tilt].sec.tilt + self.theta_offset_deg)
+
+    def volume_centre(self) -> Tuple[float, float]:
+        """
+        ``(cx, cz)`` of the reconstruction, in recon voxels: the point the
+        reprojection shear turns about.
+
+        The derived values are the centre of the volume, ``(n-1)/2`` on each
+        axis. That is an assumption about what AreTomo did, not a measurement of
+        it -- in particular ``cz`` assumes the ``-VolZ`` slab was centred on the
+        specimen mid-plane -- and ``z_centre_offset`` / ``x_centre_offset``
+        exist to correct it when the residual fit says otherwise.
+        """
+        nz, ny, nx = self.recon_shape
+        return ((nx - 1) / 2.0 + self.x_centre_offset,
+                (nz - 1) / 2.0 + self.z_centre_offset)
 
     def tomo_to_aligned(self, tilt: float, xyz: np.ndarray) -> np.ndarray:
         """
@@ -337,26 +651,118 @@ class MontageProjector:
         is what sets a particle's defocus relative to the tilt image's nominal
         value. Its sign is the classic tomography handedness ambiguity, so it is
         multiplied by ``handedness`` (+-1) rather than asserted.
+
+        ``col`` and ``depth`` are the two components of ONE orthogonal map of
+        the x-z plane through theta (the standard rotation formula). Flipping
+        the sign of the ``dz`` term in ``col`` alone destroys that -- the
+        determinant becomes cos(2 theta), and at 45 deg ``depth`` comes out
+        identically equal to ``col - cx`` -- so the depth-axis direction
+        enters once, as ``z_sign`` on ``dz``, and the 2x2 below stays
+        length-preserving whatever it is set to.
+
+        This link has exactly three fitted-in-principle parameters -- ``cx``,
+        ``cz`` and ``theta`` -- and each is derived rather than fitted. Test
+        them by measuring the residual against AreTomo's *aligned* stack
+        (``measure_reprojection_residual --frame aligned``), which exercises
+        this method and nothing else, and feed a fitted coefficient back
+        through ``volume_centre``'s offsets or ``theta_offset_deg``. A depth
+        axis pointing the other way shows up in that same fit, as a depth scale
+        factor of -1; the answer to that one is ``z_sign``, not an offset.
         """
         xyz = np.atleast_2d(np.asarray(xyz, dtype=float))
-        nz, ny, nx = self.recon_shape
-        cx, cz = (nx - 1) / 2.0, (nz - 1) / 2.0
+        # Retrieve tomography volume center
+        cx, cz = self.volume_centre()
+        # Retrieve the tilt angles in radians
         th = self.theta(tilt)
+        # calculate cosine and sine
         cos_t, sin_t = np.cos(th), np.sin(th)
-        dx, dz = xyz[:, 0] - cx, xyz[:, 2] - cz
+        # Distance from the centre of the volume. dz is measured along the beam
+        # with z_sign fixing which way that is; see __init__.
+        dx = xyz[:, 0] - cx
+        dz = self.z_sign * (xyz[:, 2] - cz)
+        # Project the 3D coordinates to the frame of the aligned tilt image in
+        # x (column). Textbook sign -- see the class docstring's link-1 note
+        # for why z_sign defaults to -1 rather than the reading below.
         col = cx + dx * cos_t - dz * sin_t
+        # aligned tilt series is along y axis so y coo]rdinate goes through unchanged
         row = xyz[:, 1]
+        # depth is distance along the beam direction, ie. deviation from mean
+        # image defocus. Its overall sign is handedness's job.
         depth = self.handedness * (dx * sin_t + dz * cos_t)
         return np.stack([row, col, depth], axis=1)
 
     def aligned_to_canvas(self, tilt: float, aligned_rc: np.ndarray) -> np.ndarray:
-        """(N, 2) aligned (row, col) -> (N, 2) canvas (row, col)."""
-        M, t = alignment_matrix(
-            self.tilts[tilt].sec, self.canvas_shape, self.conv, self.out_bin
-        )
+        """
+        (N, 2) aligned (row, col) -> (N, 2) canvas (row, col).
+
+        Two terms, and for a ``-Patch`` reconstruction the second is not small.
+
+        The global term inverts :func:`alignment_matrix` as before. The local
+        term is AreTomo's patch field, which its correction kernel applies
+        *between* the rotation and the global shift::
+
+            p_in = centre + v + L(v) + G,   v = R(ROT) (p_out - centre_out)
+
+        (Correct/GCorrPatchShift.cu:117-133). Read in that order the inverse is
+        explicit rather than iterative, because ``v`` is exactly what the purely
+        global inverse already computes: ``v = p_global - centre + shift_rc``,
+        so the local shift is simply *added* to the globally-inverted position.
+        No fixed point, no ambiguity.
+
+        Skipping it is what put a 191 A position-dependent error into the
+        RELION export (job 28886886): the field is a median 12 px and a p90 of
+        32 canvas px on 9-A, it varies within a single tilt, and no global
+        shift can absorb it -- which is precisely why AreTomo measured it.
+        """
+        sec = self.tilts[tilt].sec
+        M, t = alignment_matrix(sec, self.canvas_shape, self.conv, self.out_bin)
         Minv = np.linalg.inv(M)
         aligned_rc = np.atleast_2d(np.asarray(aligned_rc, dtype=float))
-        return (aligned_rc - t) @ Minv.T + self.extra_shift
+        canvas = (aligned_rc - t) @ Minv.T
+        if self.local is not None:
+            centre = np.array(self.canvas_shape, dtype=float) / 2.0
+            # AreTomo's pre-shift, image-centred coordinate, in (row, col).
+            v_rc = canvas - centre + alignment_shift_rc(sec, self.conv)
+            # The field is defined in (x, y); the table is in unbinned canvas
+            # pixels and so is `canvas`, so no rescaling enters here.
+            shift_xy = self.local.shift_at(sec.sec, v_rc[:, ::-1])
+            canvas = canvas + shift_xy[:, ::-1]
+        return canvas + self.extra_shift
+
+    def canvas_to_aligned(self, tilt: float, canvas_rc: np.ndarray) -> np.ndarray:
+        """
+        (N, 2) canvas (row, col) -> (N, 2) aligned (row, col), the inverse of
+        :meth:`aligned_to_canvas`.
+
+        This direction *is* implicit -- ``v + L(v)`` has to be inverted for
+        ``v`` -- so it is solved by fixed-point iteration. ``L`` is a smooth
+        Gaussian blend of tens of pixels over a field of thousands, so the
+        iteration is a strong contraction and converges to well under a tenth
+        of a pixel in a handful of steps; the loop asserts that rather than
+        assuming it.
+        """
+        sec = self.tilts[tilt].sec
+        M, t = alignment_matrix(sec, self.canvas_shape, self.conv, self.out_bin)
+        canvas_rc = np.atleast_2d(np.asarray(canvas_rc, dtype=float)) - self.extra_shift
+        if self.local is not None:
+            centre = np.array(self.canvas_shape, dtype=float) / 2.0
+            shift_rc = alignment_shift_rc(sec, self.conv)
+            q = canvas_rc - centre + shift_rc  # = v + L(v)
+            v = q.copy()
+            for _ in range(_LOCAL_INVERSE_ITERS):
+                shift_xy = self.local.shift_at(sec.sec, v[:, ::-1])
+                new = q - shift_xy[:, ::-1]
+                delta = float(np.abs(new - v).max()) if new.size else 0.0
+                v = new
+                if delta < 1e-3:
+                    break
+            else:
+                logger.warning(
+                    "tilt %+.1f: local-shift inversion still moving by %.2f px "
+                    "after %d iterations.", tilt, delta, _LOCAL_INVERSE_ITERS,
+                )
+            canvas_rc = v + centre - shift_rc
+        return canvas_rc @ M.T + t
 
     def tomo_to_canvas(self, tilt: float, xyz: np.ndarray) -> np.ndarray:
         """(N, 3) reconstruction voxels -> (N, 2) canvas (row, col)."""
@@ -533,6 +939,163 @@ class MontageProjector:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def add_geometry_args(parser) -> None:
+    """
+    Add the canvas-geometry arguments every reprojection tool shares.
+
+    Four tools had four private copies of this block, all with the same
+    hard-coded ROI and pixel size in their defaults. That is four places for a
+    dataset's geometry to be restated and one of them to go stale. The
+    arguments stay, because overriding one for a test is useful, but the
+    provenance sidecars should be the normal route: they read what the steps
+    actually did instead of asking the caller to remember it. They are read
+    automatically -- the tomogram names its own chain -- so there is no flag
+    to remember either; ``--no-sidecars`` opts out.
+    """
+    g = parser.add_argument_group("geometry")
+    g.add_argument("--no-sidecars", dest="sidecars", action="store_false",
+                   default=True,
+                   help="do not read geometry from the tomogram's provenance "
+                        "sidecars. They supply the ROI, pixel size, binning, "
+                        "OutBin, the stitch rotation and z_sign, and say "
+                        "whether the tomogram had the patch alignment applied; "
+                        "without them every one of those falls back to a "
+                        "hard-coded default that belongs to another dataset. "
+                        "Explicitly given values below win either way")
+    g.add_argument("--roi", nargs=4, type=float,
+                   default=[-5500, 12000, -6000, 12000])
+    g.add_argument("--pixel-size", type=float, default=3.426)
+    g.add_argument("--binning", type=int, default=2)
+    g.add_argument("--out-bin", type=int, default=2)
+    g.add_argument("--rotate", default="auto",
+                   help="stitch.py --rotate; 'auto' measures it from index_map, "
+                        "which cannot tell k from k+2 -- prefer the sidecar")
+    g.add_argument("--extra-shift", nargs=2, type=float, default=[0.0, 0.0])
+    g.add_argument("--handedness", type=int, choices=[1, -1], default=1)
+    g.add_argument("--no-local", dest="use_local", action="store_false",
+                   default=True,
+                   help="ignore the .aln's patch alignment. Only correct when "
+                        "the tomogram was reconstructed without one; otherwise "
+                        "it reintroduces the error the patch field removes")
+
+    # Link 1 of the chain. The three offsets are NOT in the sidecars and never
+    # will be: they are corrections to what the reconstruction actually did,
+    # measured by measure_reprojection_residual --frame aligned, which prints
+    # the exact flags to paste here. Leave them at zero until a fit says
+    # otherwise. --z-sign is the opposite kind of thing -- a fact about the
+    # file, which the sidecars do carry -- and is here only to override it.
+    a = parser.add_argument_group("tomogram -> aligned frame")
+    a.add_argument("--z-sign", type=int, choices=[1, -1], default=-1,
+                   help="direction of the volume's Z axis. -1 (default) is an "
+                        "AreTomo volume with exactly one depth flip applied, "
+                        "by `clip rotx` or by -FlipVol -- what every volume "
+                        "this pipeline has made so far needs; +1 is one with "
+                        "both or neither. Normally comes from a sidecar; a "
+                        "fitted depth scale factor of -1 is what says to "
+                        "change it")
+    a.add_argument("--z-centre-offset", type=float, default=0.0,
+                   help="recon voxels added to cz = (nz-1)/2, the depth the "
+                        "shear turns about. Apply the fitted sin(theta) "
+                        "coefficient here, sign included")
+    a.add_argument("--x-centre-offset", type=float, default=0.0,
+                   help="recon voxels added to cx = (nx-1)/2. Apply MINUS the "
+                        "fitted cos(theta)-1 coefficient")
+    a.add_argument("--theta-offset", type=float, default=0.0,
+                   help="degrees added to the .aln TILT column. Apply MINUS the "
+                        "fitted dx sin(theta) coefficient, in degrees")
+
+
+def build_projector(args, recon_shape: Sequence[int], **extra) -> "MontageProjector":
+    """Construct a :class:`MontageProjector` from :func:`add_geometry_args`.
+
+    By default the geometry comes from the tomogram's own provenance sidecars
+    and only the arguments the caller actually typed override it. With
+    ``--no-sidecars`` -- or a tomogram that has none -- this is the old
+    behaviour exactly, defaults and all.
+    """
+    import sys
+
+    rotate = args.rotate if args.rotate == "auto" else int(args.rotate)
+    common = dict(
+        tile_dir=getattr(args, "tile_dir", None),
+        extra_shift=args.extra_shift,
+        handedness=args.handedness,
+        # Corrections to link 1, so they apply with or without sidecars --
+        # sidecars record what the steps did, not where they were wrong.
+        z_centre_offset=getattr(args, "z_centre_offset", 0.0),
+        x_centre_offset=getattr(args, "x_centre_offset", 0.0),
+        theta_offset_deg=getattr(args, "theta_offset", 0.0),
+        **extra,
+    )
+    tomogram = getattr(args, "tomogram", None)
+    if not getattr(args, "sidecars", True) or not tomogram:
+        return MontageProjector(
+            aln_path=args.aln, positions_dir=args.positions_dir,
+            recon_shape=recon_shape, roi=args.roi, pixel_size=args.pixel_size,
+            binning=args.binning, out_bin=args.out_bin, rotate=rotate,
+            use_local=args.use_local, z_sign=getattr(args, "z_sign", -1),
+            **common,
+        )
+
+    # Only forward what was typed. Passing the parser's defaults through as
+    # "overrides" would silently beat the sidecar with the very hard-coded
+    # numbers this is meant to replace -- and `use_local` in particular must
+    # stay absent unless asked for, because from_sidecars turns it off by
+    # itself when the record says the tomogram never had the field applied.
+    typed = " ".join(sys.argv)
+    overrides = {}
+    for flag, name, value in (("--roi", "roi", args.roi),
+                              ("--pixel-size", "pixel_size", args.pixel_size),
+                              ("--binning", "binning", args.binning),
+                              ("--out-bin", "out_bin", args.out_bin)):
+        if flag in typed:
+            overrides[name] = value
+    if "--rotate" in typed:
+        overrides["rotate"] = rotate
+    # Like --rotate, and unlike the link-1 offsets: the sidecar has an opinion
+    # on this one, so passing the parser's default through would beat a
+    # recorded -1 with a hard-coded +1.
+    if "--z-sign" in typed:
+        overrides["z_sign"] = args.z_sign
+    if not args.use_local:
+        overrides["use_local"] = False
+    if overrides:
+        logger.warning("Overriding the sidecars with command-line %s",
+                       ", ".join(sorted(overrides)))
+    return MontageProjector.from_sidecars(
+        tomogram, aln_path=args.aln, positions_dir=args.positions_dir,
+        recon_shape=recon_shape,
+        canvas_path=getattr(args, "canvas_stack", None),
+        **overrides, **common,
+    )
+
+
+def _sidecar_effective(sidecar, path: str, step: str) -> dict:
+    """``effective`` from ``path``'s sidecar, if it is the step we expected.
+
+    Returns an empty dict rather than raising when there is no sidecar, so a
+    series that predates them still runs on the argument defaults -- loudly,
+    via the "missing" warning in :meth:`MontageProjector.from_sidecars`,
+    rather than by silently substituting another dataset's geometry.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    doc = sidecar.read_for(path)
+    if doc is None:
+        return {}
+    if doc.get("step") != step:
+        logger.warning("%s carries a %r sidecar, not %r.",
+                       os.path.basename(path), doc.get("step"), step)
+        return {}
+    if doc.get("reconstructed"):
+        logger.info(
+            "%s's %s sidecar was RECONSTRUCTED by backfill, not written by "
+            "the run itself — its parameters are inferred from surviving "
+            "evidence. Treat a disagreement with the data as the sidecar's "
+            "fault first.", os.path.basename(path), step)
+    return doc.get("effective") or {}
 
 
 def _find_tile_stacks(directory: str) -> Dict[float, str]:

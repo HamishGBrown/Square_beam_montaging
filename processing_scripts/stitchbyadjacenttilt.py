@@ -4,7 +4,6 @@ from scipy.ndimage import affine_transform
 from tqdm import tqdm
 from PIL import Image
 import os
-from scipy.ndimage import binary_fill_holes, binary_erosion
 import sys
 from skimage.registration import phase_cross_correlation
 
@@ -48,13 +47,6 @@ def parse_commandline() -> Dict[str, Any]:
         type=str,
     )
     parser.add_argument(
-        "-g",
-        "--gainref",
-        help="Gain reference, if left blank a new gain reference will be calculated and saved in the output directory. If 'False' no gain reference will be used.",
-        required=False,
-        type=str,
-    )
-    parser.add_argument(
         "-b",
         "--binning",
         help="Binning of input data, defaults to 1",
@@ -84,13 +76,6 @@ def parse_commandline() -> Dict[str, Any]:
         required=False,
     )
     parser.add_argument(
-        "-G",
-        "--gain_corrected_files",
-        help="The program will write the files with the gain correction applied to an mrc. Use this option to re-use already gain corrected files and save time.",
-        type=str,
-        required=False,
-    )
-    parser.add_argument(
         "-M",
         "--maximageshift",
         help="Limit the size of the total montage by excluding images in montage with image shift in microns greater than this value.",
@@ -115,13 +100,6 @@ def parse_commandline() -> Dict[str, Any]:
         required=False,
     )
     parser.add_argument(
-        "-mg",
-        "--Matchgainrefmask",
-        help="If True, a mask will be generated for each tile by cross-correlation alignment of the gain reference mask to each tile. If False, a mask will be generated for each tile.",
-        action="store_true",
-    )
-
-    parser.add_argument(
         "-mt",
         "--maskthreshold",
         help="threshold (as fraction of raw image median) for masking of beam.",
@@ -139,92 +117,9 @@ def parse_commandline() -> Dict[str, Any]:
         required=False,
     )
 
-    parser.add_argument(
-        "-fb",
-        "--flattenbeam",
-        help="If True, the beam will be flattened by subtracting a 2D polynomial fit to the beam.",
-        action="store_true",
-    )
-
     return vars(parser.parse_args())
 
 
-def make_gain_ref(images, shrinkn=20, binning=8, templateindex=0, maxnumber=None, medianthreshold=0.4, absolutethreshold=None):
-    """
-    Generate a gain reference image by averaging a series of input images.
-
-    This function processes a list of images to create a gain reference image.
-    The images are first binned to reduce their size, then aligned using cross-correlation,
-    and finally averaged together to produce the gain reference. The result is normalized
-    by the median value of the template region in the gain reference.
-
-    Parameters:
-    -----------
-    images : list of str
-        A list of file paths to the input images (in MRC format) that will be used to create the gain reference.
-    binning : int, optional
-        The factor by which the images are binned to reduce their size. Default is 8.
-    templateindex: int,optional
-        Which image to align all other images too.
-    maxnumber: int or None
-        Maximum number of frames that will be averaged to produce the gain reference.
-        If None, all available frames will be used.
-    Returns:
-    --------
-    numpy.ndarray
-        The resulting gain reference image, normalized by the median value of the template region.
-    """
-
-    def get_image_and_mask(img):
-        # Perform Fourier interpolation on the image to bin it
-        im = np.asarray(img)
-        im = fourier_interpolate(im, [x // binning for x in img.shape])
-
-        # Create a mask for the image
-        msk = make_mask(im, shrinkn=shrinkn / binning,medianthreshold=medianthreshold,absolutethreshold=absolutethreshold)
-        return im, msk
-
-    # Get target image
-    memmap = mrcfile.mrcmemmap.MrcMemmap(images[0])
-    img = memmap.data[templateindex]
-    im, msk = get_image_and_mask(img)
-    template = np.where(msk, 1, 0)  # Create the binary template mask
-    # Initialize the gain reference with the first image
-    gainref = copy.deepcopy(im)
-
-    # Weight will track the denominator for the averaging step later on
-    weight = np.ones_like(gainref)
-
-    count = 0
-
-    # Loop through each image file
-    for i, image in enumerate(tqdm(images, desc="Averaging images to gain ref")):
-        # Open the MRC file and read the image data
-        memmap = mrcfile.mrcmemmap.MrcMemmap(image)
-
-        for j, img in enumerate(tqdm(memmap.data, leave=False, desc="Frames in mrc")):
-            im, msk = get_image_and_mask(img)
-
-            # skip template image
-            if i == 0 and j == templateindex:
-                continue
-            else:
-                # Align images to the templatex
-                y, x = cross_correlate_alignment(
-                    template, np.where(msk, 1, 0), returncoords=True
-                )
-                gainref += roll_no_periodic(im, (-y, -x), axis=(-2, -1))
-                weight += roll_no_periodic(np.ones_like(im), (-y, -x), axis=(-2, -1))
-                count += 1
-            if maxnumber is not None:
-                if count >= maxnumber:
-                    break
-    gainref /= weight
-    # Normalize the gain reference by the median value of the template region
-    median = np.median(gainref[template == 1])
-    gainref /= median
-
-    return gainref
 
 def stitch(ims,positions,msks,pixel_size,binning=1,montagewidth=None,montageorigin=None,smooth=True,renormalize=False):
     # Determine the global range of tiles in Angstroms
@@ -333,19 +228,14 @@ def montage(
     pixel_size,
     compression_factor,
     binning=8,
-    gainref=None,
-    gainrefmask=None,
     skipcrosscorrelation=False,
     montagewidth=None,
     montageorigin=None,
     tiles=None,
-    gaincorrectedfile=None,
     maxshift=0.05,
     fringe_size=20,
-    Matchgainrefmask=False,
     maskthreshold=0.4,
     maskabsolutethreshold=None,
-    flattenbeam=False,
     tilt_axis=0.0
 ):
     """
@@ -456,81 +346,16 @@ def montage(
     msks = []
 
     ims = []  # List to store the processed images
-    beam_posns = []  # List to store the beam positions
-    if gaincorrectedfile is None:
-        gaincorrectedfile = os.path.join(
-            outdir, os.path.split(image)[1].replace(".mrc", "_gain_corrected.mrc")
-        )
-        if gainref is not None:
-            desc = "Applying gain reference"
-            # y0, x0 = center_of_mass(gainref)
-        else:
-            desc = "Generating masks"
-        if flattenbeam:
-            beam_rotation = determine_square_beam_angle(mrcmemmap.data[M][0])
-            print(beam_rotation)
-        for position, img in tqdm(
-            zip(positions[M], mrcmemmap.data[M]),
-            total=len(positions[M]),
-            desc=desc,
-        ):
-            # Load image from memory map and convert to numpy array
-            im = copy.deepcopy(np.asarray(img))
-            # Fourier interpolate if reqeusted
-            if binning > 1:
-                im = fourier_interpolate(im, [x // binning for x in im.shape])
-
-            if Matchgainrefmask:
-                # Align beam in image tile to gain reference
-                y, x = cross_correlate_alignment(im, gainref, returncoords=True)
-                msks.append(roll_no_periodic(gainrefmask, (-y, -x), axis=(-2, -1)))
-
-                # Apply aligned gain reference
-                im[msks[-1]] /= np.roll(gainref, (-y, -x), axis=(-2, -1))[msks[-1]]
-                im = np.where(msks[-1], im, 0)
-                beam_posns.append([x, y])
-            else:
-                # Generate a mask if none is provided
-                msks.append(make_mask(im, shrinkn=fringe_size / binning,medianthreshold=maskthreshold,absolutethreshold=maskabsolutethreshold))
-                
-                if gainref is not None:
-                    y, x = cross_correlate_alignment(
-                        msks[-1], gainrefmask, returncoords=True
-                    )
-                    # QUICKFIX try using gainref ask mask since generating a mask for each tile
-                    # is problematic
-                    coords = [-y, -x]
-                    msk = roll_no_periodic(gainrefmask, coords, axis=(-2, -1))
-                    msks[-1] = msk
-                    im[msk] = im[msk]/np.roll(gainref, coords, axis=(-2, -1))[msk]
-                    im = np.where(msk, im, 0)
-
-                    beam_posns.append([x, y])
-            if flattenbeam:
-                # Flatten the beam by subtracting a 2D polynomial fit
-                # from the image
-                # fig,ax = plt.subplots(ncols=2)
-                # ax[0].imshow(im,cmap='gist_gray')
-                
-                im = flatten_beam(im,msks[-1],rotation=beam_rotation)
-                # ax[1].imshow(im,cmap='gist_gray')
-                # plt.show(block=True)
-            ims.append(im)
-
-        # print("Saving gain corrected images to {0}".format(gaincorrectedfile))
-        # savetomrc(np.asarray(ims, dtype="float32"), gaincorrectedfile)
-    else:
-        print("Loading gain corrected images from {0}".format(gaincorrectedfile))
-        ims = mrcfile.mrcmemmap.MrcMemmap(gaincorrectedfile).data  # [M]
-
-        # Check that binning of already gain corrected images is the same as requested
-        if np.any(ims.shape[-2:] != pixels):
-            raise ValueError(
-                "Binning of gain corrected images given in command line does not match requested binning"
-            )
-
-        for im in ims:
-            msks.append(make_mask(im, shrinkn=fringe_size / binning,medianthreshold=maskthreshold,absolutethreshold=maskabsolutethreshold))
+    for position, img in tqdm(
+        zip(positions[M], mrcmemmap.data[M]),
+        total=len(positions[M]),
+        desc="Generating masks",
+    ):
+        im = copy.deepcopy(np.asarray(img))
+        if binning > 1:
+            im = fourier_interpolate(im, [x // binning for x in im.shape])
+        msks.append(make_mask(im, shrinkn=fringe_size / binning, medianthreshold=maskthreshold, absolutethreshold=maskabsolutethreshold))
+        ims.append(im)
 
     positionfile = os.path.join(
         outdir, os.path.split(image)[1].replace(".mrc", "_refined_positions.h5")
@@ -1418,39 +1243,6 @@ def setup_outputdir(args):
     return outputdir
 
 
-def setup_gainreference(gainreffile, filenames, outputdir, shrinkn=20, medianthreshold=0.4,maskabsolutethreshold=None):
-    """
-    Sets up the gain reference for image processing.
-
-    Parameters:
-    gainreffile (str): Path to the gain reference file.
-    filenames (list of str): List of filenames to use for generating the gain reference if it does not exist.
-    outputdir (str): Directory where the generated gain reference file will be saved.
-    shrinkn (int, optional): Size of fringes for removal in unbinned pixels. Default is 20.
-
-    Returns:
-    tuple: A tuple containing:
-        - gainref (numpy.ndarray): The gain reference array.
-        - gainrefmask (numpy.ndarray): The mask of the gain reference after filling holes and applying binary erosion.
-    """
-    if os.path.exists(gainreffile):
-        with mrcfile.open(gainreffile, "r+") as m:
-            gainref = np.asarray(m.data)
-    else:
-        gainref = make_gain_ref(filenames, binning=4, shrinkn=shrinkn, medianthreshold=medianthreshold,absolutethreshold=maskabsolutethreshold)
-        gainreffile_ = os.path.join(outputdir, "gain.mrc")
-        print("Saving generated Gain reference as {0}".format(gainreffile_))
-        savetomrc(gainref.astype(np.float32), gainreffile_)
-
-    # Create a mask of the gain reference, filling holes and using binary
-    # erosion to remove the fringes
-    gainrefmask = binary_fill_holes(gainref > 0.4 * np.median(gainref))
-    gainrefmask = binary_erosion(
-        gainrefmask, structure=circular_mask([shrinkn] * 2, radius=shrinkn)
-    )
-
-    return gainref, gainrefmask
-
 
 def plot_positions(coordinates, fnam=None, fig=None, color="blue"):
     # Extract X and Y coordinates
@@ -1613,63 +1405,6 @@ def main():
     globalorigin = np.amin(reshapedimshifts[mask], axis=0)
 
     fringe_size = args["fringe_size"]
-    skipgainref = args["gainref"] == "False"
-
-    if not skipgainref:
-        # Load gain ref if available make a new one if not
-        checkforgainref = args["gainref"] is not None
-
-        if checkforgainref:
-            if os.path.exists(args["gainref"]):
-                print("Loading gain reference {0}".format(args["gainref"]))
-                with mrcfile.open(args["gainref"], "r+") as m:
-                    gainref = np.asarray(m.data)
-                # Check gain reference data size mismatch and interpolate if necessary
-                imageshape = (
-                    np.asarray(mrcfile.mmap(files[0]).data.shape[1:]) // binning
-                )
-                gainrefshape = np.asarray(gainref.shape)
-                if np.any(gainrefshape != imageshape):
-                    print(
-                        "Interpolating gain reference (original {0} x {1} ) to match binned image size ({2} x {3})".format(
-                            *gainrefshape, *imageshape
-                        )
-                    )
-                    gainref = fourier_interpolate(gainref, imageshape)
-                    gainrefmask = make_mask(gainref, shrinkn=fringe_size / binning,medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
-
-                    gainref /= np.median(gainref[gainrefmask])
-                    Image.fromarray(gainref).save(
-                        os.path.join(outdir, "binned_gainref.tif")
-                    )
-                    # gainref = np.where(gainrefmask, gainref, 1)
-            else:
-                print(
-                    "Gain reference file {0} not found so making new one".format(
-                        args["gainref"]
-                    )
-                )
-                checkforgainref = False
-        if not checkforgainref:
-            gainref = make_gain_ref(files, binning=binning, shrinkn=fringe_size, medianthreshold=args['maskthreshold'],absolutethreshold=args['maskabsolutethreshold'])
-            gainreffile = os.path.join(outdir, "gainref.mrc")
-            print("Saving gain reference to {0}".format(gainreffile))
-            savetomrc(gainref.astype(np.float32), gainreffile)
-
-        # make gain reference mask
-        gainrefmask = binary_fill_holes(gainref > 0.7 * np.median(gainref))
-
-        # Remove Fresnel fringes from gain reference mask
-        gainrefmask = binary_erosion(
-            gainrefmask,
-            structure=circular_mask(
-                [fringe_size / binning] * 2, radius=fringe_size / binning
-            ),
-        )
-        gainref = np.where(gainrefmask, gainref, 1)
-    else:
-        gainref = None
-        gainrefmask = None
 
     for i, (file, tilt) in enumerate(
         tqdm(zip(files, tilts), total=len(files), desc="Stitching montages")

@@ -1051,12 +1051,31 @@ def _plot_plasmon_correction(tile, I_expected, corrected, mask,
     plt.show()
 
 
+def align_beam_reference(tile, ref_beam, template_edges=None):
+    """Integer (dy, dx) shift that aligns ref_beam to the beam in ``tile``.
+
+    Uses the same edge cross-correlation as make_mask, so a tile's mask and its
+    plasmon correction share one registration. The result is data-dependent:
+    the same tile at a different dose (an even/odd half-stack, say) can land a
+    pixel or two away, so callers that need a bit-for-bit reproducible
+    correction should compute this once and feed it back to
+    :func:`plasmon_beam_correction` via ``beam_shift``.
+    """
+    smoothed = convolve(tile.astype(float), Gaussian(3, tile.shape))
+    image_edges = np.hypot(sobel(renormalize(smoothed), axis=0),
+                           sobel(renormalize(smoothed), axis=1))
+    if template_edges is None:
+        smooth_ref = convolve(ref_beam.astype(float), Gaussian(3, ref_beam.shape))
+        template_edges = np.hypot(sobel(smooth_ref, axis=0), sobel(smooth_ref, axis=1))
+    return cross_correlate_alignment(image_edges, template_edges, returncoords=True)
+
+
 def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
                              template_edges=None, E_plasmon_eV=21.0, voltage_kV=300.0,
                              n_avg_method='grid', downsample=64,
                              n_range=(0.0, 25.0), q_E_range=(0.003, 0.08),
                              n_hint=None, q_E_hint=None,
-                             n_fixed=None, q_E_fixed=None):
+                             n_fixed=None, q_E_fixed=None, beam_shift=None):
     """
     Correct beam edge darkening due to inelastic (plasmon) scattering.
 
@@ -1114,6 +1133,11 @@ def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
     q_E_range : (float, float)
         Search bounds for q_E in cycles nm⁻¹ used by the 'grid' method.
         Default (0.003, 0.08), covering E_plasmon ≈ 3–80 eV at 300 kV.
+    beam_shift : (int, int) or None
+        Pre-computed (dy, dx) alignment of ref_beam to this tile, as returned
+        by :func:`align_beam_reference`.  When None it is measured from the
+        tile, which makes the correction depend on the tile's noise; pass a
+        stored value to reproduce an earlier run's correction exactly.
 
     Returns
     -------
@@ -1122,13 +1146,9 @@ def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
     """
     # Align ref_beam to the beam position in this tile via edge cross-correlation,
     # matching the approach used in make_mask so both share the same registration.
-    smoothed = convolve(tile.astype(float), Gaussian(3, tile.shape))
-    image_edges = np.hypot(sobel(renormalize(smoothed), axis=0),
-                           sobel(renormalize(smoothed), axis=1))
-    if template_edges is None:
-        smooth_ref = convolve(ref_beam.astype(float), Gaussian(3, ref_beam.shape))
-        template_edges = np.hypot(sobel(smooth_ref, axis=0), sobel(smooth_ref, axis=1))
-    dy, dx = cross_correlate_alignment(image_edges, template_edges, returncoords=True)
+    if beam_shift is None:
+        beam_shift = align_beam_reference(tile, ref_beam, template_edges)
+    dy, dx = (int(beam_shift[0]), int(beam_shift[1]))
     ref_beam = roll_no_periodic(ref_beam.astype(float), (-dy, -dx), axis=(0, 1))
 
     #plot_plasmon_sweep(tile, ref_beam, mask, pixel_size_nm,
@@ -1153,8 +1173,8 @@ def plasmon_beam_correction(tile, ref_beam, mask, pixel_size_nm,
             n_range=n_range, q_E_range=q_E_range, downsample=downsample,
             n_hint=n_hint, q_E_hint=q_E_hint,
         )
-        print(f"Grid fit: n_avg={n_avg:.3f}  q_E={q_E:.5f} cyc/nm  "
-              f"(E_eff≈{q_E * hc * np.sqrt(beta2):.1f} eV)")
+        # print(f"Grid fit: n_avg={n_avg:.3f}  q_E={q_E:.5f} cyc/nm  "
+        #       f"(E_eff≈{q_E * hc * np.sqrt(beta2):.1f} eV)")
         if q_E < q_E_phys / 5:
             warnings.warn(
                 f"Fitted q_E ({q_E:.5f} cyc/nm, E_eff≈{q_E * hc * np.sqrt(beta2):.2f} eV) "
@@ -1348,7 +1368,7 @@ def iterative_edge_smoothing(array, mask, niterations=5, pow=4, initial_radius=N
 
 def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
               absolutethreshold=None, template_mask=None, template_edges=None,
-              bin_factor=8):
+              bin_factor=1, erosion_method="binary_erosion"):
     """
     Generate a binary mask from an image by applying a Gaussian filter, filling holes,
     and then shrinking the mask with morphological erosion.
@@ -1362,8 +1382,7 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
     im : numpy.ndarray
         Input 2D image array.
     shrinkn : int, optional
-        Factor determining the size of the structuring element for shrinking the mask.
-        Default is 20.
+        Number of pixels to shrink the mask boundary inward by. Default is 20.
     smoothing_kernel : float, optional
         Sigma of the Gaussian smoothing kernel before applying the mask (3 by default).
     medianthreshold : float, optional
@@ -1375,6 +1394,18 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
         the (smoothed) image and of the template boundary are cross-correlated to locate
         the beam, and the template is shifted to that position. The result is insensitive
         to bright/dark sample regions inside the beam.
+    erosion_method : {"binary_erosion", "distance_transform"}, optional
+        Only used by the fallback (no ``template_mask``) path -- the template
+        path always uses ``binary_erosion``. ``"binary_erosion"`` (default)
+        erodes with a disk structuring element of radius ``shrinkn``; this is
+        the historical approach and removes exactly ``shrinkn`` pixels of
+        boundary. ``"distance_transform"`` approximates the same disk erosion
+        via ``distance_transform_edt(mask) >= shrinkn`` instead, which is O(N)
+        rather than O(N * shrinkn**2) and so is faster for large ``shrinkn``
+        on full-resolution images; it removes ``shrinkn - 1`` pixels (an
+        off-by-one at the exact boundary from the ``>=`` vs strict-disk
+        comparison), which is immaterial at the scale ``shrinkn`` is used at
+        here.
 
     Returns:
     --------
@@ -1406,19 +1437,35 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
         mask = roll_no_periodic(template_mask, (-dy, -dx), axis=(0, 1))
 
 
-        # Optionally erode to keep away from the beam edge
+        # Optionally erode to keep away from the beam edge. radius=shrinkn
+        # (not shrinkn/2) to match the fallback threshold path below --
+        # otherwise the same shrinkn value shrinks half as much here as it
+        # does there, which is exactly the mismatch that made Choose_fringe_
+        # size.py (always the fallback path) and stitch.py --referencebeam
+        # (always this path) disagree on what a given fringe size does.
         if shrinkn > 0:
-            struct_elem = circular_mask([shrinkn * 2, shrinkn * 2], radius=shrinkn / 2)
+            struct_elem = circular_mask([shrinkn * 2 + 1] * 2, radius=shrinkn)
             mask = binary_erosion(mask, structure=struct_elem)
 
         return mask
 
     # --- Fallback: fast threshold-based approach ---
-    # Step 1: Downsample — all heavy ops run at 1/bin_factor resolution
+    # Step 1: Downsample — only the Gaussian smoothing runs at 1/bin_factor
+    # resolution, since that's the expensive step. Everything downstream
+    # (threshold, fill, erode) runs at full resolution so the mask boundary
+    # lands at full-image accuracy rather than being quantized to
+    # bin_factor-sized blocks.
     im_work = im[::bin_factor, ::bin_factor] if bin_factor > 1 else im
 
     # Step 2: Separable Gaussian smooth (replaces full-image FFT convolution)
     smoothed_im = gaussian_filter(im_work.astype(np.float32), sigma=smoothing_kernel)
+
+    # Step 2b: Upsample the smoothed intensity field (not yet a binary mask)
+    # back to full resolution. Interpolating the continuous field preserves
+    # the true edge position; interpolating an already-binarized mask cannot
+    # recover position lost to the downsample.
+    if bin_factor > 1:
+        smoothed_im = fourier_interpolate(smoothed_im, im.shape)
 
     # Step 3: Threshold
     if absolutethreshold is not None:
@@ -1429,15 +1476,19 @@ def make_mask(im, shrinkn=20, smoothing_kernel=3, medianthreshold=0.4,
     # Step 4: Fill holes
     mask = binary_fill_holes(mask)
 
-    # Step 5: Erode via distance transform — O(N) regardless of radius,
-    #         vs O(N * k^2) for binary_erosion with a large structuring element
+    # Step 5: Shrink the mask boundary inward by shrinkn pixels.
     if shrinkn > 0:
-        mask = distance_transform_edt(mask) >= (shrinkn / bin_factor)
-
-    # Step 6: Upsample back to original resolution (nearest-neighbour)
-    if bin_factor > 1:
-        mask = np.repeat(np.repeat(mask, bin_factor, axis=0), bin_factor, axis=1)
-        mask = mask[:im.shape[0], :im.shape[1]]
+        if erosion_method == "binary_erosion":
+            struct_elem = circular_mask(
+                [shrinkn * 2 + 1] * 2, radius=shrinkn
+            )
+            mask = binary_erosion(mask, structure=struct_elem)
+        elif erosion_method == "distance_transform":
+            # O(N) regardless of radius, vs O(N * shrinkn**2) for
+            # binary_erosion with a large structuring element.
+            mask = distance_transform_edt(mask) >= shrinkn
+        else:
+            raise ValueError(f"Unknown erosion_method: {erosion_method!r}")
 
     return mask.astype(bool)
 
@@ -1791,7 +1842,7 @@ def cross_correlate_tiles(
     # from cross-correlation linking them to the other tiles,
     # in this case default to using the original
     # shifts implied by the microscope image shifts if groups of tiles
-    # TODO use RANSAC algorithm to find the best fit
+    
     if not nx.is_connected(G):
         # if False:
         extraA = []

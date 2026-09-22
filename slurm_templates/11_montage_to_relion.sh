@@ -2,11 +2,12 @@
 #SBATCH --job-name=montage2relion
 #SBATCH --output=/home/hgbrown/logs/montage2relion_%A.out
 #SBATCH --error=/home/hgbrown/logs/montage2relion_%A.out
-#SBATCH -p sapphire
+#SBATCH -p cascade,sapphire
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
+# set -x
 #
 # Turn 3D picks made in a montage tomogram into a RELION-5 tomogram +
 # particle set, one "tilt image" per (tilt, tile).
@@ -18,14 +19,51 @@
 # ── edit these ────────────────────────────────────────────────────────────────
 BASE=/home/hgbrown/20240917_Montage_stitching/20260713Yeastattempt2
 
-PICKS="${BASE}/AreTomo_motioncorr/Ribosomes.txt"
-PICKS="${BASE}/AreTomo_motioncorr/Points_for_reproject_check.txt"
+# The picks, as the IMOD model straight out of 3dmod. It is converted to the
+# text form every stage reads by model2point below, so the model stays the
+# master copy and there is no hand-made .txt to go stale against it. A .txt
+# here still works and is passed through untouched.
+PICKS="${BASE}/AreTomo_motioncorr/Ribosomes.mod"
+PICKS="${BASE}/AreTomo_motioncorr/Points_for_reprojection_check.mod"
+
+# TOMOGRAM AND ALN MUST BE THE SAME RUN.
+#
+# The picks are 3D coordinates in one specific volume, and the .aln is the only
+# description of where that volume sits. Pairing a volume with a different run's
+# alignment is not a small error: the local (patch) field differs between runs,
+# so the reprojection is wrong by the whole field, position-dependently, which
+# is precisely what cost the 191 A of job 28886886.
+#
+# Two consistent pairs exist here. The -Patch 5 3 one is the volume these check
+# points were picked in (2026-08-07), so it is the pair to verify against; the
+# archived .aln is the alignment that run solved, kept when 03_AreTomo_motioncorr
+# installed the newer one.
+#   -Patch 5 3   recon_patch53mask_bin2.mrc    Montage_9-A_inpainted_20260805-1627.aln
+#   -Patch 10 6  recon_patch10x6mask_bin2.mrc  Montage_9-A_inpainted.aln
+# Switching to the 10x6 volume means re-picking in it first.
 TOMOGRAM="${BASE}/AreTomo_motioncorr/recon_patch53mask_bin2.mrc"
-ALN="${BASE}/AreTomo_motioncorr/Montage_9-A_inpainted.aln"
+ALN="${BASE}/AreTomo_motioncorr/Montage_9-A_inpainted_20260805-1627.aln"
+
 POSITIONS_DIR="${BASE}/stitched_motioncorr"
 TILE_DIR="${BASE}/motion_corrected"
 CTF_RESULTS="${TILE_DIR}/ctf_results.txt"
 CTF_BASE="Montage_9-A_9-A"
+
+# Geometry now comes from the provenance sidecars written beside each output,
+# read automatically by walking back from TOMOGRAM: its own sidecar names the
+# stack it was reconstructed from, that stack's sidecar carries the ROI, tile
+# pixel size, stitch binning and -- the one that used to be guessed -- the
+# rotation stitch actually applied. Nothing downstream restates 02_stitch.sh
+# from memory and there is no path to configure.
+#
+# That anchoring is also what enforces the warning above: TOMOGRAM's sidecar
+# names ITS aln and ITS input, so a -Patch 5 3 volume can no longer be paired
+# with a -Patch 10 6 run's geometry by editing one variable and not the other.
+#
+# For a series processed before sidecars existed, reconstruct them once:
+#   montage_backfill ${BASE}
+# and pass --set for anything only the submission scripts know. Add
+# --no-sidecars below to ignore them and use the hard-coded defaults instead.
 
 ALIGNED_STACK="${BASE}/AreTomo_motioncorr/recon_patch53mask_bin2tiltseries.mrc"
 CANVAS_STACK="${POSITIONS_DIR}/Montage_9-A.mrc"
@@ -48,6 +86,11 @@ TILT_ARGS="--tilt -57 --tilt -24 --tilt 0 --tilt 24 --tilt 60"
 # STAGE="${STAGE:-1}"
 # ── end of edit section ───────────────────────────────────────────────────────
 
+# Passed to every stage. Empty by default: the sidecars supply the geometry,
+# and anything set here OVERRIDES them, which is occasionally what you want
+# for a test and never what you want by accident.
+GEOM_ARGS=""
+
 # NOTE: the `Stitch` conda env is currently broken -- ~/.conda/envs/Stitch has
 # only conda-meta/ and etc/, no bin/, so `conda activate Stitch` yields no
 # python. That breaks 02_stitch.sh and 03_inpaint_apply.sh too and wants
@@ -67,6 +110,39 @@ export MPLBACKEND=Agg
 unset DISPLAY
 
 mkdir -p "${OVERLAY_DIR}" "${OUT_DIR}"
+
+# Picks: .mod -> .txt, once, before any stage runs.
+#
+# -float because load_picks() takes fractional coordinates and the default
+# integer rounding would throw away up to half a voxel (~7 A at bin 2). No
+# -object/-contour (the loader wants three columns; it would take the last
+# three anyway) and no -zcoord, which shifts Z by -0.5. That combination was
+# checked to reproduce the hand-made Ribosomes.txt exactly. IMOD 4.11 prints
+# "the -float entry is no longer needed" -- it is float by default there; the
+# flag is kept for whichever IMOD sbgrid supplies.
+#
+# The output is named for the tool that made it so it cannot be confused with,
+# or overwrite, a .txt written by hand from an older version of the model.
+if [ "${PICKS##*.}" = "mod" ]; then
+    PICKS_MOD="${PICKS}"
+    PICKS="${PICKS_MOD%.mod}_model2point.txt"
+    if ! command -v model2point >/dev/null 2>&1; then
+        # IMOD is on PATH interactively (~/Software/IMOD). A batch job that
+        # inherited a thinner environment gets it from sbgrid instead; see the
+        # stage 3 note for why the source is wrapped in `set +e`. PY is already
+        # an absolute path, so sbgrid's python 2.7.2 landing in front of
+        # everything does not matter here.
+        set +e
+        source /programs/sbgrid.shrc
+        set -e
+    fi
+    if ! command -v model2point >/dev/null 2>&1; then
+        echo "model2point not on PATH; cannot convert ${PICKS_MOD}" >&2
+        exit 1
+    fi
+    model2point -float "${PICKS_MOD}" "${PICKS}"
+    echo "picks: ${PICKS_MOD} -> ${PICKS}  ($(wc -l < "${PICKS}") points)"
+fi
 
 if [ "${STAGE}" = "1" ]; then
     # Stage 1: does the chain land the picks on density?
@@ -89,6 +165,7 @@ if [ "${STAGE}" = "1" ]; then
         --canvas-stack   "${CANVAS_STACK}" \
         --mode all \
         --box  ${BOX} \
+        ${GEOM_ARGS} \
         -o     "${OVERLAY_DIR}"
 elif [ "${STAGE}" = "3" ]; then
     # Stage 3: IMOD models, to check the chain against the images in 3dmod.
@@ -122,6 +199,7 @@ elif [ "${STAGE}" = "3" ]; then
         --box               ${BOX} \
         --mode both \
         ${TILT_ARGS} \
+        ${GEOM_ARGS} \
         -o "${OVERLAY_DIR}"
 elif [ "${STAGE}" = "4" ]; then
     # Stage 4: measure the reprojection residual and fit it.
@@ -135,14 +213,31 @@ elif [ "${STAGE}" = "4" ]; then
     #
     # Use picks on obvious high-contrast features; ribosomes are too small and
     # too crowded to cross-correlate one at a time.
-    ${PY} -m processing_scripts.measure_reprojection_residual \
-        --picks          "${PICKS}" \
-        --tomogram       "${TOMOGRAM}" \
-        --aln            "${ALN}" \
-        --positions-dir  "${POSITIONS_DIR}" \
-        --tile-dir       "${TILE_DIR}" \
-        --canvas-stack   "${CANVAS_STACK}" \
-        -o "${OVERLAY_DIR}"
+    # Run it BOTH ways, in one job, so the comparison is like-for-like.
+    #
+    # `nolocal` reproduces the old behaviour: global ROT/TX/TY only, ignoring
+    # the .aln's patch table. That is the configuration that measured 14.0
+    # voxels rms = 191 A perpendicular in job 28886886, so it is the control.
+    # `local` applies AreTomo's patch field the way the reconstruction did.
+    # If the diagnosis is right the perpendicular residual falls in `local`
+    # and `nolocal` reproduces ~191 A; if both are unchanged, the patch field
+    # was not the cause and the sin(theta) z-centre term is next.
+    for mode in nolocal local; do
+        extra=""
+        [ "${mode}" = "nolocal" ] && extra="--no-local"
+        echo
+        echo "──────── reprojection residual: ${mode} ────────"
+        mkdir -p "${OVERLAY_DIR}/residual_${mode}"
+        ${PY} -m processing_scripts.measure_reprojection_residual \
+            --picks          "${PICKS}" \
+            --tomogram       "${TOMOGRAM}" \
+            --aln            "${ALN}" \
+            --positions-dir  "${POSITIONS_DIR}" \
+            --tile-dir       "${TILE_DIR}" \
+            --canvas-stack   "${CANVAS_STACK}" \
+            ${GEOM_ARGS} ${extra} \
+            -o "${OVERLAY_DIR}/residual_${mode}"
+    done
 else
     # Stage 2: write the star files.
     #
@@ -163,6 +258,7 @@ else
         --dose-per-tilt  ${DOSE_PER_TILT} \
         --extra-shift    0 0 \
         --handedness     1 \
+        ${GEOM_ARGS} \
         -o "${OUT_DIR}"
 
     echo

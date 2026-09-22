@@ -15,7 +15,7 @@ The full pipeline for montage tomography is:
 1. **Acquisition** — collect montage tilt series in SerialEM
 2. **Motion correction** — align raw frames per tile (`beam_mask_motioncorr`)
 3. **Stitching** — assemble tiles into full montage tilt series (`stitch_square_beam`)
-4. **Masking & inpainting** — isolate lamella signal and fill background (`mask_and_inpaint`)
+4. **Masking & inpainting** — [optional and only if necessary] isolate lamella signal and fill background (`mask_and_inpaint`)
 5. **Reconstruction** — tomogram reconstruction in IMOD or AreTomo2/3
 
 # Step 1: Collect in SerialEM
@@ -23,7 +23,7 @@ The full pipeline for montage tomography is:
 Full details are in `Montage tomography SOP.docx`. In brief:
 
 1. In low-dose mode, acquire Navigator maps of your lamellae using the View preset. Avoid low mag due to image shifts between magnifications.
-2. Away from any area of interest, run the DeterminOverlapFraction.txt to work out optimal beam overlap (aim for 10% in each direction), copy the values for beam rotation and overlap into the setupPolygonMontage.txt script.
+2. On an adjacent vacuum area, run the DeterminOverlapFraction.txt to work out optimal beam overlap (aim for max 10% in each direction), copy the values for beam rotation and overlap into the setupPolygonMontage.txt script.
 2. Draw navigator polygons around each of the items to acquire.
 3. Using the SerialEM "Acquire at items" feature, acquire viewmag images of each of the items of interest, tick the box to make navigator maps and set  the "SetupPolygonMontage.txt" script to run after each acquisition. Check that 'Imageshift*.txt" files have been generated for each navigator item.
 3. Set each of the new view image maps to acquire and run `acquire_montage.txt` at those points using the SerialEM "Acquire at items" feature.
@@ -55,7 +55,7 @@ Key arguments:
 - `--save-diagnostic` — save a PNG showing the detected beam mask and crop region for each tile
 - `--split-frames` — also write odd/even frame sums to `output-dir/odd/` and `output-dir/even/` for cryoCARE denoising
 
-For large datasets, generate and submit a SLURM array job:
+If you have access to an HPC, for large datasets, generate and submit a SLURM array job:
 
 ```
 beam_mask_motioncorr --input "/data/frames/*.tif" --output-dir ./motioncorr \
@@ -80,14 +80,14 @@ stitch_square_beam \
 Key arguments:
 - `-i` — directory of per-tile MRCs from `beam_mask_motioncorr`, or a glob of per-tilt MRC stacks
 - `-I` — image shifts file from `generate_image_shifts`
-- `-o` — output directory
+- `-o` — output directory (for individual tiff output) or single mrc file for direct stack output
 - `-g` — gain reference (omit to skip gain correction, e.g. if already applied during motion correction)
 - `-s` — skip cross-correlation refinement of tile positions and use image shifts directly
 - `--mark-uncovered` — mark regions with no tile coverage with pixel value −1 rather than inpainting them; **recommended** when the output will be processed by `mask_and_inpaint`, which detects this sentinel automatically
 - `-nt` — number of threads for parallel stitching
-- `--correct-beam-edges` — correct plasmon-scattering darkening at beam edges (requires `--templatemask`)
+- `--correct-beam-edges` — correct plasmon-scattering darkening at beam edges (requires `--referencebeam`)
 
-Then join all the per-tilt stitched images into a single MRC tilt series for reconstruction:
+(If necessary), join all the per-tilt stitched images into a single MRC tilt series for reconstruction:
 
 ```
 crop_to_smallest_common_size -i ./stitched -o ./stitched_stack
@@ -126,7 +126,7 @@ The inpainted tilt series `Montage_inpainted.mrc` is ready for standard tomograp
 
 **IMOD:** Import into etomo or use `tilt` directly after alignment with `tiltalign`. The montage tilt series is large so consider binning during reconstruction.
 
-**AreTomo2/3:** Use AreTomo3 for alignment (produces a `.aln` file) then AreTomo2 to apply the alignment and reconstruct. Because the montage tilt series is too large for a single GPU reconstruction, split the aligned tilt stack into horizontal strips and reconstruct each independently — the tilt axis will be along Y after alignment so each strip is self-contained.
+**AreTomo2/3:** Consider using memory efficient implementation of [`AreTomo2`](https://github.com/HamishGBrown/MaskedMemoryEfficientAreTomo), this streams reconstructions to disk rather than storing the whole array in memory.
 
 SLURM submission script templates for each step of the pipeline are provided in [`slurm_templates/`](slurm_templates/). Edit the `EDIT_ME` placeholders at the top of each script for your paths and parameters:
 
@@ -135,5 +135,4 @@ SLURM submission script templates for each step of the pipeline are provided in 
 | `01_motion_correction.sh` | Array job: motion-correct one TIFF per task |
 | `02_stitch.sh` | Stitch tiles into a tilt series MRC stack |
 | `03_inpaint_apply.sh` | Apply inpainting params (generated by `mask_and_inpaint` GUI) |
-| `04_aretomo3_aln_aretomo2_ali.sh` | AreTomo3 alignment + AreTomo2 aligned stack |
-| `05_aretomo2_strip_recon.sh` | Array job: reconstruct one horizontal strip per task |
+| `04_AreTomo.sh` | AreTomo2 reconstruction |

@@ -2,7 +2,7 @@
 #SBATCH --job-name=inpaint
 #SBATCH --output=logs/inpaint_%j.out
 #SBATCH --error=logs/inpaint_%j.err
-#SBATCH -p cpu
+#SBATCH -p cascade,sapphire
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
 #SBATCH --cpus-per-task=16
@@ -20,7 +20,9 @@
 INPUT="EDIT_ME"               # stitched MRC tilt series (output of 02_stitch)
 OUTPUT="EDIT_ME"              # output path for inpainted MRC
 PARAMS="EDIT_ME"              # per-tilt (lo, hi) JSON written by mask_and_inpaint GUI
-N_CPUS=16                     # match --cpus-per-task above
+N_TOTAL=16                    # total thread budget (match --cpus-per-task above)
+NPERTILT=4                    # DCT threads per tilt; N_TOTAL // NPERTILT tilts run concurrently
+BIN=2                         # downsample factor for the smoothn fit (1 disables binning)
 # ── end of edit section ───────────────────────────────────────────────────────
 
 source /programs/sbgrid.shrc
@@ -28,9 +30,11 @@ source /programs/sbgrid.shrc
 mkdir -p logs
 
 inpaint_apply \
-    --input  "${INPUT}" \
-    --output "${OUTPUT}" \
-    --params "${PARAMS}" \
-    --cpus   ${N_CPUS}
+    --input    "${INPUT}" \
+    --output   "${OUTPUT}" \
+    --params   "${PARAMS}" \
+    --ntotal   ${N_TOTAL} \
+    --npertilt ${NPERTILT} \
+    --bin      ${BIN}
 
 my-job-stats -a -n -s

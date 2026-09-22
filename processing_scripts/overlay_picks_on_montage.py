@@ -57,7 +57,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import mrcfile  # noqa: E402
 import numpy as np  # noqa: E402
 
-from .montage_projection import MontageProjector, load_picks  # noqa: E402
+from .montage_projection import (  # noqa: E402
+    add_geometry_args, build_projector, load_picks)
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +86,8 @@ def _downsample(img: np.ndarray, target: int = 2000) -> tuple:
 
 def overlay_aligned(proj, picks, tilt, stack, outdir) -> Optional[str]:
     """Predicted positions on AreTomo's aligned tilt series."""
-    surviving = sorted(s.sec for s in proj.aln.sections)
     sec = proj.tilts[tilt].sec
-    if sec.sec not in surviving:
-        return None
-    zi = surviving.index(sec.sec)
+    zi = proj.aligned_slice_index(tilt)
     with mrcfile.mmap(stack, mode="r", permissive=True) as m:
         if zi >= m.data.shape[0]:
             logger.error("aligned stack has %d slices, need %d", m.data.shape[0], zi)
@@ -113,11 +111,7 @@ def overlay_aligned(proj, picks, tilt, stack, outdir) -> Optional[str]:
 
 def overlay_canvas(proj, picks, tilt, stack, outdir) -> Optional[str]:
     """Predicted positions on the stitched montage canvas."""
-    # The canvas stack holds every tilt, including the ones AreTomo called dark,
-    # in ascending tilt order -- the same ordering the .aln SEC index uses. Use
-    # all_tilts, not the surviving sections, or every slice past the first dark
-    # frame is off by one.
-    zi = proj.all_tilts.index(tilt)
+    zi = proj.canvas_slice_index(tilt)
     with mrcfile.mmap(stack, mode="r", permissive=True) as m:
         if zi >= m.data.shape[0]:
             logger.error("canvas stack has %d slices, need %d", m.data.shape[0], zi)
@@ -399,14 +393,7 @@ def parse_commandline(argv=None):
     p.add_argument("--patch-tilts", type=int, default=9,
                    help="how many of the lowest-|TILT| sections to average over")
 
-    g = p.add_argument_group("montage geometry (must match 02_stitch.sh)")
-    g.add_argument("--roi", nargs=4, type=float, default=[-5500, 12000, -6000, 12000])
-    g.add_argument("--pixel-size", type=float, default=3.426)
-    g.add_argument("--binning", type=int, default=2)
-    g.add_argument("--out-bin", type=int, default=2)
-    g.add_argument("--rotate", default="auto")
-    g.add_argument("--extra-shift", nargs=2, type=float, default=[0.0, 0.0])
-    g.add_argument("--handedness", type=int, choices=[1, -1], default=1)
+    add_geometry_args(p)
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args(argv)
 
@@ -422,13 +409,7 @@ def main(argv=None) -> int:
     with mrcfile.open(args.tomogram, header_only=True, permissive=True) as m:
         recon_shape = (int(m.header.nz), int(m.header.ny), int(m.header.nx))
 
-    rotate = args.rotate if args.rotate == "auto" else int(args.rotate)
-    proj = MontageProjector(
-        aln_path=args.aln, positions_dir=args.positions_dir, recon_shape=recon_shape,
-        roi=args.roi, pixel_size=args.pixel_size, binning=args.binning,
-        out_bin=args.out_bin, rotate=rotate, tile_dir=args.tile_dir,
-        extra_shift=args.extra_shift, handedness=args.handedness,
-    )
+    proj = build_projector(args, recon_shape)
     picks = load_picks(args.picks)
     logger.info("%d picks", len(picks))
 

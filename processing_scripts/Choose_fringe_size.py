@@ -1,20 +1,55 @@
 """
 Interactive tool for choosing the fringe-removal size used during square-beam
-montage stitching.  Load one frame from an MRC stack, then drag the sliders to
-find the fringe size (in unbinned pixels) and beam threshold at which beam-edge
-artefacts are cleanly excluded without eroding too much real sample signal.
-Pass the chosen values as --fringe and --maskabsolutethreshold to the main
-stitching script.
+montage stitching.  Load one frame from an MRC or multi-page TIFF stack, then
+drag the sliders to find the fringe size (in unbinned pixels) and beam
+threshold at which beam-edge artefacts are cleanly excluded without eroding
+too much real sample signal. Pass the chosen values as --fringe and
+--maskabsolutethreshold to the main stitching script.
 """
+
+import os
 
 import matplotlib
 matplotlib.use('TkAgg')  # X11-forwarding compatible backend
 import mrcfile
 import numpy as np
 from matplotlib import pyplot as plt
-from matplotlib.widgets import Slider, Button
+from matplotlib.widgets import Slider
+from PIL import Image
 import argparse
 from .Utilities import fourier_interpolate, make_mask
+from .mask_tuning_widgets import make_fraction_text, make_nav_buttons, make_threshold_slider
+
+
+def open_stack(path):
+    """
+    Open an MRC or multi-page TIFF as a lazily-indexable stack.
+
+    Returns ``(get_slice, n_slices, close)``: ``get_slice(idx)`` reads one 2D
+    frame without loading the rest, ``n_slices`` is the stack length (1 for a
+    single-image file), and ``close()`` releases the file handle. Only the
+    requested frame is read either way -- via mrcfile's memmap for .mrc, via
+    PIL's per-frame seek for .tif/.tiff -- so browsing a large raw movie or
+    stitched montage stays cheap.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".tif", ".tiff"):
+        img = Image.open(path)
+        n_slices = getattr(img, "n_frames", 1)
+
+        def get_slice(idx):
+            img.seek(idx)
+            return np.asarray(img.copy())
+
+        return get_slice, n_slices, img.close
+
+    mrc = mrcfile.mrcmemmap.MrcMemmap(path)
+    n_slices = mrc.data.shape[0] if mrc.data.ndim == 3 else 1
+
+    def get_slice(idx):
+        return np.asarray(mrc.data[idx] if mrc.data.ndim == 3 else mrc.data)
+
+    return get_slice, n_slices, mrc.close
 
 
 def parse_commandline():
@@ -32,9 +67,9 @@ def parse_commandline():
     parser.add_argument(
         "-i", "--input",
         help=(
-            "MRC stack to preview.  The first frame/tilt is used by default. "
-            "Append a colon and a zero-based index to select a specific slice, "
-            "e.g. file.mrc:5 loads slice 5."
+            "MRC or multi-page TIFF stack to preview.  The first frame/tilt is "
+            "used by default.  Append a colon and a zero-based index to select "
+            "a specific slice, e.g. file.mrc:5 or file.tif:5 loads slice 5."
         ),
         required=True,
         type=str,
@@ -89,11 +124,10 @@ def main():
         input_path = input_str
         slice_idx = 0
 
-    mrc = mrcfile.mrcmemmap.MrcMemmap(input_path)
-    n_slices = mrc.data.shape[0] if mrc.data.ndim == 3 else 1
+    get_slice, n_slices, close_stack = open_stack(input_path)
 
     def get_image(idx):
-        raw = np.asarray(mrc.data[idx] if mrc.data.ndim == 3 else mrc.data)
+        raw = get_slice(idx)
         return fourier_interpolate(raw, [x // args["binning"] for x in raw.shape])
 
     image = get_image(slice_idx)
@@ -141,33 +175,18 @@ def main():
         valinit=initial_fringe_px, valstep=1, valfmt="%0.0f",
     )
 
-    # Threshold slider spans 1st–99th percentile to avoid outlier pixels
-    # collapsing the usable range.
-    ax_thresh = plt.axes([0.2, 0.21, 0.65, 0.03])
-    threshold_slider = Slider(
-        ax_thresh, "Abs. threshold (counts)",
-        np.percentile(image, 1), np.percentile(image, 99),
-        valinit=initial_threshold,
+    threshold_slider = make_threshold_slider(
+        fig, [0.2, 0.21, 0.65, 0.03], image, initial_threshold,
+        label="Abs. threshold (counts)",
     )
 
     # Text line below the threshold slider showing the fraction of current median.
-    frac_text = fig.text(
-        0.2, 0.155, "", fontsize=8, color="dimgray",
+    update_frac_text = make_fraction_text(
+        fig, 0.2, 0.155, prefix="  →  ", fontsize=8, color="dimgray",
     )
-
-    def update_frac_text(threshold, median):
-        frac = threshold / median if median != 0 else 0.0
-        frac_text.set_text(
-            f"  →  {frac:.4f} × image median   (median = {median:.1f} counts)"
-        )
-
     update_frac_text(initial_threshold, image_median)
 
     # --- Slice navigation buttons ---
-    ax_prev = plt.axes([0.30, 0.07, 0.13, 0.05])
-    ax_next = plt.axes([0.57, 0.07, 0.13, 0.05])
-    btn_prev = Button(ax_prev, "← Prev slice")
-    btn_next = Button(ax_next, "Next slice →")
     slice_label = fig.text(
         0.5, 0.08, f"Slice {slice_idx} / {n_slices - 1}",
         ha="center", fontsize=10,
@@ -203,19 +222,16 @@ def main():
         slice_label.set_text(f"Slice {idx} / {n_slices - 1}")
         update(None)
 
-    def on_prev(event):
-        load_slice(state["idx"] - 1)
-
-    def on_next(event):
-        load_slice(state["idx"] + 1)
-
     fringe_slider.on_changed(update)
     threshold_slider.on_changed(update)
-    btn_prev.on_clicked(on_prev)
-    btn_next.on_clicked(on_next)
+    make_nav_buttons(
+        fig, [0.30, 0.07, 0.13, 0.05], [0.57, 0.07, 0.13, 0.05], n_slices,
+        load_slice, prev_label="← Prev slice", next_label="Next slice →",
+        start=slice_idx,
+    )
 
     plt.show()
-    mrc.close()
+    close_stack()
 
 
 if __name__ == "__main__":

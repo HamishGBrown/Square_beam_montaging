@@ -2,7 +2,7 @@
 #SBATCH --job-name=subtomo_val
 #SBATCH --output=/home/hgbrown/logs/subtomo_val_%A.out
 #SBATCH --error=/home/hgbrown/logs/subtomo_val_%A.out
-#SBATCH -p sapphire
+#SBATCH -p cascade,sapphire
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 # relion_tomo_subtomo loads the WHOLE tilt series into memory before extracting,
