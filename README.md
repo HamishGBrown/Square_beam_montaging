@@ -36,7 +36,7 @@ Full details are in `Montage tomography SOP.docx`. In brief:
 
 A single tilt's acquisition looks like this:
 
-![image](https://github.com/HamishGBrown/StitchTomo/blob/main/SingleMontage.gif)
+![image](SingleMontage.gif)
 
 ---
 
